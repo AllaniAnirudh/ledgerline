@@ -9,21 +9,52 @@ package replay
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 
 	"github.com/AllaniAnirudh/ledgerline/internal/ledger"
 )
 
-// ExportJSONL writes every event in the ledger as one JSON object per
+// ExportJSONL writes every event in the store as one JSON object per
 // line. The file is the offline bundle: replay it anywhere.
-func ExportJSONL(l *ledger.Ledger, path string) error {
+func ExportJSONL(s ledger.Store, path string) error {
+	events, err := s.Events()
+	if err != nil {
+		return err
+	}
+	return writeBundle(path, events)
+}
+
+// ExportSessionJSONL writes a prefix-closed bundle: every event from
+// the chain start through the session's last event. Prefix-closure is
+// what keeps the bundle verifiable — a session-filtered slice would
+// break the chain at its first event, since prev hashes point at
+// events from other sessions. Filter by session when displaying.
+func ExportSessionJSONL(s ledger.Store, sessionID, path string) error {
+	events, err := s.Events()
+	if err != nil {
+		return err
+	}
+	end := -1
+	for i, e := range events {
+		if e.SessionID == sessionID {
+			end = i
+		}
+	}
+	if end < 0 {
+		return fmt.Errorf("no events for session %q", sessionID)
+	}
+	return writeBundle(path, events[:end+1])
+}
+
+func writeBundle(path string, events []ledger.Event) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	enc := json.NewEncoder(f)
-	for _, e := range l.Events() {
+	for _, e := range events {
 		if err := enc.Encode(e); err != nil {
 			return err
 		}

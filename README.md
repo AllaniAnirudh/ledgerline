@@ -28,20 +28,34 @@ Agent --(MCP/JSON-RPC)--> [ Ledgerline ] --(forward)--> MCP server
 go build ./...
 
 # Proxy your MCP server. Deny dangerous tools, hold sensitive ones.
-./ledgerline --upstream http://localhost:3000 --listen :8080 \
-  --deny "exec,rm" --hold "write_file"
+# --db makes the ledger survive restarts (SQLite); omit for in-memory.
+./ledgerline gateway --upstream http://localhost:3000 --listen :8080 \
+  --db ledger.db --deny "exec,rm" --hold "write_file"
 
 # Point your MCP client at http://localhost:8080
-# Every tools/call is witnessed; denied and held calls never reach upstream.
+# Held calls wait for a human:
+./ledgerline approvals --gateway http://localhost:8080
+./ledgerline approve <id> --actor buppy
+
+# Run a terminal session into the same ledger (shares --db):
+./ledgerline run --db ledger.db --session demo -- opencode run "fix the bug"
+
+# Watch the unified timeline:
+open http://localhost:8080/replay?session=demo
+
+# Export an offline bundle and verify it without host access:
+./ledgerline export --db ledger.db --session demo --out demo.jsonl
+./ledgerline verify demo.jsonl
 ```
 
 ## Layout
 
-- `cmd/ledgerline` — the gateway binary and CLI flags
-- `internal/gateway` — the boundary proxy: intercepts `tools/call`, consults policy, forwards the rest
-- `internal/ledger` — append-only hash-chained event log with chain verification
+- `cmd/ledgerline` — CLI: `gateway`, `approvals`, `approve`, `deny`, `export`, `verify`, `run`
+- `internal/gateway` — the boundary proxy: intercepts `tools/call`, consults policy, holds for approval, forwards the rest; serves `/v1/*` API and `/replay`
+- `internal/ledger` — `Store` interface; in-memory chain and SQLite backend; chain verification
 - `internal/policy` — allow/deny/hold decisions (static lists in v0, YAML policy next)
-- `internal/replay` — offline bundle export (JSONL) and chain verification without host access
+- `internal/pty` — PTY co-capture: runs a command, witnesses terminal output into the same ledger
+- `internal/replay` — offline bundle export (prefix-closed, so the chain verifies) and the timeline viewer
 - `docs/VISION.md` — the full vision and architecture doc
 
 ## Status

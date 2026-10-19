@@ -40,7 +40,7 @@ type Ledger struct {
 func New() *Ledger { return &Ledger{} }
 
 // Append records one event and returns it with its chain position and hash.
-func (l *Ledger) Append(sessionID, kind, tool string, args json.RawMessage, decision, actor string) Event {
+func (l *Ledger) Append(sessionID, kind, tool string, args json.RawMessage, decision, actor string) (Event, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -61,21 +61,38 @@ func (l *Ledger) Append(sessionID, kind, tool string, args json.RawMessage, deci
 	}
 	e.Hash = hashEvent(e)
 	l.events = append(l.events, e)
-	return e
+	return e, nil
 }
 
 // Events returns a copy of the chain in order.
-func (l *Ledger) Events() []Event {
+func (l *Ledger) Events() ([]Event, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	out := make([]Event, len(l.events))
 	copy(out, l.events)
-	return out
+	return out, nil
+}
+
+// EventsBySession returns one session's events in order.
+func (l *Ledger) EventsBySession(sessionID string) ([]Event, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []Event
+	for _, e := range l.events {
+		if e.SessionID == sessionID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 // Verify recomputes the whole chain.
 func (l *Ledger) Verify() error {
-	return VerifyEvents(l.Events())
+	events, err := l.Events()
+	if err != nil {
+		return err
+	}
+	return VerifyEvents(events)
 }
 
 // VerifyEvents checks linkage and hashes for any slice of events,

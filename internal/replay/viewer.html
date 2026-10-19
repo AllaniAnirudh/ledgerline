@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ledgerline Replay</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.2rem; }
+  .bar { display: flex; gap: .5rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
+  input { font: inherit; padding: .4rem .6rem; width: 22rem; }
+  button { font: inherit; padding: .4rem .8rem; cursor: pointer; }
+  #verify { font-weight: bold; }
+  #verify.ok { color: #137333; } #verify.bad { color: #b3261e; }
+  .tl { border-left: 2px solid #888; margin-left: .5rem; padding-left: 1rem; }
+  .ev { margin: 0 0 1rem; padding: .6rem .8rem; border: 1px solid #8883; border-radius: 6px; }
+  .ev .head { display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; }
+  .kind { font-size: .75rem; text-transform: uppercase; letter-spacing: .05em; padding: .1rem .4rem; border-radius: 4px; background: #8882; }
+  .kind.tool_call { background: #d3e3fd; color: #041e49; }
+  .kind.policy_decision { background: #feefc3; color: #5c3b00; }
+  .kind.approval { background: #c4eed0; color: #0d3b1e; }
+  .kind.terminal_output { background: #e8e8e8; color: #333; }
+  .tool { font-weight: bold; }
+  .decision.allow, .decision.approve { color: #137333; }
+  .decision.deny { color: #b3261e; }
+  .decision.hold, .decision.pending, .decision.timeout { color: #b06000; }
+  .meta { color: #888; font-size: .8rem; }
+  details { margin-top: .4rem; }
+  summary { cursor: pointer; color: #888; font-size: .8rem; }
+  pre { background: #8881; padding: .6rem; border-radius: 4px; overflow-x: auto; font-size: .8rem; }
+  .empty { color: #888; }
+</style>
+</head>
+<body>
+<h1>Ledgerline replay</h1>
+<div class="bar">
+  <input id="session" placeholder="session id (or 'default')" value="">
+  <button onclick="load()">Load</button>
+  <span id="verify"></span>
+</div>
+<div class="tl" id="timeline"><p class="empty">Enter a session id to replay its witnessed timeline.</p></div>
+<script>
+const q = new URLSearchParams(location.search);
+if (q.get('session')) { document.getElementById('session').value = q.get('session'); load(); }
+
+async function load() {
+  const id = document.getElementById('session').value.trim() || 'default';
+  history.replaceState(null, '', '?session=' + encodeURIComponent(id));
+  const tl = document.getElementById('timeline');
+  tl.innerHTML = '<p class="empty">Loading…</p>';
+  try {
+    const [evRes, vRes] = await Promise.all([
+      fetch('/v1/sessions/' + encodeURIComponent(id) + '/events'),
+      fetch('/v1/verify')
+    ]);
+    const events = await evRes.json();
+    const v = await vRes.json();
+    const vEl = document.getElementById('verify');
+    vEl.textContent = v.ok ? 'chain intact' : 'CHAIN BROKEN: ' + (v.error || '');
+    vEl.className = v.ok ? 'ok' : 'bad';
+    if (!events || !events.length) { tl.innerHTML = '<p class="empty">No events for this session.</p>'; return; }
+    tl.innerHTML = '';
+    for (const e of events) tl.appendChild(render(e));
+  } catch (err) {
+    tl.innerHTML = '<p class="empty">Failed to load: ' + err + '</p>';
+  }
+}
+
+function render(e) {
+  const d = document.createElement('div');
+  d.className = 'ev';
+  const when = new Date(e.timestamp).toLocaleTimeString();
+  let head = `<div class="head"><span class="kind ${e.kind}">${e.kind}</span>` +
+    (e.tool ? `<span class="tool">${esc(e.tool)}</span>` : '') +
+    (e.decision ? `<span class="decision ${e.decision}">${e.decision}</span>` : '') +
+    `<span class="meta">#${e.seq} · ${when}${e.actor ? ' · by ' + esc(e.actor) : ''}</span></div>`;
+  let extra = '';
+  if (e.args) extra += `<details><summary>arguments</summary><pre>${esc(JSON.stringify(e.args, null, 2))}</pre></details>`;
+  if (e.kind === 'terminal_output' && e.tool === 'pty') extra += `<pre>${esc(e.args ? JSON.stringify(e.args) : '')}</pre>`;
+  extra += `<div class="meta">hash ${String(e.hash).slice(0, 12)}… ← ${String(e.prev_hash).slice(0, 12) || 'genesis'}…</div>`;
+  d.innerHTML = head + extra;
+  return d;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+document.getElementById('session').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+</script>
+</body>
+</html>

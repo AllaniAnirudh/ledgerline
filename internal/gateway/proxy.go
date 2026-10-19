@@ -6,13 +6,15 @@
 // Non-tool traffic is forwarded untouched.
 //
 // The agent is never trusted to log itself. The gateway is the trust
-// root for everything it witnesses.
+// root for everything it witnesses. If the ledger cannot be written,
+// the boundary fails closed: no witness, no passage.
 package gateway
 
 import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -23,20 +25,27 @@ import (
 
 // Proxy forwards MCP traffic while witnessing and policing tool calls.
 type Proxy struct {
-	upstream *url.URL
-	ledger   *ledger.Ledger
-	policy   *policy.Policy
-	client   *http.Client
+	upstream  *url.URL
+	ledger    ledger.Store
+	policy    *policy.Policy
+	client    *http.Client
+	approvals *Approvals
 }
 
 // New builds a proxy for one upstream MCP server base URL.
-func New(upstream string, l *ledger.Ledger, p *policy.Policy) (*Proxy, error) {
+func New(upstream string, l ledger.Store, p *policy.Policy) (*Proxy, error) {
 	u, err := url.Parse(strings.TrimSuffix(upstream, "/"))
 	if err != nil {
 		return nil, err
 	}
-	return &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}}, nil
+	return &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, approvals: NewApprovals()}, nil
 }
+
+// Approvals exposes the pending human-approval queue.
+func (px *Proxy) Approvals() *Approvals { return px.approvals }
+
+// Ledger exposes the underlying store for export and the replay API.
+func (px *Proxy) Ledger() ledger.Store { return px.ledger }
 
 // jsonRPC is the minimal shape we need to spot a tool call.
 type jsonRPC struct {
@@ -51,6 +60,12 @@ type toolParams struct {
 }
 
 func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Approval and replay API live on the same port, outside the proxy path.
+	if strings.HasPrefix(r.URL.Path, "/v1/") || r.URL.Path == "/replay" {
+		px.serveAPI(w, r)
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "cannot read body", http.StatusBadRequest)
@@ -66,17 +81,34 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Witness + police tool calls at the boundary.
 	if r.Method == http.MethodPost && isToolCall(body) {
 		tool, args := toolCallDetails(body)
-		d := px.policy.Decide(tool)
-		px.ledger.Append(session, "policy_decision", tool, nil, d.String(), "")
-		if d != policy.Allow {
-			px.ledger.Append(session, "approval", tool, args, d.String(), "")
-			writeJSONRPCError(w, body, "ledgerline: tool call "+d.String()+" by policy")
+		if !px.witness(session, "policy_decision", tool, nil, px.policy.Decide(tool).String(), "", w, body) {
 			return
 		}
-		px.ledger.Append(session, "tool_call", tool, args, d.String(), "")
+		switch px.policy.Decide(tool) {
+		case policy.Deny:
+			writeJSONRPCError(w, body, "ledgerline: tool call deny by policy")
+			return
+		case policy.Hold:
+			px.hold(w, r, session, body, tool, args)
+			return
+		}
+		if !px.witness(session, "tool_call", tool, args, policy.Allow.String(), "", w, body) {
+			return
+		}
 	}
 
 	px.forward(w, r, body)
+}
+
+// witness appends one event, failing closed: if the ledger cannot be
+// written, the call does not pass the boundary.
+func (px *Proxy) witness(session, kind, tool string, args json.RawMessage, decision, actor string, w http.ResponseWriter, body []byte) bool {
+	if _, err := px.ledger.Append(session, kind, tool, args, decision, actor); err != nil {
+		log.Printf("ledger write failed: %v", err)
+		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+		return false
+	}
+	return true
 }
 
 // forward passes the request upstream and streams the response back.
