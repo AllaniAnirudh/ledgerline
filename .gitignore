@@ -1,0 +1,19 @@
+# Binaries and build output
+ledgerline
+*.exe
+/dist/
+
+# Go
+*.test
+*.out
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Local bundles from replay export
+*.jsonl
