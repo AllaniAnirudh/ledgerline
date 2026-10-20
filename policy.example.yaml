@@ -1,0 +1,52 @@
+# Ledgerline policy example.
+#
+# Run it with:
+#   ledgerline gateway --upstream http://localhost:3000 --policy policy.example.yaml
+#
+# Rules run in order. The first rule that matches a call wins.
+# A call that matches no rule gets the default.
+#
+# Fields per rule:
+#   tool          glob for the tool name. Case-insensitive. "*" and "?" work.
+#   action        allow, deny, or hold (hold = wait for a human approval).
+#   reason        optional text. Shown in deny errors and kept for review.
+#   args_match    optional map. Keys are dotted argument paths. Each value
+#                 is a glob matched against that argument's string value.
+#                 Argument globs are case-sensitive. "**" matches any
+#                 number of path segments, so "/etc/**" covers every
+#                 file under /etc at any depth. All entries must match.
+#   args_contains optional text. Matches when the call arguments contain
+#                 this text, case-insensitive.
+#
+# A rule with argument conditions that do not hold does not match.
+# Evaluation continues to the next rule.
+
+version: 1
+default: allow
+
+rules:
+  # Shell and delete tools never pass.
+  - tool: exec
+    action: deny
+    reason: "shell access is off limits at this boundary"
+  - tool: "delete_*"
+    action: deny
+    reason: "deletes are not permitted"
+
+  # Writes under system paths need a human, at any depth.
+  # Other writes pass.
+  - tool: write_file
+    action: hold
+    args_match:
+      path: "/etc/**"
+    reason: "system path write"
+  - tool: write_file
+    action: hold
+    args_match:
+      path: "/home/**"
+    reason: "home path write"
+
+  # Mail that looks confidential needs a human.
+  - tool: send_email
+    action: hold
+    args_contains: "confidential"

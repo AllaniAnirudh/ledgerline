@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -22,22 +23,28 @@ type PendingApproval struct {
 	Tool      string          `json:"tool"`
 	Args      json.RawMessage `json:"args,omitempty"`
 	CreatedAt time.Time       `json:"created_at"`
+	ExpiresAt time.Time       `json:"expires_at"`
 
-	resultCh  chan bool // true = approved
-	decided   bool
-	decidedBy string
+	resultCh chan decisionResult
+	decided  bool
+}
+
+type decisionResult struct {
+	approved bool
+	actor    string
 }
 
 // Approvals is the hold queue.
 type Approvals struct {
-	mu      sync.Mutex
-	pending map[string]*PendingApproval
-	timeout time.Duration
+	mu         sync.Mutex
+	pending    map[string]*PendingApproval
+	timeout    time.Duration
+	maxPending int
 }
 
 // NewApprovals builds a queue with a 5 minute hold timeout.
 func NewApprovals() *Approvals {
-	return &Approvals{pending: map[string]*PendingApproval{}, timeout: 5 * time.Minute}
+	return &Approvals{pending: map[string]*PendingApproval{}, timeout: 5 * time.Minute, maxPending: 1000}
 }
 
 // SetTimeout changes how long a held call waits for a human.
@@ -51,15 +58,18 @@ func (a *Approvals) List() []*PendingApproval {
 	for _, p := range a.pending {
 		out = append(out, &PendingApproval{
 			ID: p.ID, SessionID: p.SessionID, Tool: p.Tool,
-			Args: p.Args, CreatedAt: p.CreatedAt,
+			Args: p.Args, CreatedAt: p.CreatedAt, ExpiresAt: p.ExpiresAt,
 		})
 	}
 	return out
 }
 
-// Decide resolves a pending approval. ok=true approves, false denies.
-// The actor is recorded into the ledger by the caller.
-func (a *Approvals) Decide(id string, ok bool) bool {
+// Decide resolves a pending approval and records the actor who won
+// the decision, atomically: the actor is set under the same lock that
+// claims the decision, so the ledger can never record a loser's name
+// against the winner's call. Returns false when the ID is unknown or
+// already decided.
+func (a *Approvals) Decide(id string, ok bool, actor string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	p, found := a.pending[id]
@@ -68,65 +78,137 @@ func (a *Approvals) Decide(id string, ok bool) bool {
 	}
 	p.decided = true
 	delete(a.pending, id)
-	p.resultCh <- ok
+	p.resultCh <- decisionResult{approved: ok, actor: actor}
 	return true
 }
 
-func newID() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
+func newID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // hold parks the agent's request until a human decides.
 // On approval the original call is forwarded upstream and the real
-// response goes back to the waiting agent.
+// response goes back to the waiting agent. The release path fails
+// closed, like the rest of the boundary: if the approval cannot be
+// written to the ledger, the call does not pass.
 func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, body []byte, tool string, args json.RawMessage) {
+	id, err := newID()
+	if err != nil {
+		writeJSONRPCError(w, body, "ledgerline: cannot allocate approval id, boundary closed")
+		return
+	}
 	p := &PendingApproval{
-		ID:        newID(),
+		ID:        id,
 		SessionID: session,
 		Tool:      tool,
 		Args:      args,
 		CreatedAt: time.Now().UTC(),
-		resultCh:  make(chan bool, 1),
+		ExpiresAt: time.Now().UTC().Add(px.approvals.timeout),
+		resultCh:  make(chan decisionResult, 1),
 	}
 	px.approvals.mu.Lock()
+	if len(px.approvals.pending) >= px.approvals.maxPending {
+		px.approvals.mu.Unlock()
+		writeJSONRPCError(w, body, "ledgerline: approval queue full, boundary closed")
+		return
+	}
+	for {
+		if _, exists := px.approvals.pending[p.ID]; !exists {
+			break
+		}
+		fresh, err := newID()
+		if err != nil {
+			px.approvals.mu.Unlock()
+			writeJSONRPCError(w, body, "ledgerline: cannot allocate approval id, boundary closed")
+			return
+		}
+		p.ID = fresh
+	}
 	px.approvals.pending[p.ID] = p
 	px.approvals.mu.Unlock()
 
+	removePending := func() {
+		px.approvals.mu.Lock()
+		delete(px.approvals.pending, p.ID)
+		px.approvals.mu.Unlock()
+	}
+
 	if _, err := px.ledger.Append(session, "approval", tool, args, "hold", ""); err != nil {
+		removePending()
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
 		return
 	}
 
+	timer := time.NewTimer(px.approvals.timeout)
+	defer timer.Stop()
 	select {
-	case approved := <-p.resultCh:
-		if !approved {
-			px.ledger.Append(session, "approval", tool, args, "deny", p.decidedBy)
-			writeJSONRPCError(w, body, "ledgerline: tool call denied by approver")
+	case res := <-p.resultCh:
+		px.release(w, r, session, body, tool, args, res)
+	case <-timer.C:
+		// Claim the entry under the lock so a decision and a
+		// timeout can never both win the same hold.
+		px.approvals.mu.Lock()
+		if p.decided {
+			// The decision won the race; its result is already
+			// in the buffered channel.
+			px.approvals.mu.Unlock()
+			px.release(w, r, session, body, tool, args, <-p.resultCh)
 			return
 		}
-		px.ledger.Append(session, "approval", tool, args, "approve", p.decidedBy)
-		px.ledger.Append(session, "tool_call", tool, args, "allow", p.decidedBy)
-		px.forward(w, r, body)
-	case <-time.After(px.approvals.timeout):
-		px.approvals.mu.Lock()
+		p.decided = true
 		delete(px.approvals.pending, p.ID)
 		px.approvals.mu.Unlock()
-		px.ledger.Append(session, "approval", tool, args, "timeout", "")
+		if _, err := px.ledger.Append(session, "approval", tool, args, "timeout", ""); err != nil {
+			log.Printf("ledger write failed on approval timeout: %v", err)
+		}
 		writeJSONRPCError(w, body, fmt.Sprintf("ledgerline: approval timed out after %s", px.approvals.timeout))
 	}
+}
+
+// release records the human's decision and, when it is an approval,
+// forwards the held call upstream. Any ledger failure closes the
+// boundary instead of letting the call through unrecorded.
+func (px *Proxy) release(w http.ResponseWriter, r *http.Request, session string, body []byte, tool string, args json.RawMessage, res decisionResult) {
+	if !res.approved {
+		if _, err := px.ledger.Append(session, "approval", tool, args, "deny", res.actor); err != nil {
+			log.Printf("ledger write failed on approval deny: %v", err)
+		}
+		writeJSONRPCError(w, body, "ledgerline: tool call denied by approver")
+		return
+	}
+	if _, err := px.ledger.Append(session, "approval", tool, args, "approve", res.actor); err != nil {
+		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+		return
+	}
+	if _, err := px.ledger.Append(session, "tool_call", tool, args, "allow", res.actor); err != nil {
+		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+		return
+	}
+	px.forward(w, r, body)
 }
 
 // serveAPI handles the control plane: approvals, session events,
 // chain verification, and the replay viewer.
 func (px *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
+	// The pages themselves are static and carry no data; every /v1
+	// call behind them checks the API token when one is set.
+	if strings.HasPrefix(r.URL.Path, "/v1/") && !px.tokenOK(r) {
+		http.Error(w, "ledgerline: missing or bad API token", http.StatusUnauthorized)
+		return
+	}
 	switch {
-	case r.URL.Path == "/v1/approvals" && r.Method == http.MethodGet:
-		writeJSON(w, px.approvals.List())
+	case r.URL.Path == "/approvals" && r.Method == http.MethodGet:
+		writePage(w, ApprovalsHTML())
 
 	case strings.HasPrefix(r.URL.Path, "/v1/approvals/") && strings.HasSuffix(r.URL.Path, "/decision") && r.Method == http.MethodPost:
 		px.decideApproval(w, r)
+
+	case r.URL.Path == "/v1/approvals" && r.Method == http.MethodGet:
+		writeJSON(w, px.approvals.List())
 
 	case strings.HasPrefix(r.URL.Path, "/v1/sessions/") && strings.HasSuffix(r.URL.Path, "/events") && r.Method == http.MethodGet:
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/events")
@@ -145,12 +227,20 @@ func (px *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"ok": true})
 
 	case r.URL.Path == "/replay" && r.Method == http.MethodGet:
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(replay.ViewerHTML())
+		writePage(w, replay.ViewerHTML())
 
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// writePage serves one of the built-in pages with headers that keep
+// it from being framed or extended by injected content.
+func writePage(w http.ResponseWriter, html []byte) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Write(html)
 }
 
 type decisionRequest struct {
@@ -171,18 +261,24 @@ func (px *Proxy) decideApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	px.approvals.mu.Lock()
-	p, found := px.approvals.pending[id]
-	if found {
-		p.decidedBy = req.Actor
+	// When the caller authenticated with a per-approver token, the
+	// actor recorded in the ledger is the name bound to that token,
+	// not the free-text name in the body. A body name that disagrees
+	// with the credential is rejected outright.
+	actor := req.Actor
+	if name, bound := px.approverActor(r); bound {
+		if actor != "" && actor != name {
+			http.Error(w, "actor does not match the approver token", http.StatusForbidden)
+			return
+		}
+		actor = name
 	}
-	px.approvals.mu.Unlock()
 
-	if !px.approvals.Decide(id, approved) {
+	if !px.approvals.Decide(id, approved, actor) {
 		http.Error(w, "approval not found or already decided", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, map[string]any{"ok": true, "decision": req.Decision})
+	writeJSON(w, map[string]any{"ok": true, "decision": req.Decision, "actor": actor})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

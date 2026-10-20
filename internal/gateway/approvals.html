@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ledgerline Approvals</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.2rem; }
+  .bar { display: flex; gap: .5rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
+  .bar label { font-size: .8rem; color: #888; }
+  input { font: inherit; padding: .35rem .55rem; }
+  #actor { width: 12rem; } #token { width: 14rem; }
+  .card { border: 1px solid #8886; border-radius: 8px; padding: .8rem 1rem; margin-bottom: 1rem; }
+  .head { display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; }
+  .tool { font-weight: bold; font-size: 1.05rem; }
+  .meta { color: #888; font-size: .8rem; }
+  .count { color: #b06000; font-size: .8rem; }
+  .count.late { color: #b3261e; font-weight: bold; }
+  pre { background: #8881; padding: .6rem; border-radius: 4px; overflow-x: auto; font-size: .8rem; }
+  .actions { display: flex; gap: .5rem; margin-top: .6rem; }
+  button { font: inherit; padding: .45rem 1rem; cursor: pointer; border-radius: 6px; border: 1px solid #8886; background: transparent; }
+  button.approve { background: #137333; color: #fff; border-color: #137333; }
+  button.deny { background: #b3261e; color: #fff; border-color: #b3261e; }
+  button:disabled { opacity: .5; cursor: wait; }
+  .empty { color: #888; }
+  #err { color: #b3261e; }
+</style>
+</head>
+<body>
+<h1>Ledgerline approvals</h1>
+<div class="bar">
+  <label>actor <input id="actor" placeholder="your name"></label>
+  <label>API token <input id="token" type="password" placeholder="only if gateway sets one"></label>
+  <span class="meta" id="status"></span>
+</div>
+<p id="err"></p>
+<div id="list"><p class="empty">Loading…</p></div>
+<script>
+const actorEl = document.getElementById('actor');
+const tokenEl = document.getElementById('token');
+actorEl.value = localStorage.getItem('ll_actor') || '';
+tokenEl.value = sessionStorage.getItem('ll_token') || '';
+actorEl.addEventListener('change', () => localStorage.setItem('ll_actor', actorEl.value.trim()));
+tokenEl.addEventListener('change', () => { sessionStorage.setItem('ll_token', tokenEl.value.trim()); load(); });
+
+function headers() {
+  const h = { 'Content-Type': 'application/json' };
+  const t = tokenEl.value.trim();
+  if (t) h['X-Ledgerline-Token'] = t;
+  return h;
+}
+
+async function load() {
+  const list = document.getElementById('list');
+  const err = document.getElementById('err');
+  try {
+    const res = await fetch('/v1/approvals', { headers: headers() });
+    if (res.status === 401) { err.textContent = 'Gateway rejected the API token. Set the token above.'; return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    err.textContent = '';
+    const items = await res.json();
+    document.getElementById('status').textContent =
+      items.length ? items.length + ' held' : 'queue empty';
+    if (!items.length) { list.innerHTML = '<p class="empty">No calls are held. Held tool calls appear here and wait for a decision.</p>'; return; }
+    list.innerHTML = '';
+    for (const p of items) list.appendChild(render(p));
+  } catch (e) {
+    err.textContent = 'Cannot reach the gateway API: ' + e;
+  }
+}
+
+function render(p) {
+  const d = document.createElement('div');
+  d.className = 'card';
+  const heldS = Math.max(0, Math.round((Date.now() - new Date(p.created_at)) / 1000));
+  const leftS = Math.max(0, Math.round((new Date(p.expires_at) - Date.now()) / 1000));
+  let args = '';
+  if (p.args) { try { args = '<pre>' + esc(JSON.stringify(p.args, null, 2)) + '</pre>'; } catch (e) {} }
+  d.innerHTML =
+    '<div class="head"><span class="tool">' + esc(p.tool) + '</span>' +
+    '<span class="meta">session ' + esc(p.session_id) + ' · id ' + esc(p.id) + ' · held ' + heldS + 's</span>' +
+    '<span class="count' + (leftS < 30 ? ' late' : '') + '">times out in ' + leftS + 's</span></div>' +
+    args +
+    '<div class="actions">' +
+    '<button class="approve">Approve</button><button class="deny">Deny</button></div>';
+  d.querySelector('.approve').addEventListener('click', () => decide(p.id, 'approve', d));
+  d.querySelector('.deny').addEventListener('click', () => decide(p.id, 'deny', d));
+  return d;
+}
+
+async function decide(id, decision, card) {
+  const actor = actorEl.value.trim();
+  if (!actor) { document.getElementById('err').textContent = 'Set your actor name first. The decision is recorded in the ledger under that name.'; actorEl.focus(); return; }
+  card.querySelectorAll('button').forEach(b => b.disabled = true);
+  try {
+    const res = await fetch('/v1/approvals/' + encodeURIComponent(id) + '/decision', {
+      method: 'POST', headers: headers(),
+      body: JSON.stringify({ decision: decision, actor: actor })
+    });
+    if (!res.ok) throw new Error((await res.text()).trim() || ('HTTP ' + res.status));
+    load();
+  } catch (e) {
+    document.getElementById('err').textContent = 'Decision failed: ' + e;
+    card.querySelectorAll('button').forEach(b => b.disabled = false);
+  }
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+load();
+setInterval(load, 2000);
+</script>
+</body>
+</html>

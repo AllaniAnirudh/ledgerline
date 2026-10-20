@@ -1,5 +1,7 @@
 # Binaries and build output
-ledgerline
+# Root-anchored on purpose: a bare "ledgerline" pattern also matches
+# the cmd/ledgerline/ source directory and silently un-commits it.
+/ledgerline
 *.exe
 /dist/
 

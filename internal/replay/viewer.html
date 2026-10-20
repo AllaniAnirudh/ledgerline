@@ -36,13 +36,22 @@
 <h1>Ledgerline replay</h1>
 <div class="bar">
   <input id="session" placeholder="session id (or 'default')" value="">
+  <input id="token" type="password" placeholder="API token (if gateway sets one)" style="width:16rem">
   <button onclick="load()">Load</button>
   <span id="verify"></span>
 </div>
 <div class="tl" id="timeline"><p class="empty">Enter a session id to replay its witnessed timeline.</p></div>
 <script>
 const q = new URLSearchParams(location.search);
+const tokenEl = document.getElementById('token');
+tokenEl.value = sessionStorage.getItem('ll_token') || '';
+tokenEl.addEventListener('change', () => { sessionStorage.setItem('ll_token', tokenEl.value.trim()); load(); });
 if (q.get('session')) { document.getElementById('session').value = q.get('session'); load(); }
+
+function headers() {
+  const t = tokenEl.value.trim();
+  return t ? { 'X-Ledgerline-Token': t } : {};
+}
 
 async function load() {
   const id = document.getElementById('session').value.trim() || 'default';
@@ -51,9 +60,13 @@ async function load() {
   tl.innerHTML = '<p class="empty">Loading…</p>';
   try {
     const [evRes, vRes] = await Promise.all([
-      fetch('/v1/sessions/' + encodeURIComponent(id) + '/events'),
-      fetch('/v1/verify')
+      fetch('/v1/sessions/' + encodeURIComponent(id) + '/events', { headers: headers() }),
+      fetch('/v1/verify', { headers: headers() })
     ]);
+    if (evRes.status === 401 || vRes.status === 401) {
+      tl.innerHTML = '<p class="empty">Gateway rejected the API token. Set the token above.</p>';
+      return;
+    }
     const events = await evRes.json();
     const v = await vRes.json();
     const vEl = document.getElementById('verify');
@@ -71,9 +84,9 @@ function render(e) {
   const d = document.createElement('div');
   d.className = 'ev';
   const when = new Date(e.timestamp).toLocaleTimeString();
-  let head = `<div class="head"><span class="kind ${e.kind}">${e.kind}</span>` +
+  let head = `<div class="head"><span class="kind ${esc(e.kind)}">${esc(e.kind)}</span>` +
     (e.tool ? `<span class="tool">${esc(e.tool)}</span>` : '') +
-    (e.decision ? `<span class="decision ${e.decision}">${e.decision}</span>` : '') +
+    (e.decision ? `<span class="decision ${esc(e.decision)}">${esc(e.decision)}</span>` : '') +
     `<span class="meta">#${e.seq} · ${when}${e.actor ? ' · by ' + esc(e.actor) : ''}</span></div>`;
   let extra = '';
   if (e.args) extra += `<details><summary>arguments</summary><pre>${esc(JSON.stringify(e.args, null, 2))}</pre></details>`;

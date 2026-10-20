@@ -4,11 +4,12 @@
 // with history breaks the chain. Verification proves self-consistency:
 // the log you read is the log that was written, in order.
 //
-// v0 keeps the log in memory. The SQLite/Postgres backend lands with
-// the Phase 1 wedge. The hash construction does not change.
+// Two Store backends implement the same chain: the in-memory Ledger
+// below and SQLiteStore (sqlite.go). The hash construction is shared.
 package ledger
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -103,7 +104,7 @@ func VerifyEvents(events []Event) error {
 		if e.PrevHash != prev {
 			return fmt.Errorf("event %d: prev hash mismatch (chain broken)", i)
 		}
-		if e.Hash != hashEvent(e) {
+		if !hashMatches(e) {
 			return fmt.Errorf("event %d: hash mismatch (log tampered)", i)
 		}
 		prev = e.Hash
@@ -111,12 +112,63 @@ func VerifyEvents(events []Event) error {
 	return nil
 }
 
+// hashEvent is the current hash construction (v2): every field is
+// length-prefixed, so two different field splits can never produce
+// the same preimage.
 func hashEvent(e Event) string {
+	h := sha256.New()
+	fields := []string{
+		fmt.Sprint(e.Seq),
+		e.Timestamp.UTC().Format(time.RFC3339Nano),
+		e.SessionID, e.Kind, e.Tool, canonicalArgs(e.Args),
+		e.Decision, e.Actor, e.PrevHash,
+	}
+	for _, f := range fields {
+		fmt.Fprintf(h, "%d:%s", len(f), f)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// hashMatches accepts the current construction and both v1 forms,
+// so chains written before the v2 change (and before the canonical
+// args fix) still verify instead of reporting themselves tampered.
+// New events are only ever written with the current construction.
+func hashMatches(e Event) bool {
+	return e.Hash == hashEvent(e) ||
+		e.Hash == hashEventV1(e, true) ||
+		e.Hash == hashEventV1(e, false)
+}
+
+// hashEventV1 is the original pipe-joined construction. canonical
+// selects the argument form: true hashes the compacted arguments
+// (the brief v1.1 form), false hashes the raw stored bytes (v1.0).
+func hashEventV1(e Event, canonical bool) string {
+	args := string(e.Args)
+	if canonical {
+		args = canonicalArgs(e.Args)
+	}
 	h := sha256.New()
 	fmt.Fprintf(h, "%d|%s|%s|%s|%s|%s|%s|%s|%s",
 		e.Seq,
 		e.Timestamp.UTC().Format(time.RFC3339Nano),
-		e.SessionID, e.Kind, e.Tool, string(e.Args),
+		e.SessionID, e.Kind, e.Tool, args,
 		e.Decision, e.Actor, e.PrevHash)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// canonicalArgs returns the compacted form of a JSON arguments blob.
+// The same call can arrive with different whitespace (Python's
+// json.dumps spaces its separators; Go's encoder compacts), and the
+// bundle writer compacts RawMessage again on export. Hashing the
+// canonical form keeps Append, live Verify, and offline bundle
+// verification in agreement. Invalid JSON hashes as-is.
+func canonicalArgs(args json.RawMessage) string {
+	if len(args) == 0 {
+		return ""
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, args); err != nil {
+		return string(args)
+	}
+	return buf.String()
 }

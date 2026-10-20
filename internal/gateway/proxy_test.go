@@ -63,7 +63,7 @@ func TestDenyBlocks(t *testing.T) {
 	if !ok {
 		t.Fatalf("denied call should return JSON-RPC error, got %v", out)
 	}
-	if !strings.Contains(errObj["message"].(string), "deny") {
+	if !strings.Contains(errObj["message"].(string), "denied") {
 		t.Fatalf("unexpected error message: %v", errObj["message"])
 	}
 }
@@ -89,7 +89,7 @@ func TestHoldApprovesAndForwards(t *testing.T) {
 	if id == "" {
 		t.Fatal("held call never appeared in approval queue")
 	}
-	if !px.Approvals().Decide(id, true) {
+	if !px.Approvals().Decide(id, true, "tester") {
 		t.Fatal("decide failed")
 	}
 
