@@ -84,5 +84,8 @@ func VerifyBundle(path string) error {
 	if err := sc.Err(); err != nil {
 		return err
 	}
+	if len(events) == 0 {
+		return fmt.Errorf("bundle has no events: nothing to verify")
+	}
 	return ledger.VerifyEvents(events)
 }

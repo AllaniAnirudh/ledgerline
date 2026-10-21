@@ -1,6 +1,6 @@
 # Ledgerline: Vision and Architecture
 
-Status: Draft design doc, revised after adversarial review
+Status: Phase 1 shipped 2026-10-20 (this repo). This document is the design record from 2026-10-19, revised after adversarial review, kept for the reasoning. Where the shipped code differs from the design below, the code and `SECURITY.md` win. Design only, not yet shipped: chain signing and external anchoring, redaction at capture, capture of call results and durations, the cost module, SIEM export, Postgres team mode, OIDC identity, published schemas, and a Docker image.
 Date: 2026-10-19
 Project name: Ledgerline (decided 2026-10-19)
 License target: Apache 2.0
@@ -59,9 +59,9 @@ State the adversary plainly.
 
 **Trust root.** The boundary gateway. The gateway runs separately from the agent host, under a different operator or at least a different trust domain. Tool calls cross the gateway to reach tools, files, and APIs. The gateway records what it sees and enforces what policy allows. The agent cannot record, edit, or delete the record of its own actions.
 
-**Signing key.** The Ed25519 chain head signing key lives with the gateway operator, not on the agent host. The operator holds it, rotates it on a set schedule and on any suspected compromise, and publishes the public key through a channel the reviewer trusts. A key on the agent host proves nothing. A key with the gateway operator does.
+**Signing key (Phase 2 design, not shipped).** The Ed25519 chain head signing key will live with the gateway operator, not on the agent host. The operator holds it, rotates it on a set schedule and on any suspected compromise, and publishes the public key through a channel the reviewer trusts. A key on the agent host proves nothing. A key with the gateway operator does.
 
-**What v1 proves, and what it does not.** A v1 replay bundle proves self consistency: the events form an unbroken hash chain signed by the gateway key. It does not, on its own, prove authenticity to a stranger who has no reason to trust that key. External anchoring in Phase 2 adds authenticity: the chain head is published to an independent witness, so a later rewrite cannot match the anchored head.
+**What v1 proves, and what it does not.** A v1 replay bundle proves self consistency: the events form an unbroken hash chain. The chain is unsigned in v1, so this proves the record is internally consistent, not that the gateway wrote it, and anyone who can write the store can recompute the chain. External anchoring in Phase 2 adds authenticity: the chain head is published to an independent witness, so a later rewrite cannot match the anchored head.
 
 **Out of scope.** A compromised gateway, or a gateway operator who colludes with the agent operator, breaks the model. That case needs separation of duties and external anchoring, and Phase 2 addresses it. v1 does not claim to survive it.
 
@@ -71,10 +71,10 @@ State the adversary plainly.
 
 Question answered: What did the agent do?
 
-- Capture at the boundary: every MCP tool call, its inputs, its outputs, and its timing, seen completely by the gateway.
-- Capture at the terminal: full PTY input and output for terminal agents, from the Backseat capture path.
+- Capture at the boundary: every MCP tool call and its inputs, seen by the gateway. The shipped build records the call and its policy outcome, not the upstream result or its duration; outputs and timing are the design target.
+- Capture at the terminal: PTY output, session start, and exit for terminal agents, from the Backseat capture path. Typed input is not recorded as an event in the shipped build.
 - Store each event with a timestamp, session ID, agent ID, and parent event ID.
-- Sign the event stream into a hash chain held by the gateway.
+- Chain the event stream into a hash chain held by the gateway. Signing the chain is Phase 2 design.
 - Support replay: step through a session second by second, on one timeline that merges boundary events and terminal events.
 
 ### Pillar 2: Approval chain ledger bound to identity
@@ -130,7 +130,7 @@ Both capture planes feed one event normalizer, one ledger, and one replay timeli
 **Primary plane: MCP boundary gateway.**
 
 - The gateway sits between the agent and its MCP servers. Every tool call passes through it.
-- Tool calls are seen completely: name, arguments, result, duration, and caller identity. Nothing depends on the agent reporting itself honestly.
+- Tool calls are seen as they cross: name and arguments. The shipped build does not record the upstream result, the duration, or a verified caller identity. Nothing depends on the agent reporting itself honestly.
 - Approvals are enforced in path. Policy can allow, block, or hold a call for human approval before it reaches the tool.
 - Framework neutrality is real here. Any agent that speaks MCP gets the same capture and enforcement, with no per framework shim.
 - Cost budgets are enforced here too, in path, per session and per task.
@@ -160,11 +160,11 @@ Both capture planes feed one event normalizer, one ledger, and one replay timeli
 
 ### 6.4 Tamper-evident store
 
-- Append only event store. SQLite for local mode, Postgres for team mode.
-- Each event includes the hash of the prior event. The gateway signs the chain head per session and on a set interval.
-- The signing key lives with the gateway operator. See Section 4.
+- Append only event store. SQLite for local mode (shipped), Postgres for team mode (Phase 2).
+- Each event includes the hash of the prior event. Signing the chain head per session is Phase 2 design; the shipped chain is unsigned.
+- The signing key will live with the gateway operator. See Section 4.
 - Phase 2 anchor: publish the chain head hash to an external witness (git repo, object storage with retention lock, or a public timestamp service). v1 ships without anchoring and states that limit plainly.
-- Schema is versioned JSON with an OpenAPI and JSON Schema definition. Migration tools ship with each release.
+- Schema is versioned JSON. OpenAPI and JSON Schema definitions are planned, not yet published.
 
 ### 6.5 Replay
 
@@ -174,6 +174,8 @@ Both capture planes feed one event normalizer, one ledger, and one replay timeli
 - Export a replay bundle: a single file a reviewer can open offline to verify the hash chain and watch the session. v1 bundles prove self consistency. See Section 4.
 
 ### 6.6 SIEM and export
+
+Design target, not shipped. The shipped export is the offline JSON bundle only.
 
 - Stream events to Splunk, Elastic, Datadog, and generic webhooks via OpenTelemetry or syslog formats.
 - Map events to common schemas so SOC tools need no custom parser.
@@ -189,16 +191,16 @@ Scope:
 
 1. MCP boundary gateway: capture all tool calls, enforce a policy file in path, hold risky calls for approval.
 2. PTY co-capture from Backseat, merged into the same session timeline.
-3. Durable recording with hash chain, signed by the gateway key.
-4. Approval ledger with identity: one approver, OIDC or local key, policy file with 5 to 10 starter rules.
+3. Durable recording with hash chain. Signing by a gateway key is Phase 2; the shipped chain is unsigned.
+4. Approval ledger with identity: one approver named by CLI or web, with per-approver tokens binding the name to a credential. OIDC is later. Policy file with 5 to 10 starter rules.
 5. Replay in the browser, on one timeline.
-6. One export: JSON bundle plus SIEM webhook.
+6. One export: JSON bundle. The SIEM webhook is Phase 2.
 
 Target user for MVP: a platform or DevSecOps lead who runs coding agents on real repos and needs an audit trail for security review.
 
 Success test for MVP:
 
-- A reviewer with no access to the agent host can open a replay bundle, verify the hash chain against the gateway public key, see each approval with a named approver, and confirm no gaps in the recorded boundary and terminal events.
+- A reviewer with no access to the agent host can open a replay bundle, verify the hash chain, see each approval with a named approver, and confirm no gaps in the recorded boundary and terminal events. In v1 the bundle proves self consistency, not authorship; key based verification arrives with Phase 2 signing.
 - Setup takes under 10 minutes on a laptop.
 - Works with at least two agent tools on day one: one MCP based agent and one terminal agent (OpenCode).
 
@@ -209,7 +211,7 @@ Everything else waits until this wedge has real users and real feedback.
 - It will not build an agent, a planner, or a model router.
 - It will not become a general LLM gateway. It is a gateway for agent tool calls at the MCP boundary. Provider routing and model proxy features stay with LiteLLM and similar tools.
 - It will not build a general SIEM or log analytics platform.
-- It will not store secrets or act as a vault. It records that a secret was used, not the secret value. Redaction rules run at capture time, at the gateway and in PTY capture.
+- It will not store secrets or act as a vault. The design records that a secret was used, not the secret value, with redaction rules at capture time. Redaction is not shipped yet: the current build stores arguments and terminal output as sent, so operators must treat the ledger as secret-bearing (see `SECURITY.md`).
 - It will not add blockchain, tokens, or crypto incentives. A hash chain and signatures give the proof. No chain is needed.
 - It will not require cloud hosting. Self host is the default. A hosted version, if it comes, is optional.
 
@@ -242,20 +244,20 @@ Second edge: the builder runs this in real DevSecOps work. Policies and audit vi
 
 - **Language: Go** for the gateway, capture proxy, store, and server. Single binary, low latency, strong fit with Backseat which is already in Go.
 - **Boundary protocol: MCP first.** The gateway proxies MCP tool calls. Non MCP tools enter through PTY capture or not at all in v1.
-- **Store: SQLite (local) and Postgres (team).** Append only tables plus hash chain columns.
-- **Schemas: JSON with JSON Schema, plus OpenTelemetry semantic conventions** where they fit. Publish schemas in the repo from day one.
-- **Identity: OIDC first.** Support GitHub and Google as starter providers, plus generic OIDC. Local dev mode uses a local key pair.
-- **Signing: Ed25519** for event chain heads and replay bundles. Key held by the gateway operator, with rotation. See Section 4.
+- **Store: SQLite (local, shipped) and Postgres (team, Phase 2).** Append only tables plus hash chain columns.
+- **Schemas: JSON with JSON Schema, plus OpenTelemetry semantic conventions** where they fit. Publishing the schemas in the repo is planned, not yet done.
+- **Identity: OIDC first (design).** Support GitHub and Google as starter providers, plus generic OIDC. The shipped build uses named actors, with per-approver tokens binding a name to a credential.
+- **Signing: Ed25519 (Phase 2 design)** for event chain heads and replay bundles. Key held by the gateway operator, with rotation. See Section 4.
 - **Frontend: small web app for replay and approvals.** Server rendered where possible, minimal JS. Must work offline for bundle review.
-- **Policy: YAML rule file in v1.** Move to a proper policy language (Rego or Cedar) only after user feedback proves the need.
-- **Packaging: single binary plus Docker image.** Install with one command. No Kubernetes required for MVP.
-- **Secrets handling: redaction at capture.** Pattern list plus user rules strip keys, tokens, and passwords before storage. Redaction runs at the gateway, before the event enters the store.
+- **Policy: YAML rule file in v1 (shipped).** Move to a proper policy language (Rego or Cedar) only after user feedback proves the need.
+- **Packaging: single binary (shipped). Docker image planned.** Install with one command. No Kubernetes required for MVP.
+- **Secrets handling: redaction at capture (design, not shipped).** A pattern list plus user rules will strip keys, tokens, and passwords before storage. Until then, arguments and output are stored as sent.
 
 Open choices to test in MVP: gateway latency under high tool call volume, PTY proxy overhead on long sessions, and SQLite write limits under parallel agents.
 
 ## 11. Name candidates
 
-Keep the working title as Agent Trust Layer until the repo launch.
+Decided 2026-10-19: Ledgerline. The rest of this section is the historical record of that decision.
 
 Removed after conflict checks: Trustline (XRP DeFi and an AI agent payments risk product), Warden (funded Cosmos L1 for AI agents, direct collision), Overwatch (Blizzard), and Attest (weak: the word is owned in practice by the Sigstore attestation ecosystem).
 
@@ -290,7 +292,7 @@ Next step is a formal conflict check on the top two picks before any rename, the
 - PTY co-capture to the same durable store with hash chain.
 - Browser replay with one merged timeline.
 - Replay bundle export and verify command.
-- Docs, quick start, and a 90 second demo video.
+- Docs, quick start, and a 90 second demo video. (Docs and quick start shipped; the demo video is not yet made.)
 - Launch: Show HN, Backseat user note, and direct outreach to design partners.
 
 ### Phase 2: Team mode and anchoring (Months 3 to 4)
@@ -321,10 +323,12 @@ Timelines are targets, not promises. Each phase ships only when the prior phase 
 - **Risk: capture misses actions that cross no boundary.** In process framework calls bypass both planes. Mitigation: state coverage plainly per plane. Expand boundary coverage by demand, not by promise.
 - **Risk: commercial competitors ship faster.** Mintive and Ecliptica Replay already ship parts of this vision. Mitigation: open source, self hosted, integrated system. Speed on the wedge, not on breadth.
 - **Risk: users see audit as friction.** Mitigation: read only actions pass with no prompt. Only risky actions ask for approval. Keep approval under 5 seconds in the UI.
-- **Risk: privacy and secret leakage in recordings.** Mitigation: redaction at capture, local first storage, and a clear data handling doc. The tension between full action payload and redaction stays open and visible.
+- **Risk: privacy and secret leakage in recordings.** Mitigation: redaction at capture (planned, not shipped), local first storage, and a clear data handling doc. Until redaction ships, the docs state plainly that the ledger is secret-bearing. The tension between full action payload and redaction stays open and visible.
 - **Risk: framework vendors ship their own audit and close the gap.** Mitigation: stay neutral at the boundary. Vendor logs will stay vendor locked. Neutral, verifiable records are the wedge.
 
 ## 14. Open questions
+
+Answered by the Phase 1 build: question 8 (YAML in v1) and question 10 (a new repo). The rest remain open.
 
 1. Which MCP based agent tool is the design partner for the MVP, alongside OpenCode on the terminal plane? Pick by user demand from the Phase 0 talks.
 2. **Multi agent data model.** One hash chain per session, or one chain per agent tree? How do subagent fan out, parallel branches, and handoffs map to sessions, and how do approval chains compose across a tree? This must be answered before the Phase 0 schema freeze.

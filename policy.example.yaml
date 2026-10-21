@@ -9,7 +9,8 @@
 # Fields per rule:
 #   tool          glob for the tool name. Case-insensitive. "*" and "?" work.
 #   action        allow, deny, or hold (hold = wait for a human approval).
-#   reason        optional text. Shown in deny errors and kept for review.
+#   reason        optional text. Shown in the deny error returned to
+#                 the agent. Reasons are not stored in the ledger.
 #   args_match    optional map. Keys are dotted argument paths. Each value
 #                 is a glob matched against that argument's string value.
 #                 Argument globs are case-sensitive. "**" matches any

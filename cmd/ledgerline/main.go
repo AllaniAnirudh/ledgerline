@@ -23,12 +23,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/user"
 	"strings"
 	"time"
@@ -67,6 +69,10 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
+		var ec exitCodeError
+		if errors.As(err, &ec) {
+			os.Exit(ec.code)
+		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -150,6 +156,9 @@ func runGateway(args []string) error {
 	backend := "in-memory"
 	if *dbPath != "" {
 		backend = *dbPath
+	}
+	if *apiToken == "" && len(approverTokens) == 0 {
+		log.Printf("ledgerline: WARNING: no API token set. The control plane is unauthenticated: anyone who can reach %s can read the ledger (arguments included) and decide approvals. Set --api-token or --approver-token before exposing this port beyond loopback.", *listen)
 	}
 	log.Printf("ledgerline: boundary up on %s -> %s (ledger: %s, policy: %s)", *listen, *upstream, backend, policyDesc)
 	log.Printf("ledgerline: approvals page at http://localhost%s/approvals, replay at /replay", *listen)
@@ -411,9 +420,23 @@ func runPTY(args []string) error {
 	}()
 
 	fmt.Fprintf(os.Stderr, "ledgerline: captured session %s (pty)\n", *sessionID)
-	_ = s.Wait()
+	if err := s.Wait(); err != nil {
+		// Propagate the captured command's exit code: a caller
+		// wrapping an agent in a script must see its failure.
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return exitCodeError{code: ee.ExitCode()}
+		}
+		return err
+	}
 	return nil
 }
+
+// exitCodeError asks main to exit with a specific code and no
+// message (used for the captured command's own exit status).
+type exitCodeError struct{ code int }
+
+func (e exitCodeError) Error() string { return fmt.Sprintf("exit code %d", e.code) }
 
 func defaultActor() string {
 	if u, err := user.Current(); err == nil && u.Username != "" {

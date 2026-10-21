@@ -10,9 +10,9 @@
 
 1. Open an issue describing the change.
 2. Keep PRs small and focused. One concern per PR.
-3. `go build ./...` and `go vet ./...` must pass.
+3. `go build ./...`, `go vet ./...`, and `go test ./...` must pass. CI runs them on every push and pull request.
 4. Write in plain, short sentences. No AI slop in docs or comments.
 
 ## What we need most
 
-Right now: the Phase 1 wedge. MCP gateway hardening, the approval UX for held calls, PTY co-capture from Backseat, and the replay viewer. See `docs/VISION.md` section 12.
+Right now: hardening the shipped Phase 1 wedge (the MCP gateway, the approval UX, PTY co-capture, and the replay viewer), and the Phase 2 design work: chain signing and anchoring, redaction at capture, and SIEM export. See `docs/VISION.md` section 12.

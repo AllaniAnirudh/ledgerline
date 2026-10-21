@@ -10,8 +10,9 @@ import (
 )
 
 // SQLiteStore persists the event chain in SQLite (pure Go, no cgo).
-// The chain is verified on read paths the same way as the in-memory
-// store; SQLite is durability, not a different trust story.
+// Verify recomputes the chain from storage, the same as the
+// in-memory store; plain reads return the stored events as written.
+// SQLite is durability, not a different trust story.
 type SQLiteStore struct {
 	db *sql.DB
 }
@@ -39,6 +40,13 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		return nil, err
 	}
 	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// Parallel agents appending through one gateway can collide on
+	// the SQLite write lock; wait briefly instead of failing closed
+	// on the first contention.
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
 		db.Close()
 		return nil, err
 	}
