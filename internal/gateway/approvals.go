@@ -82,6 +82,25 @@ func (a *Approvals) Decide(id string, ok bool, actor string) bool {
 	return true
 }
 
+// DenySession resolves every pending approval from one session as
+// denied, so a contained session's held calls do not hang until
+// timeout. Returns how many were denied.
+func (a *Approvals) DenySession(sessionID, actor string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := 0
+	for _, p := range a.pending {
+		if p.SessionID != sessionID || p.decided {
+			continue
+		}
+		p.decided = true
+		delete(a.pending, p.ID)
+		p.resultCh <- decisionResult{approved: false, actor: actor}
+		n++
+	}
+	return n
+}
+
 func newID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -209,6 +228,21 @@ func (px *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 
 	case r.URL.Path == "/v1/approvals" && r.Method == http.MethodGet:
 		writeJSON(w, px.approvals.List())
+
+	case strings.HasPrefix(r.URL.Path, "/v1/sessions/") && strings.HasSuffix(r.URL.Path, "/contain") && r.Method == http.MethodPost:
+		px.containSessionAPI(w, r)
+
+	case r.URL.Path == "/v1/contained" && r.Method == http.MethodGet:
+		writeJSON(w, px.ContainedList())
+
+	case r.URL.Path == "/v1/proposals" && r.Method == http.MethodGet:
+		writeJSON(w, px.proposals.List())
+
+	case strings.HasPrefix(r.URL.Path, "/v1/proposals/") && strings.HasSuffix(r.URL.Path, "/decision") && r.Method == http.MethodPost:
+		px.decideProposal(w, r)
+
+	case r.URL.Path == "/v1/upstream" && r.Method == http.MethodGet:
+		writeJSON(w, map[string]any{"upstream": px.upstream.String(), "pin": px.upstreamPin, "pinned": px.pinConfigured})
 
 	case strings.HasPrefix(r.URL.Path, "/v1/sessions/") && strings.HasSuffix(r.URL.Path, "/events") && r.Method == http.MethodGet:
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/events")

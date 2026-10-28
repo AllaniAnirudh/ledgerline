@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/AllaniAnirudh/ledgerline/internal/ledger"
 	"github.com/AllaniAnirudh/ledgerline/internal/policy"
@@ -37,8 +38,14 @@ type Proxy struct {
 	policy    *policy.Policy
 	client    *http.Client
 	approvals *Approvals
+	proposals *Proposals
 	apiToken  string
 	approvers map[string]string // token -> approver name
+
+	containedMu   sync.Mutex
+	contained     map[string]containedSession
+	upstreamPin   string
+	pinConfigured bool
 }
 
 // SetAPIToken guards the /v1 control plane. When a token is set,
@@ -117,11 +124,24 @@ func New(upstream string, l ledger.Store, p *policy.Policy) (*Proxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, approvals: NewApprovals()}, nil
+	return &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, approvals: NewApprovals(), proposals: NewProposals()}, nil
 }
 
 // Approvals exposes the pending human-approval queue.
 func (px *Proxy) Approvals() *Approvals { return px.approvals }
+
+// Proposals exposes the pending out-of-band proposal queue.
+func (px *Proxy) Proposals() *Proposals { return px.proposals }
+
+// SetUpstreamPin records the pinned upstream identity for the
+// /v1/upstream endpoint. Empty means pinning is not configured.
+func (px *Proxy) SetUpstreamPin(pin string) {
+	if pin == "" {
+		return
+	}
+	px.upstreamPin = pin
+	px.pinConfigured = true
+}
 
 // Ledger exposes the underlying store for export and the replay API.
 func (px *Proxy) Ledger() ledger.Store { return px.ledger }
@@ -161,6 +181,23 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		session = "default"
 	}
 
+	// A contained session is cut off entirely: no tool call, no
+	// list, no other proxied traffic passes. The control plane
+	// above is unaffected, so a human can still inspect the
+	// session, and it stays contained until a new gateway start.
+	// Containment holds only while this gateway process lives: it
+	// is a session freeze, not a kill switch that survives a
+	// gateway restart.
+	if px.IsContained(session) {
+		if r.Method == http.MethodPost {
+			if !px.witness(session, "containment", "(session)", nil, "deny", "", w, body) {
+				return
+			}
+		}
+		http.Error(w, "ledgerline: session contained", http.StatusForbidden)
+		return
+	}
+
 	// Witness + police tool calls at the boundary.
 	if r.Method == http.MethodPost && isToolCall(body) {
 		tool, args := toolCallDetails(body)
@@ -178,6 +215,17 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		case policy.Hold:
 			px.hold(w, r, session, body, tool, args)
+			return
+		case policy.Contain:
+			msg := "ledgerline: session contained by policy"
+			if reason != "" {
+				msg += ": " + reason
+			}
+			px.Contain(session, "", reason)
+			writeJSONRPCError(w, body, msg)
+			return
+		case policy.Propose:
+			px.propose(w, session, body, tool, args)
 			return
 		}
 		if !px.witness(session, "tool_call", tool, args, policy.Allow.String(), "", w, body) {

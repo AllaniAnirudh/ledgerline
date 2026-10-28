@@ -1,5 +1,7 @@
 // Package policy decides what happens to a tool call at the boundary:
-// allow it through, deny it, or hold it for human approval.
+// allow it through, deny it, hold it for human approval, contain the
+// session it came from, or record it as a proposal for a human to
+// apply out of band.
 //
 // Policies come from a YAML file (see LoadFile and policy.example.yaml)
 // or from static allow/deny/hold lists (New, used by tests and the
@@ -33,6 +35,13 @@ const (
 	Allow Decision = iota
 	Deny
 	Hold // Hold means "needs a human" before the call may pass.
+	// Contain denies this call and freezes its whole session: every
+	// further call from the session is denied, and pending held calls
+	// from it are denied too.
+	Contain
+	// Propose records the call as a proposal and never forwards it.
+	// A human applies it out of band (or denies it) afterwards.
+	Propose
 )
 
 func (d Decision) String() string {
@@ -41,12 +50,17 @@ func (d Decision) String() string {
 		return "allow"
 	case Deny:
 		return "deny"
-	default:
+	case Hold:
 		return "hold"
+	case Contain:
+		return "contain"
+	default:
+		return "propose"
 	}
 }
 
-// ParseDecision converts "allow", "deny", or "hold" to a Decision.
+// ParseDecision converts "allow", "deny", "hold", "contain", or
+// "propose" to a Decision.
 func ParseDecision(s string) (Decision, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "allow":
@@ -55,8 +69,12 @@ func ParseDecision(s string) (Decision, error) {
 		return Deny, nil
 	case "hold":
 		return Hold, nil
+	case "contain":
+		return Contain, nil
+	case "propose":
+		return Propose, nil
 	}
-	return Allow, fmt.Errorf("invalid action %q (want allow, deny, or hold)", s)
+	return Allow, fmt.Errorf("invalid action %q (want allow, deny, hold, contain, or propose)", s)
 }
 
 // Rule is one ordered policy rule. Tool is a glob matched
@@ -225,8 +243,9 @@ func (p *Policy) DecideCall(tool string, args json.RawMessage) (Decision, string
 		case matchUnknown:
 			// Fail closed: a restrictive rule whose conditions
 			// cannot be evaluated counts as matched; an allow
-			// rule in that state grants nothing.
-			if r.Action == Deny || r.Action == Hold {
+			// rule in that state grants nothing. Contain and
+			// propose are restrictive: neither forwards the call.
+			if r.Action == Deny || r.Action == Hold || r.Action == Contain || r.Action == Propose {
 				reason := r.Reason
 				if reason == "" {
 					reason = "arguments could not be fully evaluated"

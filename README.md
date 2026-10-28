@@ -47,6 +47,25 @@ go build -o ledgerline ./cmd/ledgerline
 ./ledgerline approvals --gateway http://localhost:8080 --watch
 ./ledgerline approve <id> --actor alice
 
+# Three more policy actions exist. Contain freezes a session: the
+# triggering call is denied, every further call from the session is
+# denied, and its pending held calls are denied too. A human can
+# also freeze a session from the control plane at any time:
+#   ./ledgerline contain <session-id> --reason "suspicious holds"
+#   ./ledgerline contained
+# Propose records a call for out-of-band application and never
+# forwards it: the agent is told the action was NOT executed, and a
+# human applies it (or denies it) afterwards, outside the gateway:
+#   ./ledgerline proposals
+#   ./ledgerline apply <proposal-id>
+#   ./ledgerline deny <proposal-id>
+
+# Pin the upstream server so a changed upstream cannot slip in
+# silently. The first run writes the pin; later runs refuse to start
+# on a mismatch until a human re-approves (witnessed in the ledger):
+#   ./ledgerline gateway ... --upstream-pin-file upstream.pin
+#   ./ledgerline gateway ... --upstream-pin-file upstream.pin --reapprove-upstream
+
 # The ledger stores tool arguments as sent. There is no redaction
 # yet: treat ledger.db and exported bundles as secret-bearing.
 
@@ -77,10 +96,10 @@ go build -o ledgerline ./cmd/ledgerline
 
 ## Layout
 
-- `cmd/ledgerline` — CLI: `gateway`, `approvals`, `approve`, `deny`, `export`, `verify`, `run`
-- `internal/gateway` — the boundary proxy: intercepts `tools/call`, consults policy, holds for approval, forwards the rest; serves the `/v1/*` API, the `/approvals` page, and `/replay`
+- `cmd/ledgerline` — CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `export`, `verify`, `run`
+- `internal/gateway` — the boundary proxy: intercepts `tools/call`, consults policy, holds for approval, contains sessions, records proposals, forwards the rest; serves the `/v1/*` API, the `/approvals` page, and `/replay`
 - `internal/ledger` — `Store` interface; in-memory chain and SQLite backend; chain verification
-- `internal/policy` — allow/deny/hold decisions from a YAML policy file (ordered rules, glob tool names, decoded-JSON argument matching that fails closed, configurable default) or static lists (entries are tool globs)
+- `internal/policy` — allow/deny/hold/contain/propose decisions from a YAML policy file (ordered rules, glob tool names, decoded-JSON argument matching that fails closed, configurable default) or static lists (entries are tool globs)
 - `internal/pty` — PTY co-capture: runs a command, witnesses terminal output into the same ledger
 - `internal/replay` — offline bundle export (prefix-closed, so the chain verifies) and the timeline viewer
 - `docs/VISION.md` — the full vision and architecture doc
@@ -95,6 +114,8 @@ Honest limits of the current build (also in `SECURITY.md`):
 - No redaction at capture yet. Arguments and terminal output are stored as sent.
 - The gateway sets no timeout on upstream calls, so long-lived streaming sessions are never cut off, and a hung upstream holds a request open.
 - Capture records the call and its policy outcome, not the upstream result or its duration.
+- Containment is a session freeze inside a running gateway, not a kill switch that survives a gateway restart. A contained session unfreezes if the gateway restarts.
+- Upstream pinning covers the configured upstream URL only. It does not verify what the upstream server is, and it does not cover MCP servers reached any other way.
 
 ## Dogfood note
 

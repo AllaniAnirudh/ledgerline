@@ -5,7 +5,12 @@
 //	gateway    run the MCP boundary gateway (witness + policy in-path)
 //	approvals  list tool calls currently held for approval
 //	approve    approve a held call: ledgerline approve <id>
-//	deny       deny a held call:    ledgerline deny <id>
+//	deny       deny a held call or a proposal: ledgerline deny <id>
+//	contain    freeze a session:    ledgerline contain <session-id>
+//	contained  list frozen sessions
+//	proposals  list actions proposed for out-of-band application
+//	apply      record a proposal as applied out of band:
+//	           ledgerline apply <proposal-id>
 //	export     export the ledger (or one session) as an offline bundle
 //	verify     verify an exported bundle's chain without host access
 //	run        run a command under PTY capture into the ledger:
@@ -57,6 +62,14 @@ func main() {
 		err = runDecide(os.Args[2:], true)
 	case "deny":
 		err = runDecide(os.Args[2:], false)
+	case "contain":
+		err = runContain(os.Args[2:])
+	case "contained":
+		err = runContained(os.Args[2:])
+	case "proposals":
+		err = runProposals(os.Args[2:])
+	case "apply":
+		err = runApply(os.Args[2:])
 	case "export":
 		err = runExport(os.Args[2:])
 	case "verify":
@@ -79,7 +92,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ledgerline <gateway|approvals|approve|deny|export|verify|run> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: ledgerline <gateway|approvals|approve|deny|contain|contained|proposals|apply|export|verify|run> [flags]")
 }
 
 // openStore returns the ledger backend: SQLite when --db is set,
@@ -107,6 +120,9 @@ func runGateway(args []string) error {
 	var approverTokens stringListFlag
 	fs.Var(&approverTokens, "approver-token", "per-approver token as name=token (repeatable); decisions made with it are recorded under that name")
 	holdTimeout := fs.Duration("hold-timeout", 5*time.Minute, "how long a held call waits for a human")
+	pinFile := fs.String("upstream-pin-file", "", "path to the upstream pin file (empty = no pinning; first run creates the pin)")
+	reapprove := fs.Bool("reapprove-upstream", false, "accept a changed upstream and overwrite the pin (witnessed in the ledger)")
+	reapproveActor := fs.String("reapprove-actor", defaultActor(), "who is re-approving the upstream")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -142,6 +158,26 @@ func runGateway(args []string) error {
 		return err
 	}
 	px.Approvals().SetTimeout(*holdTimeout)
+	if *pinFile != "" {
+		st, err := gateway.CheckUpstreamPin(*pinFile, *upstream, *reapprove)
+		if err != nil {
+			return err
+		}
+		pin := gateway.UpstreamPin(*upstream)
+		px.SetUpstreamPin(pin)
+		switch st {
+		case "created":
+			log.Printf("ledgerline: upstream pin created for %s", *upstream)
+		case "ok":
+			log.Printf("ledgerline: upstream pin verified for %s", *upstream)
+		case "reapproved":
+			argsJSON, _ := json.Marshal(map[string]string{"pin": pin})
+			if _, err := store.Append("gateway", "upstream", "(upstream)", argsJSON, "reapprove", *reapproveActor); err != nil {
+				log.Printf("ledgerline: WARNING: could not witness upstream re-approval: %v", err)
+			}
+			log.Printf("ledgerline: upstream pin re-approved for %s by %s", *upstream, *reapproveActor)
+		}
+	}
 	if *apiToken != "" {
 		px.SetAPIToken(*apiToken)
 	}
@@ -324,6 +360,16 @@ func runDecide(args []string, approve bool) error {
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
+		// A deny for an unknown approval may be a proposal: deny
+		// falls through to the proposal queue before giving up.
+		// Approve has no fallback: proposals are applied, not
+		// approved, so an approval miss on approve is an error.
+		if !approve && resp.StatusCode == http.StatusNotFound {
+			if err := denyProposal(*gw, id, *actor, *token); err == nil {
+				fmt.Printf("denied %s by %s\n", id, *actor)
+				return nil
+			}
+		}
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
 	}
 	past := "denied"
@@ -331,6 +377,258 @@ func runDecide(args []string, approve bool) error {
 		past = "approved"
 	}
 	fmt.Printf("%s %s by %s\n", past, id, *actor)
+	return nil
+}
+
+func denyProposal(gw, id, actor, token string) error {
+	body, _ := json.Marshal(map[string]string{"decision": "deny", "actor": actor})
+	url := strings.TrimSuffix(gw, "/") + "/v1/proposals/" + id + "/decision"
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("X-Ledgerline-Token", token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
+// runContain freezes one session from the CLI.
+func runContain(args []string) error {
+	// Pull the session ID (first non-flag arg); flags may come in any order.
+	valued := map[string]bool{"gateway": true, "actor": true, "token": true, "reason": true}
+	var id string
+	var rest []string
+	skipNext := false
+	for _, a := range args {
+		if skipNext {
+			rest = append(rest, a)
+			skipNext = false
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		if eq := strings.Index(name, "="); eq >= 0 {
+			name = name[:eq]
+		}
+		if strings.HasPrefix(a, "-") {
+			rest = append(rest, a)
+			if valued[name] && !strings.Contains(a, "=") {
+				skipNext = true
+			}
+			continue
+		}
+		if id == "" {
+			id = a
+			continue
+		}
+		rest = append(rest, a)
+	}
+	fs := flag.NewFlagSet("contain", flag.ExitOnError)
+	gw := fs.String("gateway", "http://localhost:8080", "gateway address")
+	actor := fs.String("actor", defaultActor(), "who is containing the session")
+	token := fs.String("token", os.Getenv("LEDGERLINE_API_TOKEN"), "gateway API token (or env LEDGERLINE_API_TOKEN)")
+	reason := fs.String("reason", "", "why the session is contained")
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if id == "" {
+		return fmt.Errorf("usage: ledgerline contain <session-id>")
+	}
+	body, _ := json.Marshal(map[string]string{"actor": *actor, "reason": *reason})
+	url := strings.TrimSuffix(*gw, "/") + "/v1/sessions/" + id + "/contain"
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if *token != "" {
+		req.Header.Set("X-Ledgerline-Token", *token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
+	}
+	fmt.Printf("contained %s by %s\n", id, *actor)
+	return nil
+}
+
+// runContained lists frozen sessions.
+func runContained(args []string) error {
+	fs := flag.NewFlagSet("contained", flag.ExitOnError)
+	gw := fs.String("gateway", "http://localhost:8080", "gateway address")
+	token := fs.String("token", os.Getenv("LEDGERLINE_API_TOKEN"), "gateway API token (or env LEDGERLINE_API_TOKEN)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimSuffix(*gw, "/")+"/v1/contained", nil)
+	if err != nil {
+		return err
+	}
+	if *token != "" {
+		req.Header.Set("X-Ledgerline-Token", *token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
+	}
+	var list []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Println("no contained sessions")
+		return nil
+	}
+	for _, c := range list {
+		fmt.Printf("%v  actor=%s  reason=%s  at=%v\n", c["session_id"], strOrDash(c["actor"]), strOrDash(c["reason"]), c["contained_at"])
+	}
+	return nil
+}
+
+// strOrDash prints a JSON value, or "-" when it is absent.
+func strOrDash(v any) string {
+	if s, ok := v.(string); ok && s != "" {
+		return s
+	}
+	return "-"
+}
+
+func fetchProposals(gw, token string) ([]map[string]any, error) {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimSuffix(gw, "/")+"/v1/proposals", nil)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("X-Ledgerline-Token", token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
+	}
+	var list []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+// runProposals lists actions proposed for out-of-band application.
+func runProposals(args []string) error {
+	fs := flag.NewFlagSet("proposals", flag.ExitOnError)
+	gw := fs.String("gateway", "http://localhost:8080", "gateway address")
+	token := fs.String("token", os.Getenv("LEDGERLINE_API_TOKEN"), "gateway API token (or env LEDGERLINE_API_TOKEN)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	list, err := fetchProposals(*gw, *token)
+	if err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Println("no pending proposals")
+		return nil
+	}
+	for _, p := range list {
+		argsStr := ""
+		if a, ok := p["args"]; ok && a != nil {
+			raw, _ := json.Marshal(a)
+			s := string(raw)
+			if len(s) > 90 {
+				s = s[:90] + "..."
+			}
+			argsStr = "  args=" + s
+		}
+		fmt.Printf("%s  session=%v  tool=%v%s\n", p["id"], p["session_id"], p["tool"], argsStr)
+	}
+	return nil
+}
+
+// runApply records a proposal as applied out of band. The gateway
+// never forwards a proposal; application is the human's own act,
+// and this command only witnesses it.
+func runApply(args []string) error {
+	valued := map[string]bool{"gateway": true, "actor": true, "token": true}
+	var id string
+	var rest []string
+	skipNext := false
+	for _, a := range args {
+		if skipNext {
+			rest = append(rest, a)
+			skipNext = false
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		if eq := strings.Index(name, "="); eq >= 0 {
+			name = name[:eq]
+		}
+		if strings.HasPrefix(a, "-") {
+			rest = append(rest, a)
+			if valued[name] && !strings.Contains(a, "=") {
+				skipNext = true
+			}
+			continue
+		}
+		if id == "" {
+			id = a
+			continue
+		}
+		rest = append(rest, a)
+	}
+	fs := flag.NewFlagSet("apply", flag.ExitOnError)
+	gw := fs.String("gateway", "http://localhost:8080", "gateway address")
+	actor := fs.String("actor", defaultActor(), "who applied the proposal out of band")
+	token := fs.String("token", os.Getenv("LEDGERLINE_API_TOKEN"), "gateway API token (or env LEDGERLINE_API_TOKEN)")
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if id == "" {
+		return fmt.Errorf("usage: ledgerline apply <proposal-id>")
+	}
+	body, _ := json.Marshal(map[string]string{"decision": "apply", "actor": *actor})
+	url := strings.TrimSuffix(*gw, "/") + "/v1/proposals/" + id + "/decision"
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if *token != "" {
+		req.Header.Set("X-Ledgerline-Token", *token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
+	}
+	fmt.Printf("applied %s by %s\n", id, *actor)
 	return nil
 }
 
