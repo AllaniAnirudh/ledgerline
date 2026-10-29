@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AllaniAnirudh/ledgerline/internal/gateway"
 	"github.com/AllaniAnirudh/ledgerline/internal/ledger"
 	"github.com/AllaniAnirudh/ledgerline/internal/policy"
 )
@@ -51,9 +52,9 @@ var hookNameMaps = map[string]map[string]string{
 	},
 	"gemini": {
 		"run_shell_command": "bash", "read_file": "read",
-		"read_many_files": "read_many_files", "write_file": "write",
+		"read_many_files": "read", "write_file": "write",
 		"replace": "edit", "grep_search": "grep",
-		"search_file_content": "grep", "web_fetch": "webfetch",
+		"search_file_content": "search", "web_fetch": "webfetch",
 		"web_search": "websearch", "list_directory": "list",
 	},
 	"opencode": {},
@@ -73,6 +74,9 @@ func mapHookName(harness, name string) string {
 		}
 	}
 	if harness == "claude-code" {
+		if strings.HasPrefix(name, "mcp__") {
+			return name
+		}
 		return strings.ToLower(name)
 	}
 	return name
@@ -133,6 +137,24 @@ type hookOutcome struct {
 	reason string
 }
 
+// resolveHoldTimeout turns an unset hold timeout into a
+// per-harness default. Gemini kills hooks at 60 seconds by
+// default. Its default sits below that line, so the bridge
+// answers before Gemini kills it. Other harnesses get 120
+// seconds. A negative value is an error.
+func resolveHoldTimeout(harness string, d time.Duration) (time.Duration, error) {
+	if d < 0 {
+		return 0, fmt.Errorf("--hold-timeout must be zero or above")
+	}
+	if d > 0 {
+		return d, nil
+	}
+	if harness == "gemini" {
+		return 45 * time.Second, nil
+	}
+	return 120 * time.Second, nil
+}
+
 // decideHookStandalone applies the policy without a gateway. It
 // mirrors the gateway witness order. The policy decision comes
 // first. The call record comes second. A hold cannot wait
@@ -140,8 +162,16 @@ type hookOutcome struct {
 // and retry. A contain rule keeps denying while it stands.
 // Each new hook invocation re-evaluates the policy. A proposal
 // is recorded in the ledger. The agent is told the action was
-// not executed.
-func decideHookStandalone(store ledger.Store, pol *policy.Policy, session, tool string, args json.RawMessage) hookOutcome {
+// not executed. With a broker, a brokered secret in the
+// arguments is denied before any witness records those
+// arguments. Without a broker, arguments are recorded as sent.
+func decideHookStandalone(store ledger.Store, pol *policy.Policy, broker *gateway.Broker, session, tool string, args json.RawMessage) hookOutcome {
+	if broker != nil && broker.ContainsSecret(args) {
+		if _, err := store.Append(session, "policy_decision", tool, nil, "deny", ""); err != nil {
+			return hookOutcome{reason: "ledgerline: ledger unavailable, boundary closed"}
+		}
+		return hookOutcome{reason: "ledgerline: tool arguments contain a brokered credential"}
+	}
 	decision, reason := pol.DecideCall(tool, args)
 	if _, err := store.Append(session, "policy_decision", tool, nil, decision.String(), ""); err != nil {
 		return hookOutcome{reason: "ledgerline: ledger unavailable, boundary closed"}
@@ -232,7 +262,8 @@ func runHook(args []string) error {
 	gatewayURL := fs.String("gateway", "", "running gateway base URL (when set, decisions come from the gateway; --db is ignored)")
 	token := fs.String("token", os.Getenv("LEDGERLINE_API_TOKEN"), "gateway API token (or env LEDGERLINE_API_TOKEN)")
 	sessionFlag := fs.String("session", "", "ledger session (default: the harness session id)")
-	holdTimeout := fs.Duration("hold-timeout", 120*time.Second, "how long to wait for a gateway approval before denying")
+	holdTimeout := fs.Duration("hold-timeout", 0, "how long to wait for a gateway approval before denying (0 = auto: 120s, or 45s for gemini; the bridge waits this plus 30s of client grace)")
+	brokerFile := fs.String("broker", "", "broker config file for standalone secret scans (empty = no scan; values come from the environment, never the file)")
 	failOpen := fs.Bool("fail-open", false, "allow on bridge errors (policy denials still block)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -244,8 +275,9 @@ func runHook(args []string) error {
 	if *policyFile != "" && (*deny != "" || *hold != "") {
 		return block("ledgerline hook: --policy replaces --deny/--hold; pass one or the other, not both")
 	}
-	if *holdTimeout <= 0 {
-		return block("ledgerline hook: --hold-timeout must be above zero")
+	timeout, err := resolveHoldTimeout(*harness, *holdTimeout)
+	if err != nil {
+		return block("ledgerline hook: " + err.Error())
 	}
 	raw, err := io.ReadAll(io.LimitReader(os.Stdin, maxHookPayload+1))
 	if err != nil {
@@ -268,7 +300,7 @@ func runHook(args []string) error {
 
 	var outcome hookOutcome
 	if *gatewayURL != "" {
-		outcome, err = decideHookGateway(*gatewayURL, *token, *holdTimeout, session, payload.Tool, payload.Args)
+		outcome, err = decideHookGateway(*gatewayURL, *token, timeout, session, payload.Tool, payload.Args)
 		if err != nil {
 			if *failOpen {
 				fmt.Fprintf(os.Stderr, "ledgerline hook: fail-open: %v\n", err)
@@ -289,12 +321,19 @@ func runHook(args []string) error {
 		} else {
 			pol = policy.New(split(*deny), split(*hold))
 		}
+		var broker *gateway.Broker
+		if *brokerFile != "" {
+			broker, err = gateway.LoadBrokerFile(*brokerFile)
+			if err != nil {
+				return block("ledgerline hook: " + err.Error())
+			}
+		}
 		store, closeStore, err := openStore(*dbPath)
 		if err != nil {
 			return block("ledgerline hook: " + err.Error())
 		}
 		defer closeStore()
-		outcome = decideHookStandalone(store, pol, session, payload.Tool, payload.Args)
+		outcome = decideHookStandalone(store, pol, broker, session, payload.Tool, payload.Args)
 	}
 	if outcome.allow {
 		return nil

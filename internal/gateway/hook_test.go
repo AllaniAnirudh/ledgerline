@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -204,6 +205,75 @@ func TestHookBadBody(t *testing.T) {
 	px.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("hook body without tool: want 400, got %d", rec.Code)
+	}
+}
+
+func TestHookHoldDisconnectCancels(t *testing.T) {
+	px, err := New("http://localhost:1", ledger.New(), policy.New(nil, []string{"bash"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	px.Approvals().SetTimeout(10 * time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/hook", strings.NewReader(`{"tool":"bash","arguments":{},"session":"s1"}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		px.ServeHTTP(rec, req)
+		close(done)
+	}()
+	var id string
+	for i := 0; i < 100 && id == ""; i++ {
+		time.Sleep(20 * time.Millisecond)
+		if list := px.Approvals().List(); len(list) > 0 {
+			id = list[0].ID
+		}
+	}
+	if id == "" {
+		t.Fatal("held hook call never appeared")
+	}
+	cancel()
+	<-done
+	if list := px.Approvals().List(); len(list) != 0 {
+		t.Fatal("disconnect should cancel the hold")
+	}
+	if px.Approvals().Decide(id, true, "tester") {
+		t.Fatal("late decision should fail after cancel")
+	}
+	if n := countEvents(t, px, "approval", "cancelled"); n != 1 {
+		t.Fatalf("disconnect should witness one cancel, got %d", n)
+	}
+	if n := countEvents(t, px, "tool_call", "allow"); n != 0 {
+		t.Fatalf("cancelled hold must record no allow, got %d", n)
+	}
+}
+
+func TestHookContainedWitness(t *testing.T) {
+	px, err := New("http://localhost:1", ledger.New(), policy.New(nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	px.Contain("s1", "", "test")
+	_, out := postHook(t, px, "bash", `{}`, "s1", "")
+	if out["decision"] != "deny" {
+		t.Fatalf("contained session should deny, got %v", out)
+	}
+	if n := countEvents(t, px, "containment", "deny"); n != 1 {
+		t.Fatalf("contained deny should witness one containment event, got %d", n)
+	}
+}
+
+func TestHookBodyTooLarge(t *testing.T) {
+	px, err := New("http://localhost:1", ledger.New(), policy.New(nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"tool":"` + strings.Repeat("a", (10<<20)+1) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/hook", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	px.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversize hook body: want 400, got %d", rec.Code)
 	}
 }
 

@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -20,9 +21,10 @@ import (
 // session. The answer is allow or deny. A hold parks the call in
 // the same approval queue the gateway uses. It waits for the
 // human decision. The harness hook timeout bounds the wait. If
-// the bridge stops waiting first, the gateway hold stays open
-// until its own timeout. The agent must retry for a fresh
-// hold.
+// the bridge stops waiting first, the gateway hold is cancelled.
+// A late approval after that records no allow. The agent must
+// retry for a fresh hold. The endpoint caps the request body
+// at the same 10 MB as other gateway traffic.
 //
 // Drift detection does not apply here. It guards the upstream
 // MCP tool surface, not native harness tools. Policy is the
@@ -40,8 +42,13 @@ type hookDecision struct {
 }
 
 func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if err != nil || len(body) > maxBodyBytes {
+		http.Error(w, "hook body too large", http.StatusBadRequest)
+		return
+	}
 	var req hookRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, "bad hook body", http.StatusBadRequest)
 		return
 	}
@@ -60,8 +67,13 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// A contained session gets nothing. This matches the proxy
-	// path.
+	// path. The denial is witnessed, so blocked hook attempts
+	// stay visible in the ledger.
 	if px.IsContained(session, "") {
+		if _, err := px.ledger.Append(session, "containment", "(session)", nil, "deny", ""); err != nil {
+			http.Error(w, "ledgerline: ledger unavailable, boundary closed", http.StatusServiceUnavailable)
+			return
+		}
 		writeJSON(w, hookDecision{Decision: "deny", Reason: "ledgerline: session contained"})
 		return
 	}
@@ -122,7 +134,7 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, hookDecision{Decision: "deny", Reason: text})
 	case policy.Hold:
-		writeJSON(w, px.hookHold(session, tool, args))
+		writeJSON(w, px.hookHold(r, session, tool, args))
 	default:
 		writeJSON(w, hookDecision{Decision: "deny", Reason: "ledgerline: unknown policy decision"})
 	}
@@ -134,7 +146,7 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 // There is no upstream call to forward. The decision itself is
 // the answer. There is no idempotency claim. A hook call
 // is a check, not a forwarded call.
-func (px *Proxy) hookHold(session, tool string, args json.RawMessage) hookDecision {
+func (px *Proxy) hookHold(r *http.Request, session, tool string, args json.RawMessage) hookDecision {
 	id, err := newID()
 	if err != nil {
 		return hookDecision{Decision: "deny", Reason: "ledgerline: cannot allocate approval id, boundary closed"}
@@ -179,6 +191,26 @@ func (px *Proxy) hookHold(session, tool string, args json.RawMessage) hookDecisi
 	select {
 	case res := <-p.resultCh:
 		return px.hookDecided(session, tool, args, res)
+	case <-r.Context().Done():
+		// The bridge left. Cancel the hold, so a late
+		// approval cannot record an allow for a call that
+		// never ran. A decision that raced the disconnect
+		// is dropped for the same reason.
+		px.approvals.mu.Lock()
+		if !p.decided {
+			p.decided = true
+			delete(px.approvals.pending, p.ID)
+		} else {
+			select {
+			case <-p.resultCh:
+			default:
+			}
+		}
+		px.approvals.mu.Unlock()
+		if _, err := px.ledger.Append(session, "approval", tool, args, "cancelled", ""); err != nil {
+			log.Printf("ledger write failed on approval cancel: %v", err)
+		}
+		return hookDecision{Decision: "deny", Reason: "ledgerline: bridge disconnected, approval cancelled; retry for a fresh hold"}
 	case <-timer.C:
 		// Claim the entry under the lock. A decision and a
 		// timeout can never both win the same hold.

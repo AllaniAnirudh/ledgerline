@@ -167,16 +167,56 @@ go build -o ledgerline ./cmd/ledgerline
 # With a gateway, a hold waits for a human decision, in the
 # same queue as MCP holds. Without a gateway, a hold blocks
 # with a note on how to approve and retry.
-# Set the harness hook timeout above --hold-timeout (120s by
-# default), and set onFailure to block, so a killed bridge
-# blocks instead of waving the call through.
+# If the bridge stops waiting, the gateway hold is cancelled.
+# A late approval after that records no allow. The agent must
+# retry for a fresh hold.
+# The bridge waits the hold timeout plus 30 seconds of client
+# grace. Set the harness hook timeout above that total.
+# Claude Code counts timeouts in seconds. Set it above 150
+# seconds for the 120 second default, and set onFailure to
+# block, so a killed bridge blocks instead of waving the call
+# through. Gemini CLI counts timeouts in milliseconds. Its
+# default is 60 seconds. The bridge default for Gemini is 45
+# seconds, so the bridge answers before Gemini kills it. Set a
+# Gemini timeout above 75000 milliseconds when you raise the
+# bridge timeout. Gemini has no fail-closed timeout option.
+# A killed Gemini bridge lets the call through. Keep the bridge
+# timeout below the Gemini timeout.
 # Tool names map to one canonical set, so one policy file works
-# across harnesses: Bash becomes bash, run_shell_command becomes
-# bash, replace becomes edit. Names with no map pass through.
+# across harnesses. Claude Code names lowercase, except names
+# that start with mcp__, which pass through unchanged. Gemini
+# names map like this: run_shell_command to bash, read_file and
+# read_many_files to read, write_file to write, replace to
+# edit, grep_search to grep, search_file_content to search,
+# web_fetch to webfetch, web_search to websearch,
+# list_directory to list. Other names pass through unchanged.
+# A policy that denies grep must also deny search to cover
+# both Gemini search tools.
+# OpenCode plugins must build the bridge envelope themselves:
+# tool, args, and session. Native OpenCode events carry input
+# and output and block by throwing. The plugin maps those to
+# the envelope and sends the session id. A missing session
+# becomes the default session.
+# No policy flags means allow-all: the bridge only records.
+# An empty policy file is refused instead. Pass a policy file
+# or a deny list or a hold list to enforce anything.
+# The bridge ignores cwd. Policy authors must match absolute
+# paths. Relative paths match as sent.
+# Fail-open flips bridge errors to allows. That includes a
+# gateway ledger outage: the gateway answers 503, the bridge
+# allows, and no record exists for that allow. Policy denials
+# still block under fail-open.
+# With --broker, the standalone bridge scans arguments for
+# brokered secrets and denies them before witnessing, like the
+# gateway. Without --broker, it records arguments as sent,
+# secrets included. Broker users who need the guarantee must
+# pass --broker or use gateway mode.
 #   # Claude Code (settings.json, PreToolUse, matcher "*"):
 #   #   "command": "ledgerline hook --harness claude-code --db ledger.db --policy policy.yaml"
+#   #   with: "timeout": 180, "onFailure": "block"
 #   # Gemini CLI (settings.json, BeforeTool, matcher "*"):
 #   #   "command": "ledgerline hook --harness gemini --db ledger.db --policy policy.yaml"
+#   #   with: "timeout": 120000
 #   # With a gateway (holds wait for approval):
 #   #   ledgerline hook --harness claude-code --gateway http://localhost:8080 --token "$LEDGERLINE_API_TOKEN"
 # Drift detection does not apply to hook calls: it guards the

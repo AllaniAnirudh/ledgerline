@@ -2,10 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/AllaniAnirudh/ledgerline/internal/gateway"
 	"github.com/AllaniAnirudh/ledgerline/internal/ledger"
 	"github.com/AllaniAnirudh/ledgerline/internal/policy"
 )
@@ -110,7 +115,7 @@ func countStoreEvents(t *testing.T, store ledger.Store, kind, decision string) i
 
 func TestDecideHookStandaloneAllow(t *testing.T) {
 	store := ledger.New()
-	out := decideHookStandalone(store, policy.New(nil, nil), "s1", "bash", json.RawMessage(`{"command":"ls"}`))
+	out := decideHookStandalone(store, policy.New(nil, nil), nil, "s1", "bash", json.RawMessage(`{"command":"ls"}`))
 	if !out.allow {
 		t.Fatalf("allow policy should allow, got %+v", out)
 	}
@@ -121,7 +126,7 @@ func TestDecideHookStandaloneAllow(t *testing.T) {
 
 func TestDecideHookStandaloneDeny(t *testing.T) {
 	store := ledger.New()
-	out := decideHookStandalone(store, policy.New([]string{"bash"}, nil), "s1", "bash", json.RawMessage(`{}`))
+	out := decideHookStandalone(store, policy.New([]string{"bash"}, nil), nil, "s1", "bash", json.RawMessage(`{}`))
 	if out.allow || !strings.Contains(out.reason, "denied by policy") {
 		t.Fatalf("deny policy should block with reason, got %+v", out)
 	}
@@ -129,7 +134,7 @@ func TestDecideHookStandaloneDeny(t *testing.T) {
 
 func TestDecideHookStandaloneHold(t *testing.T) {
 	store := ledger.New()
-	out := decideHookStandalone(store, policy.New(nil, []string{"bash"}), "s1", "bash", json.RawMessage(`{}`))
+	out := decideHookStandalone(store, policy.New(nil, []string{"bash"}), nil, "s1", "bash", json.RawMessage(`{}`))
 	if out.allow || !strings.Contains(out.reason, "no gateway") {
 		t.Fatalf("standalone hold should block with a gateway note, got %+v", out)
 	}
@@ -144,11 +149,11 @@ func TestDecideHookStandaloneContainPropose(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := ledger.New()
-	out := decideHookStandalone(store, p, "s1", "bash", json.RawMessage(`{}`))
+	out := decideHookStandalone(store, p, nil, "s1", "bash", json.RawMessage(`{}`))
 	if out.allow || !strings.Contains(out.reason, "contained") {
 		t.Fatalf("contain should block, got %+v", out)
 	}
-	out = decideHookStandalone(store, p, "s1", "edit", json.RawMessage(`{}`))
+	out = decideHookStandalone(store, p, nil, "s1", "edit", json.RawMessage(`{}`))
 	if out.allow || !strings.Contains(out.reason, "NOT executed") {
 		t.Fatalf("propose should block as not executed, got %+v", out)
 	}
@@ -166,8 +171,117 @@ func TestDecideHookStandaloneLedgerFailure(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	out := decideHookStandalone(store, policy.New(nil, nil), "s1", "bash", json.RawMessage(`{}`))
+	out := decideHookStandalone(store, policy.New(nil, nil), nil, "s1", "bash", json.RawMessage(`{}`))
 	if out.allow || !strings.Contains(out.reason, "ledger unavailable") {
 		t.Fatalf("ledger failure should block, got %+v", out)
+	}
+}
+
+func TestResolveHoldTimeout(t *testing.T) {
+	if d, err := resolveHoldTimeout("gemini", 0); err != nil || d != 45*time.Second {
+		t.Fatalf("gemini auto timeout should be 45s, got %v %v", d, err)
+	}
+	if d, err := resolveHoldTimeout("claude-code", 0); err != nil || d != 120*time.Second {
+		t.Fatalf("default auto timeout should be 120s, got %v %v", d, err)
+	}
+	if d, err := resolveHoldTimeout("gemini", 90*time.Second); err != nil || d != 90*time.Second {
+		t.Fatalf("explicit timeout should pass through, got %v %v", d, err)
+	}
+	if _, err := resolveHoldTimeout("generic", -time.Second); err == nil {
+		t.Fatal("negative timeout should error")
+	}
+}
+
+func TestMapHookNameMCPMixed(t *testing.T) {
+	if got := mapHookName("claude-code", "mcp__MyServer__MyTool"); got != "mcp__MyServer__MyTool" {
+		t.Fatalf("mixed-case MCP name should pass through, got %q", got)
+	}
+}
+
+func TestParseHookPayloadGeminiMap(t *testing.T) {
+	p, err := parseHookPayload("gemini", []byte(`{"tool_name":"read_many_files","tool_input":{}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Tool != "read" {
+		t.Fatalf("read_many_files should map to read, got %q", p.Tool)
+	}
+	p, err = parseHookPayload("gemini", []byte(`{"tool_name":"search_file_content","tool_input":{}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Tool != "search" {
+		t.Fatalf("search_file_content should map to search, got %q", p.Tool)
+	}
+}
+
+func TestDecideHookGateway(t *testing.T) {
+	allowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/hook" || r.Header.Get("X-Ledgerline-Token") != "tok" {
+			t.Errorf("gateway call should hit /v1/hook with the token, got path %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"decision":"allow"}`))
+	}))
+	defer allowSrv.Close()
+	out, err := decideHookGateway(allowSrv.URL+"/", "tok", time.Second, "s1", "bash", json.RawMessage(`{}`))
+	if err != nil || !out.allow {
+		t.Fatalf("allow answer should allow, got %+v %v", out, err)
+	}
+
+	denySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"decision":"deny","reason":"nope"}`))
+	}))
+	defer denySrv.Close()
+	out, err = decideHookGateway(denySrv.URL, "", time.Second, "s1", "bash", json.RawMessage(`{}`))
+	if err != nil || out.allow || out.reason != "nope" {
+		t.Fatalf("deny answer should block with its reason, got %+v %v", out, err)
+	}
+
+	bareDenySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"decision":"deny"}`))
+	}))
+	defer bareDenySrv.Close()
+	out, err = decideHookGateway(bareDenySrv.URL, "", time.Second, "s1", "bash", json.RawMessage(`{}`))
+	if err != nil || out.allow || !strings.Contains(out.reason, "denied by gateway") {
+		t.Fatalf("bare deny should use the fallback reason, got %+v %v", out, err)
+	}
+
+	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("ledger unavailable"))
+	}))
+	defer errSrv.Close()
+	if _, err := decideHookGateway(errSrv.URL, "", time.Second, "s1", "bash", json.RawMessage(`{}`)); err == nil {
+		t.Fatal("non-200 gateway answer should error")
+	}
+}
+
+func TestDecideHookStandaloneBroker(t *testing.T) {
+	t.Setenv("LEDGERLINE_TEST_HOOK_BROKER_KEY", "hook-broker-secret-12345")
+	cfg := filepath.Join(t.TempDir(), "broker.yaml")
+	if err := os.WriteFile(cfg, []byte("version: 1\ncredentials:\n  - name: upstream-key\n    header: X-Upstream-Key\n    env: LEDGERLINE_TEST_HOOK_BROKER_KEY\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := gateway.LoadBrokerFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := ledger.New()
+	out := decideHookStandalone(store, policy.New(nil, nil), b, "s1", "bash", json.RawMessage(`{"command":"hook-broker-secret-12345"}`))
+	if out.allow || !strings.Contains(out.reason, "brokered credential") {
+		t.Fatalf("secret in arguments should deny, got %+v", out)
+	}
+	events, err := store.Events()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range events {
+		if strings.Contains(string(e.Args), "hook-broker-secret-12345") {
+			t.Fatal("standalone ledger must never record a brokered secret")
+		}
+	}
+	out = decideHookStandalone(store, policy.New(nil, nil), b, "s1", "bash", json.RawMessage(`{"command":"ls"}`))
+	if !out.allow {
+		t.Fatalf("clean call should allow, got %+v", out)
 	}
 }
