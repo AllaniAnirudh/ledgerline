@@ -213,6 +213,9 @@ func decideHookStandalone(store ledger.Store, pol *policy.Policy, broker *gatewa
 // hold wait. The extra 30 seconds cover response transit
 // after the gateway answers. The total wait is timeout plus
 // grace, and harness timeouts must sit above that total.
+// This is the only bridge client constructor. decideHookGateway
+// must build its client here, so the timeout arithmetic stays
+// pinned by TestHookClientTimeout and the wiring test below.
 func hookHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{Timeout: timeout + 30*time.Second}
 }

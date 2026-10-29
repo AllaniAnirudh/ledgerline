@@ -265,6 +265,25 @@ func TestDecideHookGateway(t *testing.T) {
 
 }
 
+func TestDecideHookGatewayTimeoutWiring(t *testing.T) {
+	// This test pins decideHookGateway to hookHTTPClient. A
+	// future edit that inlines a different timeout inside the
+	// gateway path must fail here.
+	// The trick: the client timeout is the hold timeout plus
+	// 30 seconds of grace. A hold timeout of -29900ms gives a
+	// client timeout of 100ms, so the test runs fast. Real
+	// code never passes a negative timeout: resolveHoldTimeout
+	// rejects negatives before the gateway path runs.
+	slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"decision":"allow"}`))
+	}))
+	defer slowSrv.Close()
+	if _, err := decideHookGateway(slowSrv.URL, "", -29900*time.Millisecond, "s1", "bash", json.RawMessage(`{}`)); err == nil {
+		t.Fatal("gateway answer past the client timeout should error")
+	}
+}
+
 func TestHookClientTimeout(t *testing.T) {
 	// The total wait is timeout plus 30 seconds of grace.
 	// The Gemini default must stay below the 60 second kill
