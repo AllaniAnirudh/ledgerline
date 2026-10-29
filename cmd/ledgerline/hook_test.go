@@ -37,8 +37,8 @@ func TestParseHookPayloadClaudeUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Tool != "sometool" {
-		t.Fatalf("unknown Claude tool should lowercase, got %q", p.Tool)
+	if p.Tool != "SomeTool" {
+		t.Fatalf("unknown Claude tool should pass through unchanged, got %q", p.Tool)
 	}
 }
 
@@ -178,8 +178,8 @@ func TestDecideHookStandaloneLedgerFailure(t *testing.T) {
 }
 
 func TestResolveHoldTimeout(t *testing.T) {
-	if d, err := resolveHoldTimeout("gemini", 0); err != nil || d != 45*time.Second {
-		t.Fatalf("gemini auto timeout should be 45s, got %v %v", d, err)
+	if d, err := resolveHoldTimeout("gemini", 0); err != nil || d != 25*time.Second {
+		t.Fatalf("gemini auto timeout should be 25s, got %v %v", d, err)
 	}
 	if d, err := resolveHoldTimeout("claude-code", 0); err != nil || d != 120*time.Second {
 		t.Fatalf("default auto timeout should be 120s, got %v %v", d, err)
@@ -253,6 +253,27 @@ func TestDecideHookGateway(t *testing.T) {
 	defer errSrv.Close()
 	if _, err := decideHookGateway(errSrv.URL, "", time.Second, "s1", "bash", json.RawMessage(`{}`)); err == nil {
 		t.Fatal("non-200 gateway answer should error")
+	}
+
+	badJSONSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`not json`))
+	}))
+	defer badJSONSrv.Close()
+	if _, err := decideHookGateway(badJSONSrv.URL, "", time.Second, "s1", "bash", json.RawMessage(`{}`)); err == nil {
+		t.Fatal("undecodable gateway answer should error")
+	}
+
+}
+
+func TestHookClientTimeout(t *testing.T) {
+	// The total wait is timeout plus 30 seconds of grace.
+	// The Gemini default must stay below the 60 second kill
+	// line: 25 seconds plus 30 seconds is 55 seconds.
+	if got := hookHTTPClient(25 * time.Second).Timeout; got != 55*time.Second {
+		t.Fatalf("gemini default wait should be 55s, got %v", got)
+	}
+	if got := hookHTTPClient(120 * time.Second).Timeout; got != 150*time.Second {
+		t.Fatalf("default wait should be 150s, got %v", got)
 	}
 }
 

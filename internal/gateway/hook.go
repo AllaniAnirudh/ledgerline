@@ -192,25 +192,7 @@ func (px *Proxy) hookHold(r *http.Request, session, tool string, args json.RawMe
 	case res := <-p.resultCh:
 		return px.hookDecided(session, tool, args, res)
 	case <-r.Context().Done():
-		// The bridge left. Cancel the hold, so a late
-		// approval cannot record an allow for a call that
-		// never ran. A decision that raced the disconnect
-		// is dropped for the same reason.
-		px.approvals.mu.Lock()
-		if !p.decided {
-			p.decided = true
-			delete(px.approvals.pending, p.ID)
-		} else {
-			select {
-			case <-p.resultCh:
-			default:
-			}
-		}
-		px.approvals.mu.Unlock()
-		if _, err := px.ledger.Append(session, "approval", tool, args, "cancelled", ""); err != nil {
-			log.Printf("ledger write failed on approval cancel: %v", err)
-		}
-		return hookDecision{Decision: "deny", Reason: "ledgerline: bridge disconnected, approval cancelled; retry for a fresh hold"}
+		return px.cancelHold(p, session, tool, args)
 	case <-timer.C:
 		// Claim the entry under the lock. A decision and a
 		// timeout can never both win the same hold.
@@ -229,6 +211,29 @@ func (px *Proxy) hookHold(r *http.Request, session, tool string, args json.RawMe
 		}
 		return hookDecision{Decision: "deny", Reason: fmt.Sprintf("ledgerline: approval timed out after %s", px.approvals.timeout)}
 	}
+}
+
+// cancelHold ends a hold because the bridge left. It claims
+// the entry under the lock, so a late approval cannot win
+// after the cancel. A decision that raced the disconnect is
+// dropped. The call never ran, so no allow may be recorded
+// for it. The ledger records the cancel.
+func (px *Proxy) cancelHold(p *PendingApproval, session, tool string, args json.RawMessage) hookDecision {
+	px.approvals.mu.Lock()
+	if !p.decided {
+		p.decided = true
+		delete(px.approvals.pending, p.ID)
+	} else {
+		select {
+		case <-p.resultCh:
+		default:
+		}
+	}
+	px.approvals.mu.Unlock()
+	if _, err := px.ledger.Append(session, "approval", tool, args, "cancelled", ""); err != nil {
+		log.Printf("ledger write failed on approval cancel: %v", err)
+	}
+	return hookDecision{Decision: "deny", Reason: "ledgerline: bridge disconnected, approval cancelled; retry for a fresh hold"}
 }
 
 // hookDecided records a hold decision. It turns the decision into

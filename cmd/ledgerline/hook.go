@@ -39,8 +39,8 @@ const maxHookPayload = 10 << 20
 
 // hookNameMaps translate harness tool names to canonical names.
 // One policy file then reads the same across harnesses. A name
-// with no entry passes through unchanged. For Claude Code,
-// unknown names are lowercased to match the built-in style.
+// with no entry passes through unchanged, so the ledger
+// records the name of the tool that ran.
 var hookNameMaps = map[string]map[string]string{
 	"claude-code": {
 		"Bash": "bash", "Read": "read", "Edit": "edit", "Write": "write",
@@ -73,12 +73,10 @@ func mapHookName(harness, name string) string {
 			return canonical
 		}
 	}
-	if harness == "claude-code" {
-		if strings.HasPrefix(name, "mcp__") {
-			return name
-		}
-		return strings.ToLower(name)
-	}
+	// Unknown names pass through unchanged. The ledger then
+	// records the name of the tool that ran. Policy globs
+	// match case-insensitively, so enforcement does not
+	// depend on the case of the recorded name.
 	return name
 }
 
@@ -139,9 +137,11 @@ type hookOutcome struct {
 
 // resolveHoldTimeout turns an unset hold timeout into a
 // per-harness default. Gemini kills hooks at 60 seconds by
-// default. Its default sits below that line, so the bridge
-// answers before Gemini kills it. Other harnesses get 120
-// seconds. A negative value is an error.
+// default. The bridge waits the timeout plus 30 seconds of
+// client grace. The Gemini default is 25 seconds, so the
+// default wait is 55 seconds. That sits below the kill line,
+// so the bridge answers before Gemini kills it. Other
+// harnesses get 120 seconds. A negative value is an error.
 func resolveHoldTimeout(harness string, d time.Duration) (time.Duration, error) {
 	if d < 0 {
 		return 0, fmt.Errorf("--hold-timeout must be zero or above")
@@ -150,7 +150,7 @@ func resolveHoldTimeout(harness string, d time.Duration) (time.Duration, error) 
 		return d, nil
 	}
 	if harness == "gemini" {
-		return 45 * time.Second, nil
+		return 25 * time.Second, nil
 	}
 	return 120 * time.Second, nil
 }
@@ -209,6 +209,14 @@ func decideHookStandalone(store ledger.Store, pol *policy.Policy, broker *gatewa
 	}
 }
 
+// hookHTTPClient bounds one gateway call. The timeout is the
+// hold wait. The extra 30 seconds cover response transit
+// after the gateway answers. The total wait is timeout plus
+// grace, and harness timeouts must sit above that total.
+func hookHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout + 30*time.Second}
+}
+
 // decideHookGateway asks a running gateway. The gateway applies
 // policy, records the call, and waits out a hold. A transport
 // error or a bad answer is a bridge error, not a policy denial.
@@ -222,7 +230,7 @@ func decideHookGateway(gwURL, token string, timeout time.Duration, session, tool
 	if token != "" {
 		req.Header.Set("X-Ledgerline-Token", token)
 	}
-	client := &http.Client{Timeout: timeout + 30*time.Second}
+	client := hookHTTPClient(timeout)
 	resp, err := client.Do(req)
 	if err != nil {
 		return hookOutcome{}, err
@@ -262,7 +270,7 @@ func runHook(args []string) error {
 	gatewayURL := fs.String("gateway", "", "running gateway base URL (when set, decisions come from the gateway; --db is ignored)")
 	token := fs.String("token", os.Getenv("LEDGERLINE_API_TOKEN"), "gateway API token (or env LEDGERLINE_API_TOKEN)")
 	sessionFlag := fs.String("session", "", "ledger session (default: the harness session id)")
-	holdTimeout := fs.Duration("hold-timeout", 0, "how long to wait for a gateway approval before denying (0 = auto: 120s, or 45s for gemini; the bridge waits this plus 30s of client grace)")
+	holdTimeout := fs.Duration("hold-timeout", 0, "how long to wait for a gateway approval before denying (0 = auto: 120s, or 25s for gemini; the bridge waits this plus 30s of client grace)")
 	brokerFile := fs.String("broker", "", "broker config file for standalone secret scans (empty = no scan; values come from the environment, never the file)")
 	failOpen := fs.Bool("fail-open", false, "allow on bridge errors (policy denials still block)")
 	if err := fs.Parse(args); err != nil {

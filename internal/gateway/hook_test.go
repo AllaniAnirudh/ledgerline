@@ -248,6 +248,72 @@ func TestHookHoldDisconnectCancels(t *testing.T) {
 	}
 }
 
+func TestCancelHoldRacedDecision(t *testing.T) {
+	px, err := New("http://localhost:1", ledger.New(), policy.New(nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A decision that raced the disconnect: already decided,
+	// result already in the buffered channel, entry already
+	// gone from the map, exactly as Decide leaves it.
+	p := &PendingApproval{
+		ID:        "race-id",
+		SessionID: "s1",
+		Tool:      "bash",
+		Args:      json.RawMessage(`{}`),
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().UTC().Add(time.Minute),
+		resultCh:  make(chan decisionResult, 1),
+		decided:   true,
+	}
+	p.resultCh <- decisionResult{approved: true, actor: "tester"}
+	out := px.cancelHold(p, "s1", "bash", json.RawMessage(`{}`))
+	if out.Decision != "deny" {
+		t.Fatalf("cancelled hold should deny, got %v", out)
+	}
+	if len(p.resultCh) != 0 {
+		t.Fatal("cancel should drain the raced decision")
+	}
+	if n := countEvents(t, px, "approval", "cancelled"); n != 1 {
+		t.Fatalf("cancel should witness one cancel, got %d", n)
+	}
+	if n := countEvents(t, px, "tool_call", "allow"); n != 0 {
+		t.Fatalf("cancelled hold must record no allow, got %d", n)
+	}
+}
+
+func TestCancelHoldUndecided(t *testing.T) {
+	px, err := New("http://localhost:1", ledger.New(), policy.New(nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &PendingApproval{
+		ID:        "pending-id",
+		SessionID: "s1",
+		Tool:      "bash",
+		Args:      json.RawMessage(`{}`),
+		CreatedAt: time.Now().UTC(),
+		ExpiresAt: time.Now().UTC().Add(time.Minute),
+		resultCh:  make(chan decisionResult, 1),
+	}
+	px.approvals.mu.Lock()
+	px.approvals.pending[p.ID] = p
+	px.approvals.mu.Unlock()
+	out := px.cancelHold(p, "s1", "bash", json.RawMessage(`{}`))
+	if out.Decision != "deny" {
+		t.Fatalf("cancelled hold should deny, got %v", out)
+	}
+	if !p.decided {
+		t.Fatal("cancel should claim the entry")
+	}
+	if list := px.Approvals().List(); len(list) != 0 {
+		t.Fatal("cancel should remove the entry from the queue")
+	}
+	if n := countEvents(t, px, "approval", "cancelled"); n != 1 {
+		t.Fatalf("cancel should witness one cancel, got %d", n)
+	}
+}
+
 func TestHookContainedWitness(t *testing.T) {
 	px, err := New("http://localhost:1", ledger.New(), policy.New(nil, nil))
 	if err != nil {
