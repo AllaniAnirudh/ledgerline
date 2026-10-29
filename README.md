@@ -81,8 +81,22 @@ go build -o ledgerline ./cmd/ledgerline
 #   ./ledgerline gateway ... --upstream-pin-file upstream.pin
 #   ./ledgerline gateway ... --upstream-pin-file upstream.pin --reapprove-upstream
 
-# The ledger stores tool arguments as sent. There is no redaction
-# yet: treat ledger.db and exported bundles as secret-bearing.
+# Broker upstream credentials: the agent never holds them. The
+# gateway injects them on every forwarded request, denies foreign
+# values under brokered header names, denies tool calls whose
+# arguments carry a brokered secret (before witnessing, so the
+# secret never reaches the ledger), and redacts brokered values
+# from upstream responses. Values come from the environment only,
+# never from the config file (see broker.example.yaml):
+#   UPSTREAM_API_KEY=... ./ledgerline gateway ... --broker broker.example.yaml
+# Broker status (names and headers only, never values):
+#   curl http://localhost:8080/v1/broker
+
+# The ledger stores tool arguments as sent, except brokered
+# secrets: those are denied before witnessing and redacted from
+# responses, so they never reach the ledger. Anything else the
+# agent puts in arguments, and all PTY output, is still stored as
+# sent: treat ledger.db and exported bundles as secret-bearing.
 
 # Guard the control plane before exposing the gateway beyond
 # loopback. With no token, anyone who can reach the port can read
@@ -112,7 +126,7 @@ go build -o ledgerline ./cmd/ledgerline
 ## Layout
 
 - `cmd/ledgerline` — CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `export`, `verify`, `run`
-- `internal/gateway` — the boundary proxy: intercepts `tools/call`, consults policy, holds for approval, contains sessions, records proposals, forwards the rest; serves the `/v1/*` API, the `/approvals` page, and `/replay`
+- `internal/gateway` — the boundary proxy: intercepts `tools/call`, consults policy, holds for approval, contains sessions, records proposals, brokers upstream credentials, forwards the rest; serves the `/v1/*` API, the `/approvals` page, and `/replay`
 - `internal/ledger` — `Store` interface; in-memory chain and SQLite backend; chain verification
 - `internal/policy` — allow/deny/hold/contain/propose decisions from a YAML policy file (ordered rules, glob tool names, decoded-JSON argument matching that fails closed, configurable default) or static lists (entries are tool globs)
 - `internal/pty` — PTY co-capture: runs a command, witnesses terminal output into the same ledger
@@ -126,7 +140,7 @@ Phase 1 wedge complete. See `docs/VISION.md` for the design, the threat model, a
 Honest limits of the current build (also in `SECURITY.md`):
 
 - The hash chain is unsigned. Bundles prove self-consistency, not who wrote them. Signing and external anchoring are Phase 2.
-- No redaction at capture yet. Arguments and terminal output are stored as sent.
+- Redaction covers brokered secrets only. A tool call carrying a brokered secret is denied before witnessing, and brokered values are redacted from upstream responses. Any other secret in arguments, and all PTY output, is still stored as sent, so the ledger and bundles stay secret-bearing. The broker cannot revoke knowledge the agent already has from elsewhere, and it does not scan non-tool traffic arguments.
 - The gateway sets no timeout on upstream calls, so long-lived streaming sessions are never cut off, and a hung upstream holds a request open.
 - Capture records the call and its policy outcome, not the upstream result or its duration.
 - Containment is a session freeze inside a running gateway, not a kill switch that survives a gateway restart. A contained session unfreezes if the gateway restarts. Cancelling an in-flight request stops the gateway waiting and cuts its response, so nothing from it reaches the agent; whether the upstream itself stops depends on it observing cancellation (a started stream does, a plain request still awaiting its first byte may run to completion server-side, with its result discarded). It never undoes a side effect the upstream already executed.

@@ -246,6 +246,13 @@ func (px *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/v1/upstream" && r.Method == http.MethodGet:
 		writeJSON(w, map[string]any{"upstream": RedactURL(px.upstream.String()), "pin": px.upstreamPin, "pinned": px.pinConfigured})
 
+	case r.URL.Path == "/v1/broker" && r.Method == http.MethodGet:
+		if px.broker == nil {
+			writeJSON(w, map[string]any{"active": false, "credentials": []BrokerStatus{}})
+			break
+		}
+		writeJSON(w, map[string]any{"active": true, "credentials": px.broker.Status()})
+
 	case strings.HasPrefix(r.URL.Path, "/v1/sessions/") && strings.HasSuffix(r.URL.Path, "/events") && r.Method == http.MethodGet:
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/events")
 		events, err := px.ledger.EventsBySession(id)

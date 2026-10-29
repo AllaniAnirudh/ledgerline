@@ -40,6 +40,7 @@ type Proxy struct {
 	client    *http.Client
 	approvals *Approvals
 	proposals *Proposals
+	broker    *Broker
 	apiToken  string
 	approvers map[string]string // token -> approver name
 
@@ -145,6 +146,10 @@ func (px *Proxy) Approvals() *Approvals { return px.approvals }
 // Proposals exposes the pending out-of-band proposal queue.
 func (px *Proxy) Proposals() *Proposals { return px.proposals }
 
+// SetBroker installs the credential broker. Nil means no broker:
+// upstream credentials pass through untouched, as before.
+func (px *Proxy) SetBroker(b *Broker) { px.broker = b }
+
 // SetUpstreamPin records the pinned upstream identity for the
 // /v1/upstream endpoint. Empty means pinning is not configured.
 func (px *Proxy) SetUpstreamPin(pin string) {
@@ -216,9 +221,41 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The broker owns its headers: a request carrying a brokered
+	// header with a foreign value is denied before anything else.
+	// Tool calls witness the denial; other traffic just fails.
+	if px.broker != nil {
+		if name := px.broker.ForeignHeader(r); name != "" {
+			msg := "ledgerline: foreign credential in header " + name
+			if r.Method == http.MethodPost {
+				if isToolCall(body) {
+					tool, _ := toolCallDetails(body)
+					if !px.witness(session, "policy_decision", tool, nil, "deny", "", w, body) {
+						return
+					}
+				}
+				writeJSONRPCError(w, body, msg)
+				return
+			}
+			http.Error(w, msg, http.StatusForbidden)
+			return
+		}
+	}
+
 	// Witness + police tool calls at the boundary.
 	if r.Method == http.MethodPost && isToolCall(body) {
 		tool, args := toolCallDetails(body)
+		// A brokered secret in the arguments is denied before any
+		// witness that would record those arguments: the secret
+		// must never reach the ledger, the hold queue, or the
+		// proposal queue.
+		if px.broker != nil && px.broker.ContainsSecret(args) {
+			if !px.witness(session, "policy_decision", tool, nil, "deny", "", w, body) {
+				return
+			}
+			writeJSONRPCError(w, body, "ledgerline: tool arguments contain a brokered credential")
+			return
+		}
 		decision, reason := px.policy.DecideCall(tool, args)
 		if !px.witness(session, "policy_decision", tool, nil, decision.String(), "", w, body) {
 			return
@@ -374,6 +411,11 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte) {
 	}
 	out.Header = r.Header.Clone()
 	stripHopByHop(out.Header)
+	// Brokered headers overwrite whatever the agent sent: the
+	// agent never holds the upstream's credentials.
+	if px.broker != nil {
+		px.broker.InjectHeaders(out.Header)
+	}
 
 	resp, err := px.client.Do(out)
 	if err != nil {
@@ -384,12 +426,24 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte) {
 
 	respHeader := resp.Header.Clone()
 	stripHopByHop(respHeader)
+	// Redaction changes the body length, so the upstream's
+	// Content-Length must not survive: without it the response
+	// is chunked, and a shortened body cannot truncate or hang
+	// the agent's read.
+	redact := px.broker != nil && len(px.broker.secrets) > 0
+	if redact {
+		respHeader.Del("Content-Length")
+	}
 	for k, vs := range respHeader {
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
+	if redact {
+		_ = px.broker.RedactCopy(w, resp.Body)
+		return
+	}
 	io.Copy(w, resp.Body)
 }
 

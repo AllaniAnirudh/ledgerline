@@ -2,7 +2,8 @@
 //
 // Subcommands:
 //
-//	gateway    run the MCP boundary gateway (witness + policy in-path)
+//	gateway    run the MCP boundary gateway (witness + policy in-path,
+//	           with an optional credential broker: --broker broker.yaml)
 //	approvals  list tool calls currently held for approval
 //	approve    approve a held call: ledgerline approve <id>
 //	deny       deny a held call or a proposal: ledgerline deny <id>
@@ -122,6 +123,7 @@ func runGateway(args []string) error {
 	fs.Var(&approverTokens, "approver-token", "per-approver token as name=token (repeatable); decisions made with it are recorded under that name")
 	holdTimeout := fs.Duration("hold-timeout", 5*time.Minute, "how long a held call waits for a human")
 	pinFile := fs.String("upstream-pin-file", "", "path to the upstream pin file (empty = no pinning; first run creates the pin)")
+	brokerFile := fs.String("broker", "", "broker config file (empty = no broker; credential values come from the environment, never the file)")
 	reapprove := fs.Bool("reapprove-upstream", false, "accept a changed upstream and overwrite the pin (witnessed in the ledger)")
 	reapproveActor := fs.String("reapprove-actor", defaultActor(), "who is re-approving the upstream")
 	if err := fs.Parse(args); err != nil {
@@ -159,6 +161,18 @@ func runGateway(args []string) error {
 		return err
 	}
 	px.Approvals().SetTimeout(*holdTimeout)
+	if *brokerFile != "" {
+		b, err := gateway.LoadBrokerFile(*brokerFile)
+		if err != nil {
+			return err
+		}
+		px.SetBroker(b)
+		var names []string
+		for _, s := range b.Status() {
+			names = append(names, s.Name)
+		}
+		log.Printf("ledgerline: broker active (%d credentials: %s)", len(names), strings.Join(names, ", "))
+	}
 	if *pinFile != "" {
 		st, err := gateway.CheckUpstreamPin(*pinFile, *upstream, *reapprove)
 		if err != nil {

@@ -1,0 +1,23 @@
+# Ledgerline credential broker config. Values come from the
+# environment, never from this file: keep this file in your repo,
+# keep the values in your shell or secret manager.
+#
+# Each credential is injected as a header on every request the
+# gateway forwards to the upstream, so the agent never holds the
+# upstream's credentials. A request carrying a brokered header with
+# a different value is denied (a foreign credential). A tool call
+# whose arguments contain a brokered value is denied before it is
+# witnessed, so the secret never reaches the ledger. Upstream
+# responses carrying a brokered value are redacted before the
+# agent sees them.
+#
+# A value shorter than 8 characters refuses to start: substring
+# scans on short values would false-positive on ordinary traffic.
+version: 1
+credentials:
+  - name: upstream-api-key
+    header: X-Api-Key
+    env: UPSTREAM_API_KEY
+  - name: upstream-auth
+    header: Authorization
+    env: UPSTREAM_AUTH_TOKEN
