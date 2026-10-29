@@ -56,6 +56,12 @@ type Proxy struct {
 	inflight   map[string]map[*inflightReq]struct{}
 
 	idemMu sync.Mutex // guards the purge-count-claim sequence
+
+	toolsMu               sync.Mutex
+	toolsBaseline         *ledger.ToolsBaseline // trust anchor, nil until established
+	toolsLatest           *ledger.ToolsBaseline // most recently observed surface
+	toolsReapprovePending bool
+	toolsReapproveActor   string
 }
 
 // inflightReq is one cancellable upstream request. It is keyed by
@@ -142,6 +148,9 @@ func New(upstream string, l ledger.Store, p *policy.Policy) (*Proxy, error) {
 	}
 	px := &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, approvals: NewApprovals(), proposals: NewProposals()}
 	if err := px.recoverIdempotency(); err != nil {
+		return nil, err
+	}
+	if err := px.loadToolsBaseline(); err != nil {
 		return nil, err
 	}
 	return px, nil
@@ -262,6 +271,17 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			writeJSONRPCError(w, body, "ledgerline: tool arguments contain a brokered credential")
+			return
+		}
+		// Tools-drift gate: once a baseline exists, a tool name
+		// outside it is denied until a human accepts the new
+		// surface. This runs before policy, because a drifted
+		// tool would otherwise take the policy default.
+		if msg, denied := px.toolsGate(tool); denied {
+			if !px.witness(session, "tools_drift", tool, nil, "deny", "", w, body) {
+				return
+			}
+			writeJSONRPCError(w, body, msg)
 			return
 		}
 		// Idempotency lookup: a retry with a key is answered
@@ -483,6 +503,16 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 		out = capW
 	}
 
+	// A tools/list response is captured for drift observation:
+	// it is how the gateway learns the upstream's current
+	// surface. Nesting capture writers is safe: each tees its
+	// own buffer while passing bytes through.
+	var listBuf *limitedBuffer
+	if r.Method == http.MethodPost && isToolsList(body) {
+		listBuf = &limitedBuffer{cap: maxBodyBytes}
+		out = &captureWriter{ResponseWriter: out, buf: listBuf}
+	}
+
 	target := *px.upstream
 	target.Path = singleJoin(px.upstream.Path, r.URL.Path)
 	target.RawQuery = r.URL.RawQuery
@@ -559,6 +589,9 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 				rec.BodyTooLarge = false
 			}
 		})
+	}
+	if listBuf != nil && !listBuf.overflow && copyErr == nil {
+		px.observeToolsList(listBuf.buf)
 	}
 }
 

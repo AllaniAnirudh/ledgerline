@@ -21,4 +21,6 @@ type Store interface {
 	IdemClaim(rec IdempotencyRecord) (IdempotencyRecord, bool, error)
 	IdemList() ([]IdempotencyRecord, error)
 	IdemPurgeBefore(t time.Time) (int, error)
+	ToolsBaselineGet() (ToolsBaseline, bool, error)
+	ToolsBaselinePut(b ToolsBaseline) error
 }

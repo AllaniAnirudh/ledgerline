@@ -34,9 +34,10 @@ type Event struct {
 
 // Ledger is a concurrency-safe, in-memory event chain.
 type Ledger struct {
-	mu     sync.Mutex
-	events []Event
-	idem   map[string]IdempotencyRecord
+	mu       sync.Mutex
+	events   []Event
+	idem     map[string]IdempotencyRecord
+	baseline *ToolsBaseline
 }
 
 func New() *Ledger { return &Ledger{} }

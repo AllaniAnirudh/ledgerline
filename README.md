@@ -116,6 +116,22 @@ go build -o ledgerline ./cmd/ledgerline
 # recovery needs a SQLite ledger (--db); in-memory mode keeps the
 # journal only while the process lives.
 
+# Tools-drift detection: the gateway records the upstream's tool
+# surface as a baseline (startup probe, else the first tools/list
+# passing through) and enforces it from then on. A tools/call for
+# a name outside the baseline is denied until a human accepts the
+# new surface. The baseline survives restarts in the ledger store,
+# so a restart does not grant the upstream amnesty. Removals and
+# description/schema changes are witnessed as drift but do not
+# block calls to baseline tools. Review and accept:
+#   ./ledgerline tools
+#   ./ledgerline accept-tools
+# The next observed list then becomes the new baseline, witnessed
+# in the ledger. Or accept at startup:
+#   ./ledgerline gateway ... --reapprove-tools
+# With no baseline at all (upstream never answered tools/list),
+# calls stay allowed: there is nothing to drift from yet.
+
 # Guard the control plane before exposing the gateway beyond
 # loopback. With no token, anyone who can reach the port can read
 # the ledger (arguments included) and decide approvals. The proxy
@@ -143,7 +159,7 @@ go build -o ledgerline ./cmd/ledgerline
 
 ## Layout
 
-- `cmd/ledgerline` — CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `idempotency`, `resolve`, `export`, `verify`, `run`
+- `cmd/ledgerline` — CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `idempotency`, `resolve`, `tools`, `accept-tools`, `export`, `verify`, `run`
 - `internal/gateway` — the boundary proxy: intercepts `tools/call`, consults policy, holds for approval, contains sessions, records proposals, brokers upstream credentials, forwards the rest; serves the `/v1/*` API, the `/approvals` page, and `/replay`
 - `internal/ledger` — `Store` interface; in-memory chain and SQLite backend; chain verification
 - `internal/policy` — allow/deny/hold/contain/propose decisions from a YAML policy file (ordered rules, glob tool names, decoded-JSON argument matching that fails closed, configurable default) or static lists (entries are tool globs)
@@ -166,6 +182,7 @@ Honest limits of the current build (also in `SECURITY.md`):
 - Upstream pinning covers the configured upstream URL only. It does not verify what the upstream server is, and it does not cover MCP servers reached any other way. The pin proves the configured upstream string matches the pin file, nothing more: the pin file itself is unprotected against a same-user process, and the first run trusts whatever upstream was passed.
 - Proposal "apply" records claim a human applied the action out of band. With no control-plane token, anyone who can reach the port can create that record, so treat no-token local use as single-user only.
 - Idempotency is per key, per session, for 24 hours, up to 1000 journal records. A replay bypasses current policy by design (same key means same call) but never bypasses containment. A resolved-executed key never re-forwards, even if the resolution was wrong: the human, not the gateway, owns that call. Journal rows are durable, not hash-chained; only the unknown and resolved transitions are witnessed in the chain.
+- Tools-drift enforcement denies unknown tool names only, and only once a baseline exists. The first sighting is trusted (TOFU): a server already compromised before the first gateway start baselines its malicious tools. A tools/list response the gateway cannot parse changes nothing, and in-memory mode loses the baseline on restart.
 
 ## Dogfood note
 

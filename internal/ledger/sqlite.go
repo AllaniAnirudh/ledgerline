@@ -31,6 +31,13 @@ CREATE TABLE IF NOT EXISTS events (
 	hash       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, seq);
+CREATE TABLE IF NOT EXISTS tools_baseline (
+	id         INTEGER PRIMARY KEY CHECK (id = 1),
+	tools_json TEXT NOT NULL,
+	hash       TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS idempotency (
 	session_id   TEXT NOT NULL,
 	key          TEXT NOT NULL,
@@ -283,4 +290,41 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// ToolsBaselineGet returns the stored tool baseline, or false when
+// none was ever established. One row holds the whole surface.
+func (s *SQLiteStore) ToolsBaselineGet() (ToolsBaseline, bool, error) {
+	row := s.db.QueryRow(`SELECT tools_json, hash, created_at, updated_at FROM tools_baseline WHERE id = 1`)
+	var toolsJSON, hash, created, updated string
+	if err := row.Scan(&toolsJSON, &hash, &created, &updated); err != nil {
+		if err == sql.ErrNoRows {
+			return ToolsBaseline{}, false, nil
+		}
+		return ToolsBaseline{}, false, err
+	}
+	var tools []BaselineTool
+	if err := json.Unmarshal([]byte(toolsJSON), &tools); err != nil {
+		return ToolsBaseline{}, false, fmt.Errorf("bad tools_baseline row: %w", err)
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, created)
+	if err != nil {
+		return ToolsBaseline{}, false, fmt.Errorf("bad created_at in tools_baseline row: %w", err)
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, updated)
+	if err != nil {
+		return ToolsBaseline{}, false, fmt.Errorf("bad updated_at in tools_baseline row: %w", err)
+	}
+	return ToolsBaseline{Tools: tools, Hash: hash, CreatedAt: createdAt, UpdatedAt: updatedAt}, true, nil
+}
+
+// ToolsBaselinePut stores the baseline, replacing any previous one.
+func (s *SQLiteStore) ToolsBaselinePut(b ToolsBaseline) error {
+	toolsJSON, err := json.Marshal(b.Tools)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO tools_baseline (id, tools_json, hash, created_at, updated_at) VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET tools_json = excluded.tools_json, hash = excluded.hash, created_at = excluded.created_at, updated_at = excluded.updated_at`,
+		string(toolsJSON), b.Hash, b.CreatedAt.UTC().Format(time.RFC3339Nano), b.UpdatedAt.UTC().Format(time.RFC3339Nano))
+	return err
 }

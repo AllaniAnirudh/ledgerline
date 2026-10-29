@@ -297,6 +297,12 @@ func (px *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/v1/idempotency/resolve" && r.Method == http.MethodPost:
 		px.serveIdempotencyResolve(w, r)
 
+	case r.URL.Path == "/v1/tools" && r.Method == http.MethodGet:
+		px.serveToolsStatus(w, r)
+
+	case r.URL.Path == "/v1/tools/accept" && r.Method == http.MethodPost:
+		px.serveToolsAccept(w, r)
+
 	case strings.HasPrefix(r.URL.Path, "/v1/sessions/") && strings.HasSuffix(r.URL.Path, "/events") && r.Method == http.MethodGet:
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/events")
 		events, err := px.ledger.EventsBySession(id)

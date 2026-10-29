@@ -76,6 +76,10 @@ func main() {
 		err = runIdempotency(os.Args[2:])
 	case "resolve":
 		err = runResolve(os.Args[2:])
+	case "tools":
+		err = runTools(os.Args[2:])
+	case "accept-tools":
+		err = runAcceptTools(os.Args[2:])
 	case "export":
 		err = runExport(os.Args[2:])
 	case "verify":
@@ -98,7 +102,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ledgerline <gateway|approvals|approve|deny|contain|contained|proposals|apply|idempotency|resolve|export|verify|run> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: ledgerline <gateway|approvals|approve|deny|contain|contained|proposals|apply|idempotency|resolve|tools|accept-tools|export|verify|run> [flags]")
 }
 
 // openStore returns the ledger backend: SQLite when --db is set,
@@ -130,6 +134,7 @@ func runGateway(args []string) error {
 	brokerFile := fs.String("broker", "", "broker config file (empty = no broker; credential values come from the environment, never the file)")
 	reapprove := fs.Bool("reapprove-upstream", false, "accept a changed upstream and overwrite the pin (witnessed in the ledger)")
 	reapproveActor := fs.String("reapprove-actor", defaultActor(), "who is re-approving the upstream")
+	reapproveTools := fs.Bool("reapprove-tools", false, "accept the next observed tool surface as the new baseline (witnessed in the ledger)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -196,6 +201,37 @@ func runGateway(args []string) error {
 			}
 			log.Printf("ledgerline: upstream pin re-approved for %s by %s", gateway.RedactURL(*upstream), *reapproveActor)
 		}
+	}
+	if *reapproveTools {
+		px.SetToolsReapprovePending(*reapproveActor)
+	}
+	if err := px.ProbeToolsBaseline(); err != nil {
+		return err
+	}
+	if !px.HasToolsBaseline() {
+		// The upstream was not up (or not listable) at startup.
+		// A one-shot probe would leave the gateway anchorless
+		// until the agent's first list, which could itself be
+		// post-compromise. Retry quietly until a baseline
+		// exists; the first passthrough list also establishes
+		// one, whichever comes first.
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				if px.HasToolsBaseline() {
+					return
+				}
+				if err := px.ProbeToolsBaselineQuiet(); err != nil {
+					log.Printf("tools baseline retry failed: %v", err)
+					return
+				}
+				if px.HasToolsBaseline() {
+					log.Printf("ledgerline: tool baseline established by retry probe")
+					return
+				}
+			}
+		}()
 	}
 	if *apiToken != "" {
 		px.SetAPIToken(*apiToken)
@@ -767,6 +803,98 @@ func runResolve(args []string) error {
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
 	}
 	fmt.Printf("resolved %s/%s as %s\n", session, key, resolution)
+	return nil
+}
+
+// runTools shows the tool baseline, the latest observed surface,
+// and any drift between them.
+func runTools(args []string) error {
+	fs := flag.NewFlagSet("tools", flag.ExitOnError)
+	gw := fs.String("gateway", "http://localhost:8080", "gateway address")
+	token := fs.String("token", os.Getenv("LEDGERLINE_API_TOKEN"), "gateway API token (or env LEDGERLINE_API_TOKEN)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimSuffix(*gw, "/")+"/v1/tools", nil)
+	if err != nil {
+		return err
+	}
+	if *token != "" {
+		req.Header.Set("X-Ledgerline-Token", *token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
+	}
+	var status struct {
+		Baseline map[string]any      `json:"baseline"`
+		Latest   map[string]any      `json:"latest"`
+		Drift    bool                `json:"drift"`
+		Detail   map[string][]string `json:"drift_detail"`
+		Pending  bool                `json:"pending_reapprove"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return err
+	}
+	names := func(v map[string]any) string {
+		if v == nil {
+			return "-"
+		}
+		tools, _ := v["tools"].([]any)
+		var out []string
+		for _, t := range tools {
+			out = append(out, fmt.Sprint(t))
+		}
+		return strings.Join(out, ", ")
+	}
+	fmt.Printf("baseline: %s\nlatest:   %s\ndrift:    %v\n", names(status.Baseline), names(status.Latest), status.Drift)
+	if status.Drift && status.Detail != nil {
+		fmt.Printf("added:    %s\nremoved:  %s\nchanged:  %s\n",
+			strings.Join(status.Detail["added"], ", "),
+			strings.Join(status.Detail["removed"], ", "),
+			strings.Join(status.Detail["changed"], ", "))
+	}
+	if status.Pending {
+		fmt.Println("re-approval pending: the next observed list becomes the new baseline")
+	}
+	return nil
+}
+
+// runAcceptTools marks the next observed tool surface as the new
+// baseline. It changes nothing by itself: the human accepts after
+// reviewing the drift, and the next list is what gets trusted.
+func runAcceptTools(args []string) error {
+	fs := flag.NewFlagSet("accept-tools", flag.ExitOnError)
+	gw := fs.String("gateway", "http://localhost:8080", "gateway address")
+	actor := fs.String("actor", defaultActor(), "who accepted the new tool surface")
+	token := fs.String("token", os.Getenv("LEDGERLINE_API_TOKEN"), "gateway API token (or env LEDGERLINE_API_TOKEN)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	body, _ := json.Marshal(map[string]string{"actor": *actor})
+	req, err := http.NewRequest(http.MethodPost, strings.TrimSuffix(*gw, "/")+"/v1/tools/accept", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if *token != "" {
+		req.Header.Set("X-Ledgerline-Token", *token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
+	}
+	fmt.Println("re-approval pending: the next observed tool surface becomes the new baseline")
 	return nil
 }
 
