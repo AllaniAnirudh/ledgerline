@@ -110,7 +110,7 @@ func TestForwardRefusesContainedSession(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
 	req.Header.Set("X-Ledgerline-Session", "s1")
 	rec := httptest.NewRecorder()
-	px.forward(rec, req, []byte(body))
+	px.forward(rec, req, []byte(body), nil)
 
 	if hits.Load() != 0 {
 		t.Fatalf("contained forward must never reach upstream, got %d hits", hits.Load())

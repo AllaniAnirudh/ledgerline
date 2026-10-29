@@ -72,6 +72,10 @@ func main() {
 		err = runProposals(os.Args[2:])
 	case "apply":
 		err = runApply(os.Args[2:])
+	case "idempotency":
+		err = runIdempotency(os.Args[2:])
+	case "resolve":
+		err = runResolve(os.Args[2:])
 	case "export":
 		err = runExport(os.Args[2:])
 	case "verify":
@@ -94,7 +98,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ledgerline <gateway|approvals|approve|deny|contain|contained|proposals|apply|export|verify|run> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: ledgerline <gateway|approvals|approve|deny|contain|contained|proposals|apply|idempotency|resolve|export|verify|run> [flags]")
 }
 
 // openStore returns the ledger backend: SQLite when --db is set,
@@ -653,6 +657,116 @@ func runApply(args []string) error {
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
 	}
 	fmt.Printf("applied %s by %s\n", id, *actor)
+	return nil
+}
+
+// runIdempotency lists the durable executor's journal: one line
+// per keyed execution, without replay bodies.
+func runIdempotency(args []string) error {
+	fs := flag.NewFlagSet("idempotency", flag.ExitOnError)
+	gw := fs.String("gateway", "http://localhost:8080", "gateway address")
+	token := fs.String("token", os.Getenv("LEDGERLINE_API_TOKEN"), "gateway API token (or env LEDGERLINE_API_TOKEN)")
+	state := fs.String("state", "", "filter by state (held, started, completed, denied, unknown, resolved, discarded)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	url := strings.TrimSuffix(*gw, "/") + "/v1/idempotency"
+	if *state != "" {
+		url += "?state=" + *state
+	}
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	if *token != "" {
+		req.Header.Set("X-Ledgerline-Token", *token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
+	}
+	var list []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return err
+	}
+	if len(list) == 0 {
+		fmt.Println("no idempotency records")
+		return nil
+	}
+	for _, rec := range list {
+		resolution := strOrDash(rec["resolution"])
+		fmt.Printf("%v  session=%v  tool=%v  state=%v  resolution=%s\n", rec["key"], rec["session_id"], rec["tool"], rec["state"], resolution)
+	}
+	return nil
+}
+
+// runResolve reconciles one unknown outcome: the human records
+// whether the call executed. A resolved-executed key never
+// re-forwards; a resolved-not-executed key may run fresh.
+func runResolve(args []string) error {
+	valued := map[string]bool{"gateway": true, "actor": true, "token": true, "note": true}
+	var positional []string
+	var rest []string
+	skipNext := false
+	for _, a := range args {
+		if skipNext {
+			rest = append(rest, a)
+			skipNext = false
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		if eq := strings.Index(name, "="); eq >= 0 {
+			name = name[:eq]
+		}
+		if strings.HasPrefix(a, "-") {
+			rest = append(rest, a)
+			if valued[name] && !strings.Contains(a, "=") {
+				skipNext = true
+			}
+			continue
+		}
+		positional = append(positional, a)
+	}
+	fs := flag.NewFlagSet("resolve", flag.ExitOnError)
+	gw := fs.String("gateway", "http://localhost:8080", "gateway address")
+	actor := fs.String("actor", defaultActor(), "who resolved the outcome")
+	token := fs.String("token", os.Getenv("LEDGERLINE_API_TOKEN"), "gateway API token (or env LEDGERLINE_API_TOKEN)")
+	note := fs.String("note", "", "note recorded with the resolution")
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if len(positional) != 3 {
+		return fmt.Errorf("usage: ledgerline resolve <session> <key> <executed|not-executed>")
+	}
+	session, key, resolution := positional[0], positional[1], positional[2]
+	if resolution != "executed" && resolution != "not-executed" {
+		return fmt.Errorf("resolution must be executed or not-executed")
+	}
+	body, _ := json.Marshal(map[string]string{"session": session, "key": key, "resolution": resolution, "note": *note, "actor": *actor})
+	url := strings.TrimSuffix(*gw, "/") + "/v1/idempotency/resolve"
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if *token != "" {
+		req.Header.Set("X-Ledgerline-Token", *token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
+	}
+	fmt.Printf("resolved %s/%s as %s\n", session, key, resolution)
 	return nil
 }
 

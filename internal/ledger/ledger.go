@@ -36,6 +36,7 @@ type Event struct {
 type Ledger struct {
 	mu     sync.Mutex
 	events []Event
+	idem   map[string]IdempotencyRecord
 }
 
 func New() *Ledger { return &Ledger{} }

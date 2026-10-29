@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AllaniAnirudh/ledgerline/internal/ledger"
 	"github.com/AllaniAnirudh/ledgerline/internal/replay"
 )
 
@@ -114,7 +115,7 @@ func newID() (string, error) {
 // response goes back to the waiting agent. The release path fails
 // closed, like the rest of the boundary: if the approval cannot be
 // written to the ledger, the call does not pass.
-func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, body []byte, tool string, args json.RawMessage) {
+func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, body []byte, tool string, args json.RawMessage, claim *idemClaim) {
 	id, err := newID()
 	if err != nil {
 		writeJSONRPCError(w, body, "ledgerline: cannot allocate approval id, boundary closed")
@@ -156,8 +157,36 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 		px.approvals.mu.Unlock()
 	}
 
+	// A keyed hold claims the journal before the ledger hold
+	// event: a concurrent identical retry must see this hold,
+	// not queue a second one. A losing retry is answered from
+	// the winner's record, and this entry is rolled back.
+	if claim != nil {
+		now := time.Now().UTC()
+		existing, claimed, err := px.claimIdem(ledger.IdempotencyRecord{Key: claim.key, SessionID: session, Tool: tool, ArgsHash: claim.argsHash, State: ledger.IdemHeld, ApprovalID: p.ID, CreatedAt: now, UpdatedAt: now})
+		if err != nil {
+			removePending()
+			writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+			return
+		}
+		if !claimed {
+			removePending()
+			if existing.Tool != tool || existing.ArgsHash != claim.argsHash {
+				writeJSONRPCError(w, body, "ledgerline: idempotency key reused with different tool or arguments")
+			} else {
+				px.idemShortCircuit(w, body, session, existing)
+			}
+			return
+		}
+	}
+
 	if _, err := px.ledger.Append(session, "approval", tool, args, "hold", ""); err != nil {
 		removePending()
+		if claim != nil {
+			// The hold never stood, so its journal entry must
+			// not block retries as "held".
+			px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
+		}
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
 		return
 	}
@@ -166,7 +195,7 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 	defer timer.Stop()
 	select {
 	case res := <-p.resultCh:
-		px.release(w, r, session, body, tool, args, res)
+		px.release(w, r, session, body, tool, args, res, claim)
 	case <-timer.C:
 		// Claim the entry under the lock so a decision and a
 		// timeout can never both win the same hold.
@@ -175,7 +204,7 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 			// The decision won the race; its result is already
 			// in the buffered channel.
 			px.approvals.mu.Unlock()
-			px.release(w, r, session, body, tool, args, <-p.resultCh)
+			px.release(w, r, session, body, tool, args, <-p.resultCh, claim)
 			return
 		}
 		p.decided = true
@@ -184,6 +213,10 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 		if _, err := px.ledger.Append(session, "approval", tool, args, "timeout", ""); err != nil {
 			log.Printf("ledger write failed on approval timeout: %v", err)
 		}
+		if claim != nil {
+			// A timed-out hold never ran: a retry runs fresh.
+			px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
+		}
 		writeJSONRPCError(w, body, fmt.Sprintf("ledgerline: approval timed out after %s", px.approvals.timeout))
 	}
 }
@@ -191,10 +224,15 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 // release records the human's decision and, when it is an approval,
 // forwards the held call upstream. Any ledger failure closes the
 // boundary instead of letting the call through unrecorded.
-func (px *Proxy) release(w http.ResponseWriter, r *http.Request, session string, body []byte, tool string, args json.RawMessage, res decisionResult) {
+func (px *Proxy) release(w http.ResponseWriter, r *http.Request, session string, body []byte, tool string, args json.RawMessage, res decisionResult, claim *idemClaim) {
 	if !res.approved {
 		if _, err := px.ledger.Append(session, "approval", tool, args, "deny", res.actor); err != nil {
 			log.Printf("ledger write failed on approval deny: %v", err)
+		}
+		if claim != nil {
+			// A denied hold never ran; retries replay the
+			// denial instead of queueing a new hold.
+			px.idemTransition(session, claim.key, ledger.IdemDenied, nil)
 		}
 		writeJSONRPCError(w, body, "ledgerline: tool call denied by approver")
 		return
@@ -207,7 +245,7 @@ func (px *Proxy) release(w http.ResponseWriter, r *http.Request, session string,
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
 		return
 	}
-	px.forward(w, r, body)
+	px.forward(w, r, body, claim)
 }
 
 // serveAPI handles the control plane: approvals, session events,
@@ -252,6 +290,12 @@ func (px *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		writeJSON(w, map[string]any{"active": true, "credentials": px.broker.Status()})
+
+	case r.URL.Path == "/v1/idempotency" && r.Method == http.MethodGet:
+		px.serveIdempotencyList(w, r)
+
+	case r.URL.Path == "/v1/idempotency/resolve" && r.Method == http.MethodPost:
+		px.serveIdempotencyResolve(w, r)
 
 	case strings.HasPrefix(r.URL.Path, "/v1/sessions/") && strings.HasSuffix(r.URL.Path, "/events") && r.Method == http.MethodGet:
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/events")

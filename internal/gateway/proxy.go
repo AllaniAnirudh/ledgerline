@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/AllaniAnirudh/ledgerline/internal/ledger"
 	"github.com/AllaniAnirudh/ledgerline/internal/policy"
@@ -53,6 +54,8 @@ type Proxy struct {
 
 	inflightMu sync.Mutex
 	inflight   map[string]map[*inflightReq]struct{}
+
+	idemMu sync.Mutex // guards the purge-count-claim sequence
 }
 
 // inflightReq is one cancellable upstream request. It is keyed by
@@ -137,7 +140,11 @@ func New(upstream string, l ledger.Store, p *policy.Policy) (*Proxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, approvals: NewApprovals(), proposals: NewProposals()}, nil
+	px := &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, approvals: NewApprovals(), proposals: NewProposals()}
+	if err := px.recoverIdempotency(); err != nil {
+		return nil, err
+	}
+	return px, nil
 }
 
 // Approvals exposes the pending human-approval queue.
@@ -243,6 +250,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Witness + police tool calls at the boundary.
+	var claim *idemClaim
 	if r.Method == http.MethodPost && isToolCall(body) {
 		tool, args := toolCallDetails(body)
 		// A brokered secret in the arguments is denied before any
@@ -255,6 +263,34 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			writeJSONRPCError(w, body, "ledgerline: tool arguments contain a brokered credential")
 			return
+		}
+		// Idempotency lookup: a retry with a key is answered
+		// from the journal when the journal says the call must
+		// not run again. The claim itself waits for the policy
+		// decision below: an allowed call claims "started", a
+		// held call claims "held". Policy denials, containments,
+		// and proposals leave no record, so a later retry
+		// re-evaluates current policy.
+		if key := strings.TrimSpace(r.Header.Get(idemHeader)); key != "" {
+			if len(key) > idemMaxKeyLen {
+				writeJSONRPCError(w, body, "ledgerline: idempotency key too long")
+				return
+			}
+			rec, found, err := px.ledger.IdemGet(session, key)
+			if err != nil {
+				writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+				return
+			}
+			if found {
+				if rec.Tool != tool || rec.ArgsHash != idemArgsHash(args) {
+					writeJSONRPCError(w, body, "ledgerline: idempotency key reused with different tool or arguments")
+					return
+				}
+				if px.idemShortCircuit(w, body, session, rec) {
+					return
+				}
+			}
+			claim = &idemClaim{key: key, tool: tool, argsHash: idemArgsHash(args)}
 		}
 		decision, reason := px.policy.DecideCall(tool, args)
 		if !px.witness(session, "policy_decision", tool, nil, decision.String(), "", w, body) {
@@ -269,7 +305,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSONRPCError(w, body, msg)
 			return
 		case policy.Hold:
-			px.hold(w, r, session, body, tool, args)
+			px.hold(w, r, session, body, tool, args, claim)
 			return
 		case policy.Contain:
 			msg := "ledgerline: session contained by policy"
@@ -283,7 +319,32 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			px.propose(w, session, body, tool, args)
 			return
 		}
+		if claim != nil {
+			// Claim "started" before forwarding: the atomic
+			// claim is what stops a concurrent identical retry
+			// from forwarding a second copy. A losing retry is
+			// answered from the winner's record.
+			now := time.Now().UTC()
+			existing, claimed, err := px.claimIdem(ledger.IdempotencyRecord{Key: claim.key, SessionID: session, Tool: tool, ArgsHash: claim.argsHash, State: ledger.IdemStarted, CreatedAt: now, UpdatedAt: now})
+			if err != nil {
+				writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+				return
+			}
+			if !claimed {
+				if existing.Tool != tool || existing.ArgsHash != claim.argsHash {
+					writeJSONRPCError(w, body, "ledgerline: idempotency key reused with different tool or arguments")
+				} else {
+					px.idemShortCircuit(w, body, session, existing)
+				}
+				return
+			}
+		}
 		if !px.witness(session, "tool_call", tool, args, policy.Allow.String(), "", w, body) {
+			if claim != nil {
+				// The call never ran, so its journal entry
+				// must not block retries as "started".
+				px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
+			}
 			return
 		}
 	}
@@ -302,7 +363,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("ledgerline: forwarding unparseable POST body (%d bytes) unwitnessed", len(body))
 	}
 
-	px.forward(w, r, body)
+	px.forward(w, r, body, claim)
 }
 
 // isBatch reports whether the body is a JSON array (a JSON-RPC batch).
@@ -385,14 +446,41 @@ func sessionOf(r *http.Request) string {
 // release path reaches forward without passing the ServeHTTP gate,
 // so a session contained after its hold was approved must still
 // never forward.
-func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte) {
+func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, claim *idemClaim) {
 	session := sessionOf(r)
 	if px.IsContained(session, r.Header.Get("Mcp-Session-Id")) {
 		if _, err := px.ledger.Append(session, "containment", "(session)", nil, "deny", ""); err != nil {
 			log.Printf("ledger write failed on contained forward: %v", err)
 		}
+		if claim != nil {
+			// Contained before running: the call never ran,
+			// so a retry runs fresh once uncontained.
+			px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
+		}
 		writeJSONRPCError(w, body, "ledgerline: session contained")
 		return
+	}
+
+	// A keyed call is journaled as started before the upstream
+	// sees it: if the process dies from here on, recovery marks
+	// it unknown instead of losing it. A journal failure closes
+	// the boundary rather than running unjournaled.
+	var out http.ResponseWriter = w
+	var capW *captureWriter
+	if claim != nil {
+		rec, found, err := px.ledger.IdemGet(session, claim.key)
+		if err != nil || !found {
+			writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+			return
+		}
+		rec.State = ledger.IdemStarted
+		rec.UpdatedAt = time.Now().UTC()
+		if err := px.ledger.IdemPut(rec); err != nil {
+			writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+			return
+		}
+		capW = &captureWriter{ResponseWriter: w, buf: &limitedBuffer{cap: idemMaxBody}}
+		out = capW
 	}
 
 	target := *px.upstream
@@ -404,22 +492,27 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte) {
 	req := px.trackInflight(session, cancel)
 	defer px.untrackInflight(session, req)
 
-	out, err := http.NewRequestWithContext(ctx, r.Method, target.String(), bytes.NewReader(body))
+	upReq, err := http.NewRequestWithContext(ctx, r.Method, target.String(), bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "bad upstream request", http.StatusBadGateway)
 		return
 	}
-	out.Header = r.Header.Clone()
-	stripHopByHop(out.Header)
-	// Brokered headers overwrite whatever the agent sent: the
-	// agent never holds the upstream's credentials.
+	upReq.Header = r.Header.Clone()
+	stripHopByHop(upReq.Header)
+	// Brokered headers are injected here; a foreign agent value
+	// under a brokered name was already denied before forwarding.
 	if px.broker != nil {
-		px.broker.InjectHeaders(out.Header)
+		px.broker.InjectHeaders(upReq.Header)
 	}
 
-	resp, err := px.client.Do(out)
+	resp, err := px.client.Do(upReq)
 	if err != nil {
 		http.Error(w, "upstream unreachable", http.StatusBadGateway)
+		if claim != nil {
+			// No response arrived: the call may or may not
+			// have executed upstream. Unknown, not completed.
+			px.idemTransition(session, claim.key, ledger.IdemUnknown, nil)
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -436,15 +529,37 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte) {
 	}
 	for k, vs := range respHeader {
 		for _, v := range vs {
-			w.Header().Add(k, v)
+			out.Header().Add(k, v)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
+	out.WriteHeader(resp.StatusCode)
+	var copyErr error
 	if redact {
-		_ = px.broker.RedactCopy(w, resp.Body)
-		return
+		copyErr = px.broker.RedactCopy(out, resp.Body)
+	} else {
+		_, copyErr = io.Copy(out, resp.Body)
 	}
-	io.Copy(w, resp.Body)
+	if claim != nil {
+		if copyErr != nil {
+			// The response did not arrive whole: the call may
+			// have executed, but the agent never saw proof.
+			px.idemTransition(session, claim.key, ledger.IdemUnknown, nil)
+			return
+		}
+		// The response the agent saw is the journaled one:
+		// post-redaction bytes, or nothing when over the cap.
+		px.idemTransition(session, claim.key, ledger.IdemCompleted, func(rec *ledger.IdempotencyRecord) {
+			rec.Status = capW.status
+			rec.ContentType = resp.Header.Get("Content-Type")
+			if capW.buf.overflow {
+				rec.Body = nil
+				rec.BodyTooLarge = true
+			} else {
+				rec.Body = capW.buf.buf
+				rec.BodyTooLarge = false
+			}
+		})
+	}
 }
 
 // hopByHop lists the connection-specific header names from

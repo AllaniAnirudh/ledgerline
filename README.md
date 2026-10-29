@@ -98,6 +98,24 @@ go build -o ledgerline ./cmd/ledgerline
 # agent puts in arguments, and all PTY output, is still stored as
 # sent: treat ledger.db and exported bundles as secret-bearing.
 
+# Durable execution: a client that sends X-Ledgerline-Idempotency-Key
+# on a tool call gets exactly-once semantics per key within its
+# session. The gateway journals the call as started before
+# forwarding, replays the recorded response on retry (up to 1 MiB),
+# answers a concurrent retry as in-flight, and answers a retry of a
+# held call with the same approval id instead of queueing a second
+# hold. A key bound to one tool and one arguments hash: reuse with
+# a different tool or different arguments is denied. After a crash,
+# started calls come back as unknown, and only a human resolution
+# moves them (executed keys never re-forward):
+#   curl ... -H 'X-Ledgerline-Idempotency-Key: deploy-001' ...
+#   ./ledgerline idempotency --state unknown
+#   ./ledgerline resolve <session> <key> <executed|not-executed>
+# Unkeyed calls behave exactly as before, and policy denials leave
+# no record, so a later retry re-evaluates current policy. Restart
+# recovery needs a SQLite ledger (--db); in-memory mode keeps the
+# journal only while the process lives.
+
 # Guard the control plane before exposing the gateway beyond
 # loopback. With no token, anyone who can reach the port can read
 # the ledger (arguments included) and decide approvals. The proxy
@@ -125,7 +143,7 @@ go build -o ledgerline ./cmd/ledgerline
 
 ## Layout
 
-- `cmd/ledgerline` — CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `export`, `verify`, `run`
+- `cmd/ledgerline` — CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `idempotency`, `resolve`, `export`, `verify`, `run`
 - `internal/gateway` — the boundary proxy: intercepts `tools/call`, consults policy, holds for approval, contains sessions, records proposals, brokers upstream credentials, forwards the rest; serves the `/v1/*` API, the `/approvals` page, and `/replay`
 - `internal/ledger` — `Store` interface; in-memory chain and SQLite backend; chain verification
 - `internal/policy` — allow/deny/hold/contain/propose decisions from a YAML policy file (ordered rules, glob tool names, decoded-JSON argument matching that fails closed, configurable default) or static lists (entries are tool globs)
@@ -142,11 +160,12 @@ Honest limits of the current build (also in `SECURITY.md`):
 - The hash chain is unsigned. Bundles prove self-consistency, not who wrote them. Signing and external anchoring are Phase 2.
 - Redaction covers brokered secrets only. A tool call carrying a brokered secret is denied before witnessing, and brokered values are redacted from upstream responses. Any other secret in arguments, and all PTY output, is still stored as sent, so the ledger and bundles stay secret-bearing. The broker cannot revoke knowledge the agent already has from elsewhere, and it does not scan non-tool traffic arguments.
 - The gateway sets no timeout on upstream calls, so long-lived streaming sessions are never cut off, and a hung upstream holds a request open.
-- Capture records the call and its policy outcome, not the upstream result or its duration.
+- Capture records the call and its policy outcome, not the upstream result or its duration, except keyed calls: their redacted responses are journaled up to 1 MiB for replay, and larger responses complete without a replay copy.
 - Containment is a session freeze inside a running gateway, not a kill switch that survives a gateway restart. A contained session unfreezes if the gateway restarts. Cancelling an in-flight request stops the gateway waiting and cuts its response, so nothing from it reaches the agent; whether the upstream itself stops depends on it observing cancellation (a started stream does, a plain request still awaiting its first byte may run to completion server-side, with its result discarded). It never undoes a side effect the upstream already executed.
 - Containment binds the ledger session header and the upstream MCP sessions observed on it. Rotating the ledger header alone does not evade it, but starting a fresh upstream MCP session does: without proxy-path client authentication, a new MCP session is a new identity.
 - Upstream pinning covers the configured upstream URL only. It does not verify what the upstream server is, and it does not cover MCP servers reached any other way. The pin proves the configured upstream string matches the pin file, nothing more: the pin file itself is unprotected against a same-user process, and the first run trusts whatever upstream was passed.
 - Proposal "apply" records claim a human applied the action out of band. With no control-plane token, anyone who can reach the port can create that record, so treat no-token local use as single-user only.
+- Idempotency is per key, per session, for 24 hours, up to 1000 journal records. A replay bypasses current policy by design (same key means same call) but never bypasses containment. A resolved-executed key never re-forwards, even if the resolution was wrong: the human, not the gateway, owns that call. Journal rows are durable, not hash-chained; only the unknown and resolved transitions are witnessed in the chain.
 
 ## Dogfood note
 
