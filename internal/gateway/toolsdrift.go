@@ -16,49 +16,50 @@ import (
 )
 
 // Tools-drift detection, after the compromised-MCP-server threat in
-// Replit's architecture paper: an upstream that gains a tool
+// Replit's architecture paper. An upstream that gains a tool
 // mid-run is not the upstream the human approved. The gateway
 // records the tool surface it first sees as the baseline, the
-// trust anchor, and enforces it from then on.
+// trust anchor. It enforces the baseline from then on.
 //
 // Semantics, stated exactly because they are the whole feature:
 //
 //   - The baseline is established from the first tools/list the
-//     gateway can read: the startup probe when the upstream
-//     answers it, otherwise the first tools/list response passing
-//     through. The first sighting is trusted (TOFU), exactly like
-//     the upstream pin's first run.
-//   - The baseline survives restarts: it is stored in the ledger
-//     store, so a restart does not grant the upstream amnesty. In
+//     gateway can read. The startup probe supplies it when the
+//     upstream answers it. Otherwise the first tools/list
+//     response passing through supplies it. The first sighting
+//     is trusted (TOFU), exactly like the upstream pin's first
+//     run.
+//   - The baseline survives restarts. It is stored in the ledger
+//     store. A restart does not grant the upstream amnesty. In
 //     in-memory mode it lives only while the process lives.
-//   - Enforcement denies unknown tool NAMES only: a tools/call
+//   - Enforcement denies unknown tool NAMES only. A tools/call
 //     for a name outside the baseline is denied until a human
 //     accepts the new surface. Removals and description/schema
-//     changes are witnessed as drift but do not block calls to
-//     baseline tools: a partial or transient list must not break
+//     changes are witnessed as drift. They do not block calls to
+//     baseline tools. A partial or transient list must not break
 //     tools the human already trusts.
-//   - Acceptance is explicit and witnessed: --reapprove-tools at
+//   - Acceptance is explicit and witnessed. --reapprove-tools at
 //     startup, or POST /v1/tools/accept, makes the NEXT observed
 //     list the new baseline. There is no silent re-baselining.
 //     Acceptance is only as trustworthy as the control-plane
-//     token: with no --api-token and no per-approver tokens, the
-//     accept endpoint is open to anyone who can reach the port,
-//     including the agent itself, so drift enforcement in that
+//     token. With no --api-token and no per-approver tokens, the
+//     accept endpoint is open to anyone who can reach the port.
+//     This includes the agent itself. Drift enforcement in that
 //     configuration is a tripwire for a human watching the
 //     ledger, not a boundary the agent cannot cross. The
-//     gateway logs a warning at startup in that case, and the
+//     gateway logs a warning at startup in that case. The
 //     drift docs carry the same caveat.
-//   - Pagination is never a surface: a tools/list page carrying
+//   - Pagination is never a surface. A tools/list page carrying
 //     nextCursor is one page, not the whole list. The probe
-//     follows cursors to build the full baseline, and a partial
-//     page passing through is ignored for baseline purposes, so
-//     page-2 tools are never denied as drift.
-//   - A tools/list response the gateway cannot parse (including
-//     an SSE stream it cannot decode) changes nothing: no
-//     baseline, no drift event, no enforcement change. SSE
+//     follows cursors to build the full baseline. A partial
+//     page passing through is ignored for baseline purposes.
+//     Page-2 tools are never denied as drift.
+//   - A tools/list response the gateway cannot parse changes
+//     nothing. This includes an SSE stream it cannot decode.
+//     No baseline, no drift event, no enforcement change. SSE
 //     payloads split across several data lines are joined before
-//     parsing, then each line is tried alone.
-//   - With no baseline at all, everything is allowed: there is
+//     parsing. Then each line is tried alone.
+//   - With no baseline at all, everything is allowed. There is
 //     nothing to drift from yet.
 
 func isToolsList(body []byte) bool {
@@ -87,10 +88,10 @@ type listResponse struct {
 // parseToolsList extracts the tool surface from a tools/list
 // response body, plus the pagination cursor when the response is
 // one page of many ("" means a complete surface). It accepts a
-// plain JSON body, and, failing that, the data payloads of an SSE
-// stream: payloads split across several data lines are joined
-// first, then each line is tried alone. It returns false when
-// nothing parses.
+// plain JSON body. Failing that, it accepts the data payloads of
+// an SSE stream. Payloads split across several data lines are
+// joined first. Then each line is tried alone. It returns false
+// when nothing parses.
 func parseToolsList(body []byte) (ledger.ToolsBaseline, string, bool) {
 	if b, cursor, ok := parseToolsListJSON(body); ok {
 		return b, cursor, true
@@ -133,12 +134,12 @@ func parseToolsListJSON(body []byte) (ledger.ToolsBaseline, string, bool) {
 }
 
 // canonicalSchema canonicalizes an inputSchema the way the
-// baseline hash needs it: key order must not matter, or a server
+// baseline hash needs it. Key order must not matter. A server
 // that serializes the same schema with keys in a different order
-// reports phantom drift on every list. encoding/json sorts map
-// keys on marshal; UseNumber keeps number literals intact. This
-// is baseline-only: the ledger chain keeps its own compacting
-// canonical form, which must never change.
+// would otherwise report phantom drift on every list.
+// encoding/json sorts map keys on marshal. UseNumber keeps number
+// literals intact. This is baseline-only. The ledger chain keeps
+// its own compacting canonical form, which must never change.
 func canonicalSchema(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -156,8 +157,8 @@ func canonicalSchema(raw json.RawMessage) string {
 	return string(out)
 }
 
-// hashTools identifies a surface: tools sorted by name, then
-// description, then schema, so duplicate names hash
+// hashTools identifies a surface. Tools are sorted by name, then
+// description, then schema. Duplicate names hash
 // deterministically instead of wobbling with input order.
 func hashTools(tools []ledger.BaselineTool) string {
 	sorted := append([]ledger.BaselineTool(nil), tools...)
@@ -183,9 +184,9 @@ func hashTools(tools []ledger.BaselineTool) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// diffTools compares an old surface with a new one: names present
-// only in the new surface, names missing from it, and names
-// present in both with a changed description or schema.
+// diffTools compares an old surface with a new one. It reports
+// names present only in the new surface, names missing from it,
+// and names present in both with a changed description or schema.
 func diffTools(old, new []ledger.BaselineTool) (added, removed, changed []string) {
 	added = []string{}
 	removed = []string{}
@@ -231,7 +232,7 @@ func toolNames(tools []ledger.BaselineTool) []string {
 	return names
 }
 
-// loadToolsBaseline restores the stored baseline at startup, so a
+// loadToolsBaseline restores the stored baseline at startup. A
 // restart does not reset the trust anchor.
 func (px *Proxy) loadToolsBaseline() error {
 	b, found, err := px.ledger.ToolsBaselineGet()
@@ -241,11 +242,11 @@ func (px *Proxy) loadToolsBaseline() error {
 	if !found {
 		return nil
 	}
-	// Recompute the hash from the stored tools: the hash function
-	// is baseline-only, so a row written by an older build may
-	// carry a hash in the old form. Recomputing heals it silently
-	// instead of reporting phantom drift on the first list after
-	// an upgrade.
+	// Recompute the hash from the stored tools. The hash
+	// function is baseline-only. A row written by an older
+	// build may carry a hash in the old form. Recomputing
+	// heals it silently instead of reporting phantom drift on
+	// the first list after an upgrade.
 	b.Hash = hashTools(b.Tools)
 	px.toolsBaseline = &b
 	cp := b
@@ -253,11 +254,11 @@ func (px *Proxy) loadToolsBaseline() error {
 	return nil
 }
 
-// toolsGate reports whether a tool call must be denied as drift:
-// the baseline exists and the name is outside it. The denial
-// names what changed, so the human can decide from the error
-// alone without a second command: a tool the gateway has seen
-// appear since the baseline is listed as added, while a name
+// toolsGate reports whether a tool call must be denied as drift.
+// The baseline exists and the name is outside it. The denial
+// names what changed. The human can decide from the error
+// alone without a second command. A tool the gateway has seen
+// appear since the baseline is listed as added. A name
 // never seen in any list stays a plain unknown.
 func (px *Proxy) toolsGate(tool string) (string, bool) {
 	px.toolsMu.Lock()
@@ -284,7 +285,7 @@ func (px *Proxy) toolsGate(tool string) (string, bool) {
 }
 
 // SetToolsReapprovePending marks the next observed list as the new
-// baseline, for --reapprove-tools and POST /v1/tools/accept.
+// baseline. It serves --reapprove-tools and POST /v1/tools/accept.
 func (px *Proxy) SetToolsReapprovePending(actor string) {
 	px.toolsMu.Lock()
 	defer px.toolsMu.Unlock()
@@ -294,12 +295,12 @@ func (px *Proxy) SetToolsReapprovePending(actor string) {
 
 // applyToolsList folds one observed surface into the baseline
 // state: establish, reapprove, drift, or no change. It witnesses
-// every transition except no-change, and persists baseline moves.
-// Callers hold no lock; this takes toolsMu. The in-memory anchor
-// moves before the ledger writes, so a failing write restores
+// every transition except no-change. It persists baseline moves.
+// Callers hold no lock. This takes toolsMu. The in-memory anchor
+// moves before the ledger writes. A failing write restores
 // the previous state instead of leaving a move the chain never
-// saw. Witness args carry the baseline hash, so the chain shows
-// what surface was trusted when; the baseline row itself is not
+// saw. Witness args carry the baseline hash. The chain shows
+// what surface was trusted when. The baseline row itself is not
 // covered by chain verification (see SECURITY.md).
 func (px *Proxy) applyToolsList(observed ledger.ToolsBaseline, actor string) error {
 	px.toolsMu.Lock()
@@ -315,8 +316,8 @@ func (px *Proxy) applyToolsList(observed ledger.ToolsBaseline, actor string) err
 	}
 	switch {
 	case px.toolsBaseline == nil:
-		// Establishment wins over a pending re-approval: there
-		// is no earlier baseline to re-approve, so a first list
+		// Establishment wins over a pending re-approval. There
+		// is no earlier baseline to re-approve. A first list
 		// witnesses "establish" and consumes the pending flag.
 		px.toolsReapprovePending = false
 		px.toolsBaseline = &observed
@@ -368,18 +369,18 @@ func (px *Proxy) HasToolsBaseline() bool {
 }
 
 // ProbeToolsBaseline asks the upstream for its tool surface at
-// startup. A network or parse failure is not fatal: the first
-// tools/list passing through will establish the baseline instead,
-// and runGateway retries quietly until one exists. A store or
+// startup. A network or parse failure is not fatal. The first
+// tools/list passing through will establish the baseline instead.
+// runGateway retries quietly until one exists. A store or
 // witness failure is fatal, like any ledger failure.
 // The probe carries brokered headers, since the upstream may need
-// them, and its body is redacted before parsing so the baseline
+// them. Its body is redacted before parsing so the baseline
 // hash matches what passthrough observations compute.
 func (px *Proxy) ProbeToolsBaseline() error {
 	return px.probeToolsBaseline(false)
 }
 
-// ProbeToolsBaselineQuiet is the retry-loop probe: same work, no
+// ProbeToolsBaselineQuiet is the retry-loop probe. Same work, no
 // per-failure log lines.
 func (px *Proxy) ProbeToolsBaselineQuiet() error {
 	return px.probeToolsBaseline(true)
@@ -391,7 +392,7 @@ func (px *Proxy) probeToolsBaseline(quiet bool) error {
 			log.Printf("tools baseline probe: %s", msg)
 		}
 	}
-	// Follow pagination cursors: the baseline is the whole
+	// Follow pagination cursors. The baseline is the whole
 	// surface, not page 1 of it.
 	var all []ledger.BaselineTool
 	cursor := ""
@@ -410,7 +411,7 @@ func (px *Proxy) probeToolsBaseline(quiet bool) error {
 		if px.broker != nil {
 			px.broker.InjectHeaders(req.Header)
 		}
-		// The probe has its own timeout: a hung upstream must
+		// The probe has its own timeout. A hung upstream must
 		// not hang gateway startup. Forwarding keeps its
 		// no-timeout posture for long-lived streams.
 		resp, err := px.probeClient.Do(req)
@@ -451,8 +452,8 @@ func (px *Proxy) probeToolsBaseline(quiet bool) error {
 
 // observeToolsList folds a tools/list response that passed through
 // the proxy into the baseline state. Unparseable, oversize, or
-// paginated (partial-page) responses change nothing: a partial
-// page is not a surface, and treating it as one would deny
+// paginated (partial-page) responses change nothing. A partial
+// page is not a surface. Treating it as one would deny
 // page-2 tools as drift.
 func (px *Proxy) observeToolsList(raw []byte) {
 	observed, cursor, ok := parseToolsList(raw)
@@ -468,8 +469,9 @@ func (px *Proxy) observeToolsList(raw []byte) {
 	}
 }
 
-// serveToolsStatus answers GET /v1/tools: baseline, latest
-// observed surface, whether they differ, and the drift detail.
+// serveToolsStatus answers GET /v1/tools. It reports the baseline,
+// the latest observed surface, whether they differ, and the drift
+// detail.
 func (px *Proxy) serveToolsStatus(w http.ResponseWriter, r *http.Request) {
 	px.toolsMu.Lock()
 	defer px.toolsMu.Unlock()
@@ -494,7 +496,7 @@ func (px *Proxy) serveToolsStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveToolsAccept marks the next observed list as the new
-// baseline. It does not itself change the baseline: the next list
+// baseline. It does not itself change the baseline. The next list
 // is what the human is accepting, after review.
 func (px *Proxy) serveToolsAccept(w http.ResponseWriter, r *http.Request) {
 	var req struct {

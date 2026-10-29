@@ -49,7 +49,7 @@ rules:
 	}
 }
 
-// Contain and propose are restrictive: when their argument
+// Contain and propose are restrictive. When their argument
 // conditions cannot be evaluated, they count as matched, exactly
 // like deny and hold. An allow rule in that state grants nothing.
 func TestContainProposeFailClosed(t *testing.T) {

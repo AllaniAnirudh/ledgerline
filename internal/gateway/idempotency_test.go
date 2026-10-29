@@ -214,7 +214,7 @@ func TestIdemUnknownRecoveryAndResolve(t *testing.T) {
 	if !strings.Contains(body, "outcome unknown") {
 		t.Fatalf("unknown retry should demand resolution, got %s", body)
 	}
-	// Resolve as not-executed: the retry runs fresh.
+	// Resolve as not-executed. The retry runs fresh.
 	resolve := func(key, resolution string) (int, string) {
 		t.Helper()
 		payload := `{"session":"test-session","key":"` + key + `","resolution":"` + resolution + `"}`

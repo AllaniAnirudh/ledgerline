@@ -1,13 +1,14 @@
 // Package gateway is the boundary: an HTTP proxy that sits between an
 // MCP client (the agent) and the upstream MCP server.
 //
-// Every JSON-RPC tool call crossing the boundary is witnessed into the
-// ledger and checked against policy before it is allowed through.
-// Non-tool traffic is forwarded untouched.
+// Every JSON-RPC tool call crossing the boundary goes into the
+// ledger. It is checked against policy before it is allowed
+// through. Non-tool traffic is forwarded untouched.
 //
-// The agent is never trusted to log itself. The gateway is the trust
-// root for everything it witnesses. If the ledger cannot be written,
-// the boundary fails closed: no witness, no passage.
+// The gateway does not trust the agent to log itself. The gateway
+// is the trust root for everything it witnesses. If the ledger
+// cannot be written, the boundary fails closed: no witness, no
+// passage.
 package gateway
 
 import (
@@ -28,15 +29,15 @@ import (
 	"github.com/AllaniAnirudh/ledgerline/internal/policy"
 )
 
-// maxBodyBytes caps one proxied request body. Tool calls are small;
-// the cap exists so a client cannot make the boundary buffer an
-// unbounded request into memory.
+// maxBodyBytes caps one proxied request body. Tool calls are
+// small. The cap exists so a client cannot make the boundary
+// buffer an unbounded request into memory.
 const maxBodyBytes = 10 << 20
 
 // maxListBytes caps one captured tools/list response. Tool lists
-// are rarely near 1 MiB, and each in-flight list pins its capture
-// buffer, so the list cap is deliberately far below the request
-// cap: an agent-triggered upstream cannot amplify memory 10 MiB
+// are rarely near 1 MiB. Each in-flight list pins its capture
+// buffer. The list cap is deliberately far below the request
+// cap. An agent-triggered upstream cannot amplify memory 10 MiB
 // per concurrent list.
 const maxListBytes = 1 << 20
 
@@ -73,22 +74,23 @@ type Proxy struct {
 }
 
 // inflightReq is one cancellable upstream request. It is keyed by
-// pointer because a CancelFunc itself is not a map key.
+// pointer. A CancelFunc itself is not a map key.
 type inflightReq struct {
 	cancel context.CancelFunc
 }
 
 // SetAPIToken guards the /v1 control plane. When a token is set,
 // every /v1 request must carry it as "Authorization: Bearer <token>"
-// or the X-Ledgerline-Token header. Empty means no check (local use
-// only; the control plane can approve held calls, so guard it before
-// exposing the gateway beyond localhost).
+// or the X-Ledgerline-Token header. Empty means no check. Use
+// empty only for local use. The control plane can approve held
+// calls, so guard it before exposing the gateway beyond
+// localhost.
 func (px *Proxy) SetAPIToken(t string) { px.apiToken = t }
 
-// SetApproverToken binds one token to one approver name. A decision
-// made with an approver token is recorded in the ledger under the
-// bound name; the request body cannot override it. Approver tokens
-// also pass the control-plane token check.
+// SetApproverToken binds one token to one approver name. A
+// decision made with an approver token goes into the ledger under
+// the bound name. The request body cannot override it. Approver
+// tokens also pass the control-plane token check.
 func (px *Proxy) SetApproverToken(name, token string) {
 	if px.approvers == nil {
 		px.approvers = map[string]string{}
@@ -106,8 +108,8 @@ func requestToken(r *http.Request) string {
 	return ""
 }
 
-// tokenEqual compares two tokens in constant time (via digests, so
-// length does not leak either).
+// tokenEqual compares two tokens in constant time. It compares
+// digests, so length does not leak either.
 func tokenEqual(got, want string) bool {
 	g := sha256.Sum256([]byte(got))
 	w := sha256.Sum256([]byte(want))
@@ -133,8 +135,9 @@ func (px *Proxy) tokenOK(r *http.Request) bool {
 	return false
 }
 
-// approverActor returns the name bound to the request's token, when
-// the request authenticated with a per-approver token.
+// approverActor returns the name bound to the request's token.
+// It applies when the request authenticated with a per-approver
+// token.
 func (px *Proxy) approverActor(r *http.Request) (string, bool) {
 	got := requestToken(r)
 	if got == "" {
@@ -170,8 +173,8 @@ func (px *Proxy) Approvals() *Approvals { return px.approvals }
 // Proposals exposes the pending out-of-band proposal queue.
 func (px *Proxy) Proposals() *Proposals { return px.proposals }
 
-// SetBroker installs the credential broker. Nil means no broker:
-// upstream credentials pass through untouched, as before.
+// SetBroker installs the credential broker. Nil means no broker.
+// Upstream credentials pass through untouched, as before.
 func (px *Proxy) SetBroker(b *Broker) { px.broker = b }
 
 // SetUpstreamPin records the pinned upstream identity for the
@@ -221,20 +224,21 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mcpID := r.Header.Get("Mcp-Session-Id")
 	px.observeMCP(session, mcpID)
 
-	// A contained session is cut off entirely: no tool call, no
-	// list, no other proxied traffic passes. The control plane
-	// above is unaffected, so a human can still inspect the
-	// session, and it stays contained until a new gateway start.
-	// Containment holds only while this gateway process lives: it
-	// is a session freeze, not a kill switch that survives a
-	// gateway restart. It is keyed on the ledger session AND on
-	// every upstream MCP session id observed on it, so rotating
-	// the ledger header alone does not evade it: the agent must
-	// also abandon its upstream MCP session. That raises the cost
-	// of evasion; it does not eliminate it, because the proxy path
-	// is unauthenticated by design and a fresh MCP session is a
-	// new identity. Full binding needs proxy-path client auth,
-	// which this build does not add (see SECURITY.md).
+	// A contained session is cut off entirely. No tool call,
+	// no list, and no other proxied traffic passes. The
+	// control plane above is unaffected. A human can still
+	// inspect the session. It stays contained until a new
+	// gateway start. Containment holds only while this
+	// gateway process lives. It is a session freeze, not a
+	// kill switch that survives a gateway restart. It is
+	// keyed on the ledger session AND on every upstream MCP
+	// session id observed on it. Rotating the ledger header
+	// alone does not evade it. The agent must also abandon
+	// its upstream MCP session. That raises the cost of
+	// evasion. It does not eliminate it. The proxy path has
+	// no authentication by design. A fresh MCP session is a
+	// new identity. Full binding needs proxy-path client
+	// auth. This build does not add it (see SECURITY.md).
 	if px.IsContained(session, mcpID) {
 		if r.Method == http.MethodPost {
 			if !px.witness(session, "containment", "(session)", nil, "deny", "", w, body) {
@@ -245,9 +249,10 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The broker owns its headers: a request carrying a brokered
-	// header with a foreign value is denied before anything else.
-	// Tool calls witness the denial; other traffic just fails.
+	// The broker owns its headers. A request carrying a
+	// brokered header with a foreign value is denied before
+	// anything else. Tool calls witness the denial. Other
+	// traffic just fails.
 	if px.broker != nil {
 		if name := px.broker.ForeignHeader(r); name != "" {
 			msg := "ledgerline: foreign credential in header " + name
@@ -270,10 +275,10 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var claim *idemClaim
 	if r.Method == http.MethodPost && isToolCall(body) {
 		tool, args := toolCallDetails(body)
-		// A brokered secret in the arguments is denied before any
-		// witness that would record those arguments: the secret
-		// must never reach the ledger, the hold queue, or the
-		// proposal queue.
+		// A brokered secret in the arguments is denied before
+		// any witness that would record those arguments. The
+		// secret must never reach the ledger, the hold queue,
+		// or the proposal queue.
 		if px.broker != nil && px.broker.ContainsSecret(args) {
 			if !px.witness(session, "policy_decision", tool, nil, "deny", "", w, body) {
 				return
@@ -281,10 +286,11 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSONRPCError(w, body, "ledgerline: tool arguments contain a brokered credential")
 			return
 		}
-		// Tools-drift gate: once a baseline exists, a tool name
-		// outside it is denied until a human accepts the new
-		// surface. This runs before policy, because a drifted
-		// tool would otherwise take the policy default.
+		// Tools-drift gate: once a baseline exists, a tool
+		// name outside it is denied until a human accepts
+		// the new surface. This runs before policy. A
+		// drifted tool would otherwise take the policy
+		// default.
 		if msg, denied := px.toolsGate(tool); denied {
 			if !px.witness(session, "tools_drift", tool, nil, "deny", "", w, body) {
 				return
@@ -293,12 +299,12 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Idempotency lookup: a retry with a key is answered
-		// from the journal when the journal says the call must
-		// not run again. The claim itself waits for the policy
-		// decision below: an allowed call claims "started", a
-		// held call claims "held". Policy denials, containments,
-		// and proposals leave no record, so a later retry
-		// re-evaluates current policy.
+		// from the journal when the journal says the call
+		// must not run again. The claim itself waits for
+		// the policy decision below. An allowed call claims
+		// "started". A held call claims "held". Policy
+		// denials, containments, and proposals leave no
+		// record. A later retry re-evaluates current policy.
 		if key := strings.TrimSpace(r.Header.Get(idemHeader)); key != "" {
 			if len(key) > idemMaxKeyLen {
 				writeJSONRPCError(w, body, "ledgerline: idempotency key too long")
@@ -348,7 +354,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if claim != nil {
-			// Claim "started" before forwarding: the atomic
+			// Claim "started" before forwarding. The atomic
 			// claim is what stops a concurrent identical retry
 			// from forwarding a second copy. A losing retry is
 			// answered from the winner's record.
@@ -369,17 +375,17 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if !px.witness(session, "tool_call", tool, args, policy.Allow.String(), "", w, body) {
 			if claim != nil {
-				// The call never ran, so its journal entry
-				// must not block retries as "started".
+				// The call never ran. Its journal entry must
+				// not block retries as "started".
 				px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
 			}
 			return
 		}
 	}
 
-	// A JSON-RPC batch could smuggle tool calls past the witness:
-	// the gateway cannot classify the calls inside it, so batches
-	// are refused at the boundary and the refusal is witnessed.
+	// A JSON-RPC batch could smuggle tool calls past the witness.
+	// The gateway cannot classify the calls inside it. Batches
+	// are refused at the boundary. The refusal is witnessed.
 	if r.Method == http.MethodPost && isBatch(body) {
 		if !px.witness(session, "policy_decision", "(batch)", nil, policy.Deny.String(), "", w, body) {
 			return
@@ -396,7 +402,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // isBatch reports whether the body is a JSON array (a JSON-RPC batch).
 // trackInflight registers a cancellable upstream request under its
-// session; untrackInflight removes it when the request finishes.
+// session. untrackInflight removes it when the request finishes.
 func (px *Proxy) trackInflight(session string, cancel context.CancelFunc) *inflightReq {
 	req := &inflightReq{cancel: cancel}
 	px.inflightMu.Lock()
@@ -425,7 +431,7 @@ func (px *Proxy) untrackInflight(session string, req *inflightReq) {
 }
 
 // cancelInflight aborts every in-flight upstream request for a
-// session. Called by Contain.
+// session. Contain calls it.
 func (px *Proxy) cancelInflight(session string) {
 	px.inflightMu.Lock()
 	set := px.inflight[session]
@@ -440,8 +446,8 @@ func isBatch(body []byte) bool {
 	return len(bytes.TrimSpace(body)) > 0 && bytes.TrimSpace(body)[0] == '['
 }
 
-// witness appends one event, failing closed: if the ledger cannot be
-// written, the call does not pass the boundary.
+// witness appends one event, failing closed. If the ledger cannot
+// be written, the call does not pass the boundary.
 func (px *Proxy) witness(session, kind, tool string, args json.RawMessage, decision, actor string, w http.ResponseWriter, body []byte) bool {
 	if _, err := px.ledger.Append(session, kind, tool, args, decision, actor); err != nil {
 		log.Printf("ledger write failed: %v", err)
@@ -451,7 +457,7 @@ func (px *Proxy) witness(session, kind, tool string, args json.RawMessage, decis
 	return true
 }
 
-// sessionOf reads the ledger session from the request, defaulting
+// sessionOf reads the ledger session from the request. It defaults
 // to the shared "default" session when the header is absent.
 func sessionOf(r *http.Request) string {
 	if s := r.Header.Get("X-Ledgerline-Session"); s != "" {
@@ -461,19 +467,18 @@ func sessionOf(r *http.Request) string {
 }
 
 // forward passes the request upstream and streams the response back.
-// The request is registered as in-flight under its session, so
-// Contain cancels it mid-flight: the gateway stops waiting and
-// cuts the response, so nothing from it reaches the agent. Whether
-// the upstream itself stops depends on it observing cancellation:
-// a stream it already started does (the server notices the closed
-// connection), while a plain request still awaiting its first byte
-// may run to completion server-side, with its result discarded.
-// Cancelling never undoes a side effect the upstream already
-// executed.
-// forward also re-checks containment at its own entry: the hold
-// release path reaches forward without passing the ServeHTTP gate,
-// so a session contained after its hold was approved must still
-// never forward.
+// The request is registered as in-flight under its session. Contain
+// cancels it mid-flight. The gateway stops waiting and cuts the
+// response. Nothing from it reaches the agent. Whether the upstream
+// itself stops depends on it observing cancellation. A stream it
+// already started does stop. The server notices the closed
+// connection. A plain request still awaiting its first byte may run
+// to completion server-side, with its result discarded. Cancelling
+// never undoes a side effect the upstream already executed.
+// forward also re-checks containment at its own entry. The hold
+// release path reaches forward without passing the ServeHTTP gate.
+// A session contained after its hold was approved must still never
+// forward.
 func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, claim *idemClaim) {
 	session := sessionOf(r)
 	if px.IsContained(session, r.Header.Get("Mcp-Session-Id")) {
@@ -481,19 +486,19 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 			log.Printf("ledger write failed on contained forward: %v", err)
 		}
 		if claim != nil {
-			// Contained before running: the call never ran,
-			// so a retry runs fresh once uncontained.
+			// Contained before running. The call never ran. A
+			// retry runs fresh once uncontained.
 			px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
 		}
 		writeJSONRPCError(w, body, "ledgerline: session contained")
 		return
 	}
 
-	// Drift re-check at the last point before upstream: a held
-	// call waited while the surface changed, and a concurrent
-	// list can move it even for a fresh call, so the gate the
+	// Drift re-check at the last point before upstream. A held
+	// call waited while the surface changed. A concurrent
+	// list can move it even for a fresh call. The gate the
 	// call passed at arrival may no longer hold. A denied
-	// release never ran, so a keyed retry runs fresh (and hits
+	// release never ran. A keyed retry runs fresh (and hits
 	// the gate again) instead of replaying a denial.
 	if r.Method == http.MethodPost && isToolCall(body) {
 		if tool, _ := toolCallDetails(body); tool != "" {
@@ -511,7 +516,7 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	}
 
 	// A keyed call is journaled as started before the upstream
-	// sees it: if the process dies from here on, recovery marks
+	// sees it. If the process dies from here on, recovery marks
 	// it unknown instead of losing it. A journal failure closes
 	// the boundary rather than running unjournaled.
 	var out http.ResponseWriter = w
@@ -532,9 +537,9 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 		out = capW
 	}
 
-	// A tools/list response is captured for drift observation:
-	// it is how the gateway learns the upstream's current
-	// surface. Nesting capture writers is safe: each tees its
+	// A tools/list response is captured for drift observation.
+	// It is how the gateway learns the upstream's current
+	// surface. Nesting capture writers is safe. Each tees its
 	// own buffer while passing bytes through.
 	var listBuf *limitedBuffer
 	if r.Method == http.MethodPost && isToolsList(body) {
@@ -558,8 +563,9 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	}
 	upReq.Header = r.Header.Clone()
 	stripHopByHop(upReq.Header)
-	// Brokered headers are injected here; a foreign agent value
-	// under a brokered name was already denied before forwarding.
+	// Brokered headers are injected here. A foreign agent
+	// value under a brokered name was already denied
+	// before forwarding.
 	if px.broker != nil {
 		px.broker.InjectHeaders(upReq.Header)
 	}
@@ -568,7 +574,7 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	if err != nil {
 		http.Error(w, "upstream unreachable", http.StatusBadGateway)
 		if claim != nil {
-			// No response arrived: the call may or may not
+			// No response arrived. The call may or may not
 			// have executed upstream. Unknown, not completed.
 			px.idemTransition(session, claim.key, ledger.IdemUnknown, nil)
 		}
@@ -578,10 +584,10 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 
 	respHeader := resp.Header.Clone()
 	stripHopByHop(respHeader)
-	// Redaction changes the body length, so the upstream's
-	// Content-Length must not survive: without it the response
-	// is chunked, and a shortened body cannot truncate or hang
-	// the agent's read.
+	// Redaction changes the body length. The upstream's
+	// Content-Length must not survive. Without it the
+	// response is chunked. A shortened body cannot truncate
+	// or hang the agent's read.
 	redact := px.broker != nil && len(px.broker.secrets) > 0
 	if redact {
 		respHeader.Del("Content-Length")
@@ -600,13 +606,14 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	}
 	if claim != nil {
 		if copyErr != nil {
-			// The response did not arrive whole: the call may
+			// The response did not arrive whole. The call may
 			// have executed, but the agent never saw proof.
 			px.idemTransition(session, claim.key, ledger.IdemUnknown, nil)
 			return
 		}
-		// The response the agent saw is the journaled one:
-		// post-redaction bytes, or nothing when over the cap.
+		// The response the agent saw is the journaled one.
+		// It holds post-redaction bytes, or nothing when over
+		// the cap.
 		px.idemTransition(session, claim.key, ledger.IdemCompleted, func(rec *ledger.IdempotencyRecord) {
 			rec.Status = capW.status
 			rec.ContentType = resp.Header.Get("Content-Type")
@@ -636,7 +643,7 @@ var hopByHop = []string{
 
 // stripHopByHop removes hop-by-hop headers: the fixed list plus any
 // header named by the Connection header itself. They describe one
-// connection and must not cross the proxy; forwarding them (a
+// connection. They must not cross the proxy. Forwarding them (a
 // client's "Connection: close", say) makes strict upstreams reject
 // otherwise valid requests.
 func stripHopByHop(h http.Header) {
@@ -672,8 +679,8 @@ func toolCallDetails(body []byte) (string, json.RawMessage) {
 	return p.Name, p.Arguments
 }
 
-// writeJSONRPCError answers with a protocol-shaped error so MCP clients
-// see a proper JSON-RPC error instead of an HTTP failure.
+// writeJSONRPCError answers with a protocol-shaped error. MCP
+// clients see a proper JSON-RPC error instead of an HTTP failure.
 func writeJSONRPCError(w http.ResponseWriter, body []byte, msg string) {
 	var m jsonRPC
 	_ = json.Unmarshal(body, &m)

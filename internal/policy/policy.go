@@ -1,19 +1,21 @@
-// Package policy decides what happens to a tool call at the boundary:
-// allow it through, deny it, hold it for human approval, contain the
-// session it came from, or record it as a proposal for a human to
-// apply out of band.
+// Package policy decides what happens to a tool call at the boundary.
+// It allows the call through, denies it, holds it for human
+// approval, contains the session it came from, or records it as a
+// proposal for a human to apply out of band.
 //
-// Policies come from a YAML file (see LoadFile and policy.example.yaml)
-// or from static allow/deny/hold lists (New, used by tests and the
-// --deny/--hold flags). Rules are evaluated in order; the first match
-// wins. A call that matches no rule gets the policy default.
+// Policies come from a YAML file (see LoadFile and
+// policy.example.yaml) or from static allow/deny/hold lists (New,
+// used by tests and the --deny/--hold flags). Rules are evaluated
+// in order. The first match wins. A call that matches no rule gets
+// the policy default.
 //
 // Argument conditions are evaluated on the DECODED JSON arguments,
-// never on the raw bytes, and they fail closed: when a rule's tool
-// matches but its argument conditions cannot be evaluated (arguments
-// unparseable, duplicate keys, a matched value of the wrong shape),
-// a deny or hold rule counts as matched and an allow rule counts as
-// not matched. A policy condition must never fail open.
+// never on the raw bytes. They fail closed. When a rule's tool
+// matches but its argument conditions cannot be evaluated, a deny
+// or hold rule counts as matched. An allow rule counts as not
+// matched. Argument conditions cannot be evaluated when arguments
+// are unparseable, keys are duplicated, or a matched value has the
+// wrong shape. A policy condition must never fail open.
 package policy
 
 import (
@@ -35,9 +37,9 @@ const (
 	Allow Decision = iota
 	Deny
 	Hold // Hold means "needs a human" before the call may pass.
-	// Contain denies this call and freezes its whole session: every
-	// further call from the session is denied, and pending held calls
-	// from it are denied too.
+	// Contain denies this call and freezes its whole session.
+	// Every further call from the session is denied. Pending
+	// held calls from it are denied too.
 	Contain
 	// Propose records the call as a proposal and never forwards it.
 	// A human applies it out of band (or denies it) afterwards.
@@ -84,17 +86,17 @@ func ParseDecision(s string) (Decision, error) {
 // path.Match). The optional argument conditions narrow the match:
 //
 //   - ArgsMatch maps a dotted argument path ("path", "file.path") to
-//     a glob matched against that argument's string value. Argument
-//     globs are case-sensitive and support "**" for "any number of
-//     path segments", so "/etc/**" covers /etc/hosts and
-//     /etc/cron.d/evil alike.
+//     a glob matched against that argument's string value.
+//     Argument globs are case-sensitive. They support "**" for
+//     "any number of path segments". "/etc/**" covers /etc/hosts
+//     and /etc/cron.d/evil alike.
 //   - ArgsContains matches when any decoded string value in the
 //     arguments contains the text, case-insensitively. JSON string
-//     escapes are decoded first, so the escaped form of a word
+//     escapes are decoded first. The escaped form of a word
 //     matches the plain needle too.
 //
-// A rule whose argument conditions do not hold does not match, and
-// evaluation continues to the next rule. Conditions that cannot be
+// A rule whose argument conditions do not hold does not match.
+// Evaluation continues to the next rule. Conditions that cannot be
 // evaluated fail closed (see the package doc).
 type Rule struct {
 	Tool         string
@@ -111,8 +113,8 @@ type Policy struct {
 }
 
 // New builds a policy from static tool name lists. Deny is checked
-// before hold. Empty lists mean "allow everything". List entries are
-// tool globs, same as in a policy file.
+// before hold. Empty lists mean "allow everything". List entries
+// are tool globs, same as in a policy file.
 func New(denyList, holdList []string) *Policy {
 	p := &Policy{def: Allow}
 	for _, t := range denyList {
@@ -145,8 +147,8 @@ type filePolicy struct {
 
 // LoadFile reads a YAML policy file. Unknown fields, an unsupported
 // version, a bad action, a bad glob, a rule without a tool, or a
-// multi-document file are hard errors: a policy that does not parse
-// must never silently allow traffic.
+// multi-document file are hard errors. A policy that does not
+// parse must never silently allow traffic.
 func LoadFile(path string) (*Policy, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -163,7 +165,7 @@ func Parse(b []byte) (*Policy, error) {
 	if err := dec.Decode(&fp); err != nil {
 		return nil, fmt.Errorf("policy: %w", err)
 	}
-	// Reject a second document instead of silently dropping it.
+	// Reject a second document. Never silently drop it.
 	var extra any
 	if err := dec.Decode(&extra); err != io.EOF {
 		if err == nil {
@@ -225,8 +227,9 @@ func (p *Policy) Decide(tool string) Decision {
 	return d
 }
 
-// DecideCall returns the decision for one tool call and the matching
-// rule's reason (empty when the default applied or the rule has none).
+// DecideCall returns the decision for one tool call and the
+// matching rule's reason. The reason is empty when the default
+// applied or the rule has none.
 func (p *Policy) DecideCall(tool string, args json.RawMessage) (Decision, string) {
 	var ev *argsEval // decoded lazily, only if a rule needs it
 	for _, r := range p.rules {
@@ -244,9 +247,9 @@ func (p *Policy) DecideCall(tool string, args json.RawMessage) (Decision, string
 			return r.Action, r.Reason
 		case matchUnknown:
 			// Fail closed: a restrictive rule whose conditions
-			// cannot be evaluated counts as matched; an allow
+			// cannot be evaluated counts as matched. An allow
 			// rule in that state grants nothing. Contain and
-			// propose are restrictive: neither forwards the call.
+			// propose are restrictive. Neither forwards the call.
 			if r.Action == Deny || r.Action == Hold || r.Action == Contain || r.Action == Propose {
 				reason := r.Reason
 				if reason == "" {
@@ -350,8 +353,9 @@ func evaluateArgs(args json.RawMessage) *argsEval {
 	return ev
 }
 
-// readValue decodes one JSON value from the token stream, recording
-// string values and flagging duplicate object keys as it goes.
+// readValue decodes one JSON value from the token stream. It
+// records string values. It flags duplicate object keys as it
+// goes.
 func readValue(dec *json.Decoder, ev *argsEval) (any, error) {
 	tok, err := dec.Token()
 	if err != nil {
@@ -465,7 +469,7 @@ func evalArgsMatch(dottedKey, pattern string, ev *argsEval) matchResult {
 				// The leaf name may live deeper, in a shape this
 				// rule does not address. If a nested value with
 				// this name would match the pattern, the rule
-				// cannot be cleared: fail closed.
+				// cannot be cleared. Fail closed.
 				for _, s := range ev.leafVals[part] {
 					if globValue(pattern, s) {
 						return matchUnknown

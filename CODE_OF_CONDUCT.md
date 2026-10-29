@@ -2,6 +2,6 @@
 
 Ledgerline follows the Contributor Covenant 2.1: https://www.contributor-covenant.org/version/2/1/code_of_conduct/
 
-Be direct, be honest, assume good intent. Technical disagreement is welcome; personal attacks are not.
+Be direct. Be honest. Assume good intent. Technical disagreement is welcome. Personal attacks are not.
 
-Enforcement: report issues to allanianirudh05@gmail.com. All complaints are reviewed promptly and fairly.
+Enforcement: report issues to allanianirudh05@gmail.com. We review all complaints promptly and fairly.

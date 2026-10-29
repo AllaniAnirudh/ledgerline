@@ -1,16 +1,16 @@
 # Ledgerline
 
-The open trust substrate for AI agents. For agents, not using agents.
+The open trust layer for AI agents. It is built for agents. It is not built with agents.
 
-Agents will run in production. Production needs trust. Ledgerline answers three questions no open layer answers today:
+Agents will run in production. Production needs trust. Ledgerline answers three questions. No other open layer answers them today:
 
-1. **What did the agent do?** Every tool call crossing the boundary is witnessed into a hash-chained ledger (unsigned in v1; see the honest limits in `SECURITY.md`).
-2. **Who approved it?** Policy is enforced in-path: allow, deny, or hold for human approval. The approval binds to the action in the ledger.
-3. **What did it cost?** (Later module.) OTel-native metering with FOCUS export. It will not become another LLM gateway.
+1. **What did the agent do?** Every tool call that crosses the boundary goes into a hash-chained ledger. The chain is unsigned in v1. See the honest limits in `SECURITY.md`.
+2. **Who approved it?** Policy runs in the request path. It allows, denies, or holds a call for human approval. The ledger binds the approval to the action.
+3. **What did it cost?** This is a later module. It meters use with OTel and FOCUS export. It will not become another LLM gateway.
 
 ## How it works
 
-Ledgerline is a boundary gateway. It sits between the agent (any MCP client) and the upstream MCP server. The agent is never trusted to log itself.
+Ledgerline is a boundary gateway. It sits between the agent (any MCP client) and the upstream MCP server. Ledgerline does not trust the agent to log itself.
 
 ```
 Agent --(MCP/JSON-RPC)--> [ Ledgerline ] --(forward)--> MCP server
@@ -35,7 +35,8 @@ go build -o ledgerline ./cmd/ledgerline
 # serves on http://localhost:3001.
 
 # Proxy your MCP server. Deny dangerous tools, hold sensitive ones.
-# --db makes the ledger survive restarts (SQLite); omit for in-memory.
+# --db keeps the ledger across restarts. It uses SQLite.
+# Omit it for in-memory use.
 # Policy comes from a YAML file (see policy.example.yaml) or from
 # the quick --deny/--hold lists. This example binds loopback only.
 ./ledgerline gateway --upstream http://localhost:3001 --listen 127.0.0.1:8080 \
@@ -47,100 +48,110 @@ go build -o ledgerline ./cmd/ledgerline
 ./ledgerline approvals --gateway http://localhost:8080 --watch
 ./ledgerline approve <id> --actor alice
 
-# Three more policy actions exist. Contain freezes a session: the
-# triggering call is denied, new calls from the session are denied,
-# in-flight requests for it are cut off at the gateway, and its pending
-# held calls are denied too. Containment is keyed on the session
-# header AND on every upstream MCP session id observed on it, so
-# rotating the session header alone does not evade it; the agent
-# must also abandon its upstream MCP session. That raises the cost
-# of evasion but does not eliminate it: the proxy path is
-# unauthenticated by design, so a fresh MCP session is a new
-# identity, and full binding needs proxy-path client auth. A human
+# Three more policy actions exist. Contain freezes a session.
+# It denies the triggering call. It denies new calls from the
+# session. It cuts off in-flight requests for the session at the
+# gateway. It also denies the pending held calls.
+# Containment uses the session header. It also uses every
+# upstream MCP session id seen on that session. Rotating the
+# session header alone does not evade it. The agent must also
+# abandon its upstream MCP session. This raises the cost of
+# evasion. It does not remove it. The proxy path has no
+# authentication by design. A fresh MCP session is a new
+# identity. Full binding needs proxy-path client auth. A human
 # can also freeze a session from the control plane at any time:
 #   ./ledgerline contain <session-id> --reason "suspicious holds"
 #   ./ledgerline contained
 # Note: clients that send no session header share the "default"
-# session, so containing "default" blocks every headerless client.
-# Propose records a call for out-of-band application and never
-# forwards it: the agent is told the action was NOT executed, and a
-# human applies it (or denies it) afterwards, outside the gateway.
+# session. Containing "default" blocks every headerless client.
+# Propose records a call for out-of-band application. It never
+# forwards the call. The agent learns the action was NOT
+# executed. A human applies it or denies it afterwards, outside
+# the gateway.
 # Identical retries return the existing proposal id instead of
 # queueing duplicates. The queue holds 1000 proposals and entries
 # expire after 24 hours. An "apply" record is only as trustworthy
-# as the control-plane token: with no token set, anyone who can
-# reach the port can mark a proposal applied, so treat no-token
+# as the control-plane token. With no token set, anyone who can
+# reach the port can mark a proposal applied. Treat no-token
 # local use as single-user only:
 #   ./ledgerline proposals
 #   ./ledgerline apply <proposal-id>
 #   ./ledgerline deny <proposal-id>
 
-# Pin the upstream server so a changed upstream cannot slip in
-# silently. The first run writes the pin; later runs refuse to start
-# on a mismatch until a human re-approves (witnessed in the ledger):
+# Pin the upstream server. A changed upstream then cannot slip
+# in silently. The first run writes the pin. Later runs refuse
+# to start on a mismatch. A human must re-approve. The
+# re-approval goes into the ledger:
 #   ./ledgerline gateway ... --upstream-pin-file upstream.pin
 #   ./ledgerline gateway ... --upstream-pin-file upstream.pin --reapprove-upstream
 
-# Broker upstream credentials: the agent never holds them. The
-# gateway injects them on every forwarded request, denies foreign
-# values under brokered header names, denies tool calls whose
-# arguments carry a brokered secret (before witnessing, so the
-# secret never reaches the ledger), and redacts brokered values
-# from upstream responses. Values come from the environment only,
-# never from the config file (see broker.example.yaml):
+# Broker upstream credentials. The agent never holds them. The
+# gateway injects them on every forwarded request. It denies
+# foreign values under brokered header names. It denies tool
+# calls whose arguments carry a brokered secret. It denies them
+# before witnessing, so the secret never reaches the ledger. It
+# redacts brokered values from upstream responses. Values come
+# from the environment only. They never come from the config
+# file (see broker.example.yaml):
 #   UPSTREAM_API_KEY=... ./ledgerline gateway ... --broker broker.example.yaml
 # Broker status (names and headers only, never values):
 #   curl http://localhost:8080/v1/broker
 
 # The ledger stores tool arguments as sent, except brokered
-# secrets: those are denied before witnessing and redacted from
-# responses, so they never reach the ledger. Anything else the
-# agent puts in arguments, and all PTY output, is still stored as
-# sent: treat ledger.db and exported bundles as secret-bearing.
+# secrets. Brokered secrets are denied before witnessing. They
+# are redacted from responses. They never reach the ledger.
+# Anything else the agent puts in arguments stays as sent. All
+# PTY output stays as sent. Treat ledger.db and exported bundles
+# as secret-bearing.
 
-# Durable execution: a client that sends X-Ledgerline-Idempotency-Key
-# on a tool call gets exactly-once semantics per key within its
-# session. The gateway journals the call as started before
-# forwarding, replays the recorded response on retry (up to 1 MiB),
-# answers a concurrent retry as in-flight, and answers a retry of a
-# held call with the same approval id instead of queueing a second
-# hold. A key bound to one tool and one arguments hash: reuse with
-# a different tool or different arguments is denied. After a crash,
-# started calls come back as unknown, and only a human resolution
-# moves them (executed keys never re-forward):
+# Durable execution: a client that sends
+# X-Ledgerline-Idempotency-Key on a tool call gets exactly-once
+# semantics per key in its session. The gateway journals the
+# call as started before forwarding. It replays the recorded
+# response on retry (up to 1 MiB). It answers a concurrent retry
+# as in-flight. It answers a retry of a held call with the same
+# approval id instead of queueing a second hold. A key binds to
+# one tool and one arguments hash. Reuse with a different tool
+# or different arguments is denied. After a crash, started calls
+# come back as unknown. Only a human resolution moves them.
+# Executed keys never re-forward:
 #   curl ... -H 'X-Ledgerline-Idempotency-Key: deploy-001' ...
 #   ./ledgerline idempotency --state unknown
 #   ./ledgerline resolve <session> <key> <executed|not-executed>
-# Unkeyed calls behave exactly as before, and policy denials leave
-# no record, so a later retry re-evaluates current policy. Restart
-# recovery needs a SQLite ledger (--db); in-memory mode keeps the
-# journal only while the process lives.
+# Unkeyed calls behave exactly as before. Policy denials leave
+# no record. A later retry re-evaluates current policy. Restart
+# recovery needs a SQLite ledger (--db). In-memory mode keeps
+# the journal only while the process lives.
 
-# Tools-drift detection: the gateway records the upstream's tool
-# surface as a baseline (startup probe, else the first tools/list
-# passing through) and enforces it from then on. A tools/call for
-# a name outside the baseline is denied until a human accepts the
-# new surface. The baseline survives restarts in the ledger store,
-# so a restart does not grant the upstream amnesty. Removals and
-# description/schema changes are witnessed as drift but do not
-# block calls to baseline tools. Review and accept:
+# Tools-drift detection: the gateway records the upstream tool
+# surface as a baseline. It takes the baseline from the startup
+# probe. If the probe finds nothing, it takes the first
+# tools/list that passes through. It enforces the baseline from
+# then on. A tools/call for a name outside the baseline is
+# denied until a human accepts the new surface. The baseline
+# survives restarts in the ledger store. A restart does not
+# grant the upstream amnesty. Removals and description/schema
+# changes go into the ledger as drift. They do not block calls
+# to baseline tools. Review and accept:
 #   ./ledgerline tools
 #   ./ledgerline accept-tools
 # The next observed list then becomes the new baseline, witnessed
 # in the ledger. Or accept at startup:
 #   ./ledgerline gateway ... --reapprove-tools
-# With no baseline at all (upstream never answered tools/list),
-# calls stay allowed: there is nothing to drift from yet. When
-# the upstream is not up at startup, the gateway retries the
-# probe quietly every 10s until a baseline exists.
-# A paginated tools/list (nextCursor present) is never treated
-# as a surface: the probe follows cursors to build the full
-# baseline, and a partial page passing through is ignored, so
-# page-2 tools are never denied as drift.
+# With no baseline at all, calls stay allowed. This happens when
+# the upstream never answered tools/list. There is nothing to
+# drift from yet. When the upstream is not up at startup, the
+# gateway retries the probe quietly every 10s until a baseline
+# exists.
+# A paginated tools/list is never treated as a surface. This
+# means a list with nextCursor present. The probe follows
+# cursors to build the full baseline. A partial page that passes
+# through is ignored. Page-2 tools are never denied as drift.
 # Drift enforcement needs a control-plane token to mean what it
-# says: with no --api-token or --approver-token, anyone who can
-# reach the port can accept a new surface, including the agent
-# itself. The gateway logs a warning at startup in that case.
+# says. With no --api-token or --approver-token, anyone who can
+# reach the port can accept a new surface. This includes the
+# agent itself. The gateway logs a warning at startup in that
+# case.
 
 # Hook bridge: check native tool calls, not just MCP calls.
 # Native tools (Bash, file edits) never cross the MCP boundary.
@@ -171,19 +182,20 @@ go build -o ledgerline ./cmd/ledgerline
 # Drift detection does not apply to hook calls: it guards the
 # upstream MCP tool surface, not native harness tools.
 
-# Guard the control plane before exposing the gateway beyond
-# loopback. With no token, anyone who can reach the port can read
-# the ledger (arguments included) and decide approvals. The proxy
-# path itself is never authenticated by design: anyone who can
-# reach the port can also send tool calls to your upstream server.
+# Guard the control plane before you expose the gateway beyond
+# loopback. With no token, anyone who can reach the port can
+# read the ledger. This includes arguments. Such a person can
+# also decide approvals. The proxy path itself has no
+# authentication by design. Anyone who can reach the port can
+# also send tool calls to your upstream server.
 ./ledgerline gateway ... --api-token "$LEDGERLINE_API_TOKEN"
 
-# Bind approver names to credentials with per-approver tokens:
-# a decision made with one is recorded in the ledger under the
-# bound name, and the request cannot override it.
+# Bind approver names to credentials with per-approver tokens.
+# A decision made with one goes into the ledger under the bound
+# name. The request cannot override it.
 ./ledgerline gateway ... --approver-token alice=TOKEN1 --approver-token bob=TOKEN2
-# With only a shared --api-token (or none), the recorded approver
-# name is the one the caller supplies: it is a claim, not a proof.
+# With only a shared --api-token, or none, the recorded approver
+# name is the one the caller supplies. It is a claim, not a proof.
 
 # Run a terminal session into the same ledger (shares --db):
 ./ledgerline run --db ledger.db --session demo -- opencode run "fix the bug"
@@ -198,13 +210,13 @@ go build -o ledgerline ./cmd/ledgerline
 
 ## Layout
 
-- `cmd/ledgerline` — CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `idempotency`, `resolve`, `tools`, `accept-tools`, `export`, `verify`, `run`, `hook`
-- `internal/gateway` — the boundary proxy: intercepts `tools/call`, consults policy, holds for approval, contains sessions, records proposals, brokers upstream credentials, forwards the rest; serves the `/v1/*` API, the `/approvals` page, and `/replay`
-- `internal/ledger` — `Store` interface; in-memory chain and SQLite backend; chain verification
-- `internal/policy` — allow/deny/hold/contain/propose decisions from a YAML policy file (ordered rules, glob tool names, decoded-JSON argument matching that fails closed, configurable default) or static lists (entries are tool globs)
-- `internal/pty` — PTY co-capture: runs a command, witnesses terminal output into the same ledger
-- `internal/replay` — offline bundle export (prefix-closed, so the chain verifies) and the timeline viewer
-- `docs/VISION.md` — the full vision and architecture doc
+- `cmd/ledgerline` holds the CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `idempotency`, `resolve`, `tools`, `accept-tools`, `export`, `verify`, `run`, `hook`
+- `internal/gateway` is the boundary proxy. It intercepts `tools/call`. It consults policy. It holds calls for approval. It contains sessions. It records proposals. It brokers upstream credentials. It forwards the rest. It serves the `/v1/*` API, the `/approvals` page, and `/replay`
+- `internal/ledger` holds the `Store` interface, the in-memory chain, the SQLite backend, and chain verification
+- `internal/policy` makes allow/deny/hold/contain/propose decisions from a YAML policy file or static lists. The YAML file uses ordered rules, glob tool names, and decoded-JSON argument matching that fails closed. It has a configurable default. Static list entries are tool globs
+- `internal/pty` is PTY co-capture. It runs a command. It witnesses terminal output into the same ledger
+- `internal/replay` is offline bundle export and the timeline viewer. Bundles are prefix-closed, so the chain verifies
+- `docs/VISION.md` is the full vision and architecture doc
 
 ## Status
 
@@ -213,31 +225,23 @@ Phase 1 wedge complete. See `docs/VISION.md` for the design, the threat model, a
 Honest limits of the current build (also in `SECURITY.md`):
 
 - The hash chain is unsigned. Bundles prove self-consistency, not who wrote them. Signing and external anchoring are Phase 2.
-- Redaction covers brokered secrets only. A tool call carrying a brokered secret is denied before witnessing, and brokered values are redacted from upstream responses. Any other secret in arguments, and all PTY output, is still stored as sent, so the ledger and bundles stay secret-bearing. The broker cannot revoke knowledge the agent already has from elsewhere, and it does not scan non-tool traffic arguments.
-- The gateway sets no timeout on upstream calls, so long-lived streaming sessions are never cut off, and a hung upstream holds a request open.
-- Capture records the call and its policy outcome, not the upstream result or its duration, except keyed calls: their redacted responses are journaled up to 1 MiB for replay, and larger responses complete without a replay copy.
-- Containment is a session freeze inside a running gateway, not a kill switch that survives a gateway restart. A contained session unfreezes if the gateway restarts. Cancelling an in-flight request stops the gateway waiting and cuts its response, so nothing from it reaches the agent; whether the upstream itself stops depends on it observing cancellation (a started stream does, a plain request still awaiting its first byte may run to completion server-side, with its result discarded). It never undoes a side effect the upstream already executed.
-- Containment binds the ledger session header and the upstream MCP sessions observed on it. Rotating the ledger header alone does not evade it, but starting a fresh upstream MCP session does: without proxy-path client authentication, a new MCP session is a new identity.
-- Upstream pinning covers the configured upstream URL only. It does not verify what the upstream server is, and it does not cover MCP servers reached any other way. The pin proves the configured upstream string matches the pin file, nothing more: the pin file itself is unprotected against a same-user process, and the first run trusts whatever upstream was passed.
-- Proposal "apply" records claim a human applied the action out of band. With no control-plane token, anyone who can reach the port can create that record, so treat no-token local use as single-user only.
-- Idempotency is per key, per session, for 24 hours, up to 1000 journal records. A replay bypasses current policy by design (same key means same call) but never bypasses containment. A resolved-executed key never re-forwards, even if the resolution was wrong: the human, not the gateway, owns that call. Journal rows are durable, not hash-chained; only the unknown and resolved transitions are witnessed in the chain.
-- Tools-drift enforcement denies unknown tool names only, and only once a baseline exists. The first sighting is trusted (TOFU): a server already compromised before the first gateway start baselines its malicious tools. A tools/list response the gateway cannot parse changes nothing, and in-memory mode loses the baseline on restart. The stored baseline row is not covered by chain verification: a process that can write the ledger DB can rewrite it while verify stays green (the same conceded DB-write power as the chain itself). Session bundles exclude gateway-wide baseline and drift events; the full chain holds them.
+- Redaction covers brokered secrets only. A tool call that carries a brokered secret is denied before witnessing. Brokered values are redacted from upstream responses. Any other secret in arguments stays as sent. All PTY output stays as sent. The ledger and bundles stay secret-bearing. The broker cannot revoke knowledge the agent already has from elsewhere. It does not scan non-tool traffic arguments.
+- The gateway sets no timeout on upstream calls. Long-lived streaming sessions are never cut off. A hung upstream holds a request open.
+- Capture records the call and its policy outcome. It does not record the upstream result or the call duration. Keyed calls are the exception. Their redacted responses go into the journal up to 1 MiB for replay. Larger responses complete without a replay copy.
+- Containment is a session freeze inside a running gateway. It is not a kill switch that survives a gateway restart. A contained session unfreezes if the gateway restarts. Cancelling an in-flight request stops the gateway waiting. It cuts the response, so nothing from it reaches the agent. Whether the upstream itself stops depends on it observing cancellation. A started stream does stop. A plain request still awaiting its first byte may run to completion server-side, with its result discarded. Cancelling never undoes a side effect the upstream already executed.
+- Containment binds the ledger session header. It also binds the upstream MCP sessions observed on it. Rotating the ledger header alone does not evade it. Starting a fresh upstream MCP session does evade it. Without proxy-path client authentication, a new MCP session is a new identity.
+- Upstream pinning covers the configured upstream URL only. It does not verify what the upstream server is. It does not cover MCP servers reached any other way. The pin proves the configured upstream string matches the pin file, nothing more. The pin file itself has no protection against a same-user process. The first run trusts whatever upstream was passed.
+- Proposal "apply" records claim a human applied the action out of band. With no control-plane token, anyone who can reach the port can create that record. Treat no-token local use as single-user only.
+- Idempotency is per key, per session, for 24 hours, up to 1000 journal records. A replay bypasses current policy by design. The same key means the same call. A replay never bypasses containment. A resolved-executed key never re-forwards, even if the resolution was wrong. The human owns that call, not the gateway. Journal rows are durable, not hash-chained. Only the unknown and resolved transitions go into the chain.
+- Tools-drift enforcement denies unknown tool names only. It acts only once a baseline exists. The first sighting is trusted (TOFU). A server already compromised before the first gateway start baselines its malicious tools. A tools/list response the gateway cannot parse changes nothing. In-memory mode loses the baseline on restart. The stored baseline row is not covered by chain verification. A process that can write the ledger DB can rewrite it while verify stays green. This is the same conceded DB-write power as the chain itself. Session bundles exclude gateway-wide baseline and drift events. The full chain holds them.
 
 ## Dogfood note
 
-The gateway is tested end to end against the official MCP
-"everything" reference server (`@modelcontextprotocol/server-everything`,
-streamable HTTP): initialize, tools/list, an allowed call, a YAML-denied
-call, and a held call approved from the CLI all pass, and the exported
-bundle verifies. That run found two real bugs, both fixed: client
-hop-by-hop headers (`Connection: close`) were forwarded upstream and
-made strict servers answer 400, and argument whitespace differences
-between clients broke bundle verification (hashes now use a compacted
-form of the arguments). An adversarial review of the result (2026-10-20)
-found and fixed a further set: argument conditions now evaluate the
-decoded JSON and fail closed, path globs support `**` for any depth,
-the approval release path checks its ledger writes, and approver
-names can be bound to per-approver tokens.
+The gateway is tested end to end against the official MCP "everything" reference server. The server is `@modelcontextprotocol/server-everything`, streamable HTTP. The tests cover initialize, tools/list, an allowed call, a YAML-denied call, and a held call approved from the CLI. All pass. The exported bundle verifies.
+
+That run found two real bugs. Both are fixed. Client hop-by-hop headers (`Connection: close`) were forwarded upstream. Strict servers then answered 400. Argument whitespace differences between clients broke bundle verification. Hashes now use a compacted form of the arguments.
+
+An adversarial review of the result (2026-10-20) found and fixed a further set. Argument conditions now evaluate the decoded JSON and fail closed. Path globs support `**` for any depth. The approval release path checks its ledger writes. Approver names can be bound to per-approver tokens.
 
 ## License
 

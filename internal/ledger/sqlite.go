@@ -11,8 +11,8 @@ import (
 
 // SQLiteStore persists the event chain in SQLite (pure Go, no cgo).
 // Verify recomputes the chain from storage, the same as the
-// in-memory store; plain reads return the stored events as written.
-// SQLite is durability, not a different trust story.
+// in-memory store. Plain reads return the stored events as
+// written. SQLite is durability, not a different trust story.
 type SQLiteStore struct {
 	db *sql.DB
 }
@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS idempotency (
 );
 `
 
-// OpenSQLite opens (creating if needed) the ledger database at path.
+// OpenSQLite opens the ledger database at path. It creates the
+// database if needed.
 func OpenSQLite(path string) (*SQLiteStore, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -67,9 +68,9 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, err
 	}
-	// Parallel agents appending through one gateway can collide on
-	// the SQLite write lock; wait briefly instead of failing closed
-	// on the first contention.
+	// Parallel agents appending through one gateway can collide
+	// on the SQLite write lock. Wait briefly instead of failing
+	// closed on the first contention.
 	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
 		db.Close()
 		return nil, err
@@ -80,8 +81,8 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 // Close releases the database.
 func (s *SQLiteStore) Close() error { return s.db.Close() }
 
-// Append records one event inside a transaction so the chain can never
-// fork under concurrency.
+// Append records one event inside a transaction. The chain can
+// never fork under concurrency.
 func (s *SQLiteStore) Append(sessionID, kind, tool string, args json.RawMessage, decision, actor string) (Event, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -177,7 +178,8 @@ func (s *SQLiteStore) Verify() error {
 	return VerifyEvents(events)
 }
 
-// IdemGet returns one journal record, or false when none exists.
+// IdemGet returns one journal record. It returns false when none
+// exists.
 func (s *SQLiteStore) IdemGet(sessionID, key string) (IdempotencyRecord, bool, error) {
 	row := s.db.QueryRow(`SELECT session_id, key, tool, args_hash, state, approval_id, status, content_type, body, body_too_large, resolution, note, created_at, updated_at FROM idempotency WHERE session_id = ? AND key = ?`, sessionID, key)
 	rec, err := scanIdemRow(row)
@@ -198,8 +200,8 @@ func (s *SQLiteStore) IdemPut(rec IdempotencyRecord) error {
 }
 
 // IdemClaim atomically claims a key for a new attempt inside one
-// transaction: insert when absent, or replace when the existing
-// record never ran (discarded, or resolved-not-executed).
+// transaction. It inserts when absent. It replaces when the
+// existing record never ran (discarded, or resolved-not-executed).
 // Otherwise it returns the existing record and claimed=false.
 func (s *SQLiteStore) IdemClaim(rec IdempotencyRecord) (IdempotencyRecord, bool, error) {
 	tx, err := s.db.Begin()
@@ -292,8 +294,9 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-// ToolsBaselineGet returns the stored tool baseline, or false when
-// none was ever established. One row holds the whole surface.
+// ToolsBaselineGet returns the stored tool baseline. It returns
+// false when none was ever established. One row holds the whole
+// surface.
 func (s *SQLiteStore) ToolsBaselineGet() (ToolsBaseline, bool, error) {
 	row := s.db.QueryRow(`SELECT tools_json, hash, created_at, updated_at FROM tools_baseline WHERE id = 1`)
 	var toolsJSON, hash, created, updated string

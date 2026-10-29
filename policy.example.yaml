@@ -8,19 +8,24 @@
 #
 # Fields per rule:
 #   tool          glob for the tool name. Case-insensitive. "*" and "?" work.
-#   action        allow, deny, hold (hold = wait for a human approval),
-#                 contain (deny this call and freeze its whole session),
-#                 or propose (record for human application out of band,
-#                 never forwarded).
-#   reason        optional text. Shown in the deny error returned to
-#                 the agent. Reasons are not stored in the ledger.
-#   args_match    optional map. Keys are dotted argument paths. Each value
-#                 is a glob matched against that argument's string value.
-#                 Argument globs are case-sensitive. "**" matches any
-#                 number of path segments, so "/etc/**" covers every
-#                 file under /etc at any depth. All entries must match.
-#   args_contains optional text. Matches when the call arguments contain
-#                 this text, case-insensitive.
+#   action        allow, deny, hold, contain, or propose.
+#                 Hold means wait for a human approval. Contain
+#                 means deny this call and freeze its whole
+#                 session. Propose means record for human
+#                 application out of band. A proposed call is
+#                 never forwarded.
+#   reason        optional text. It appears in the deny error
+#                 returned to the agent. Reasons are not stored
+#                 in the ledger.
+#   args_match    optional map. Keys are dotted argument paths.
+#                 Each value is a glob. It matches against that
+#                 argument's string value. Argument globs are
+#                 case-sensitive. "**" matches any number of path
+#                 segments, so "/etc/**" covers every file under
+#                 /etc at any depth. All entries must match.
+#   args_contains optional text. It matches when the call
+#                 arguments contain this text. The match is
+#                 case-insensitive.
 #
 # A rule with argument conditions that do not hold does not match.
 # Evaluation continues to the next rule.
@@ -55,18 +60,19 @@ rules:
     action: hold
     args_contains: "confidential"
 
-  # A destructive tool freezes the session that called it: the call
-  # is denied, new calls from that session (and from its upstream
-  # MCP sessions) are denied, in-flight requests are aborted, and
-  # pending held calls are denied. The freeze lasts until a new
-  # gateway start, and it does not stop a fresh upstream MCP
-  # session: without proxy-path client auth, that is a new identity.
+  # A destructive tool freezes the session that called it.
+  # The call is denied. New calls from that session are denied.
+  # New calls from its upstream MCP sessions are denied.
+  # In-flight requests are aborted. Pending held calls are
+  # denied. The freeze lasts until a new gateway start. It does
+  # not stop a fresh upstream MCP session. Without proxy-path
+  # client auth, that session is a new identity.
   - tool: "drop_*"
     action: contain
     reason: "destructive tool: session frozen"
 
   # Production deploys are never executed by the agent. They are
-  # recorded as proposals; a human applies them out of band.
+  # recorded as proposals. A human applies them out of band.
   - tool: deploy
     action: propose
     args_match:

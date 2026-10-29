@@ -71,7 +71,7 @@ credentials:
 		w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`))
 	}, b)
 
-	// The agent sends no credential: the gateway injects its own.
+	// The agent sends no credential. The gateway injects its own.
 	postToolHeaders(t, px, "read_file", `{}`, nil)
 	select {
 	case got := <-seen:
@@ -82,8 +82,8 @@ credentials:
 		t.Fatal("upstream never called")
 	}
 
-	// The agent sending the matching value passes (it is
-	// indistinguishable from the broker's own) and still arrives
+	// The agent sending the matching value passes. It is
+	// indistinguishable from the broker's own. It still arrives
 	// brokered.
 	postToolHeaders(t, px, "read_file", `{}`, map[string]string{"X-Api-Key": testSecret})
 	select {

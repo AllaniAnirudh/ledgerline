@@ -2,8 +2,9 @@
 //
 // Subcommands:
 //
-//	gateway    run the MCP boundary gateway (witness + policy in-path,
-//	           with an optional credential broker: --broker broker.yaml)
+//	gateway    run the MCP boundary gateway. It witnesses calls and
+//	           enforces policy in path. It takes an optional
+//	           credential broker: --broker broker.yaml
 //	approvals  list tool calls currently held for approval
 //	approve    approve a held call: ledgerline approve <id>
 //	deny       deny a held call or a proposal: ledgerline deny <id>
@@ -107,8 +108,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "usage: ledgerline <gateway|approvals|approve|deny|contain|contained|proposals|apply|idempotency|resolve|tools|accept-tools|export|verify|run|hook> [flags]")
 }
 
-// openStore returns the ledger backend: SQLite when --db is set,
-// in-memory otherwise.
+// openStore returns the ledger backend. SQLite serves when --db
+// is set. In-memory serves otherwise.
 func openStore(dbPath string) (ledger.Store, func(), error) {
 	if dbPath == "" {
 		return ledger.New(), func() {}, nil
@@ -211,12 +212,12 @@ func runGateway(args []string) error {
 		return err
 	}
 	if !px.HasToolsBaseline() {
-		// The upstream was not up (or not listable) at startup.
-		// A one-shot probe would leave the gateway anchorless
-		// until the agent's first list, which could itself be
-		// post-compromise. Retry quietly until a baseline
-		// exists; the first passthrough list also establishes
-		// one, whichever comes first.
+		// The upstream was not up at startup. Or it was not
+		// listable. A one-shot probe would leave the gateway
+		// anchorless until the agent's first list. That list
+		// could itself be post-compromise. Retry quietly until
+		// a baseline exists. The first passthrough list also
+		// establishes one. Whichever comes first wins.
 		go func() {
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
@@ -356,9 +357,10 @@ func runDecide(args []string, approve bool) error {
 	if !approve {
 		name = "deny"
 	}
-	// Pull the approval ID (first non-flag arg) so flags may come in any
-	// order; Go's flag package stops parsing at the first positional arg.
-	// Flag values are skipped, not mistaken for the ID.
+	// Pull the approval ID. It is the first non-flag arg.
+	// Flags may come in any order. Go's flag package stops
+	// parsing at the first positional arg. Flag values are
+	// skipped. They are not mistaken for the ID.
 	valued := map[string]bool{"gateway": true, "actor": true, "token": true}
 	var id string
 	var rest []string
@@ -417,11 +419,11 @@ func runDecide(args []string, approve bool) error {
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		// A deny for an unknown approval may be a proposal: deny
-		// falls through to the proposal queue before giving up.
-		// Approve has no fallback: proposals are applied, not
-		// approved, but a miss that turns out to be a proposal
-		// says so instead of leaving a bare 404.
+		// A deny for an unknown approval may be a proposal.
+		// Deny falls through to the proposal queue before it
+		// gives up. Approve has no fallback. Proposals are
+		// applied, not approved. A miss that turns out to be
+		// a proposal says so. It does not leave a bare 404.
 		if resp.StatusCode == http.StatusNotFound {
 			if !approve {
 				if err := denyProposal(*gw, id, *actor, *token); err == nil {
@@ -471,7 +473,8 @@ func denyProposal(gw, id, actor, token string) error {
 
 // runContain freezes one session from the CLI.
 func runContain(args []string) error {
-	// Pull the session ID (first non-flag arg); flags may come in any order.
+	// Pull the session ID. It is the first non-flag arg.
+	// Flags may come in any order.
 	valued := map[string]bool{"gateway": true, "actor": true, "token": true, "reason": true}
 	var id string
 	var rest []string
@@ -571,7 +574,8 @@ func runContained(args []string) error {
 	return nil
 }
 
-// strOrDash prints a JSON value, or "-" when it is absent.
+// strOrDash prints a JSON value. It prints "-" when the value
+// is absent.
 func strOrDash(v any) string {
 	if s, ok := v.(string); ok && s != "" {
 		return s
@@ -635,8 +639,8 @@ func runProposals(args []string) error {
 }
 
 // runApply records a proposal as applied out of band. The gateway
-// never forwards a proposal; application is the human's own act,
-// and this command only witnesses it.
+// never forwards a proposal. Application is the human's own act.
+// This command only witnesses it.
 func runApply(args []string) error {
 	valued := map[string]bool{"gateway": true, "actor": true, "token": true}
 	var id string
@@ -698,8 +702,8 @@ func runApply(args []string) error {
 	return nil
 }
 
-// runIdempotency lists the durable executor's journal: one line
-// per keyed execution, without replay bodies.
+// runIdempotency lists the durable executor's journal. It prints
+// one line per keyed execution. It leaves out replay bodies.
 func runIdempotency(args []string) error {
 	fs := flag.NewFlagSet("idempotency", flag.ExitOnError)
 	gw := fs.String("gateway", "http://localhost:8080", "gateway address")
@@ -743,9 +747,9 @@ func runIdempotency(args []string) error {
 	return nil
 }
 
-// runResolve reconciles one unknown outcome: the human records
+// runResolve reconciles one unknown outcome. The human records
 // whether the call executed. A resolved-executed key never
-// re-forwards; a resolved-not-executed key may run fresh.
+// re-forwards. A resolved-not-executed key may run fresh.
 func runResolve(args []string) error {
 	valued := map[string]bool{"gateway": true, "actor": true, "token": true, "note": true}
 	var positional []string
@@ -868,8 +872,8 @@ func runTools(args []string) error {
 }
 
 // runAcceptTools marks the next observed tool surface as the new
-// baseline. It changes nothing by itself: the human accepts after
-// reviewing the drift, and the next list is what gets trusted.
+// baseline. It changes nothing by itself. The human accepts after
+// reviewing the drift. The next list is what gets trusted.
 func runAcceptTools(args []string) error {
 	fs := flag.NewFlagSet("accept-tools", flag.ExitOnError)
 	gw := fs.String("gateway", "http://localhost:8080", "gateway address")
@@ -940,10 +944,10 @@ func runVerify(args []string) error {
 	return nil
 }
 
-// runPTY runs a command under PTY capture, witnessing its terminal
-// output into the ledger under one session id. Shares the SQLite db
-// with the gateway, so boundary events and terminal output land on
-// one timeline.
+// runPTY runs a command under PTY capture. It witnesses terminal
+// output into the ledger under one session id. It shares the
+// SQLite db with the gateway. Boundary events and terminal output
+// land on one timeline.
 func runPTY(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	dbPath := fs.String("db", "", "SQLite ledger path (empty = in-memory)")
@@ -970,7 +974,7 @@ func runPTY(args []string) error {
 	}
 	defer s.Close()
 
-	// Mirror terminal output locally and pipe stdin through.
+	// Mirror terminal output locally. Pipe stdin through.
 	s.OnOutput(func(b []byte) { os.Stdout.Write(b) })
 	go func() {
 		buf := make([]byte, 1024)
@@ -987,8 +991,8 @@ func runPTY(args []string) error {
 
 	fmt.Fprintf(os.Stderr, "ledgerline: captured session %s (pty)\n", *sessionID)
 	if err := s.Wait(); err != nil {
-		// Propagate the captured command's exit code: a caller
-		// wrapping an agent in a script must see its failure.
+		// Propagate the captured command's exit code. A caller
+		// that wraps an agent in a script must see its failure.
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			return exitCodeError{code: ee.ExitCode()}
@@ -999,7 +1003,7 @@ func runPTY(args []string) error {
 }
 
 // exitCodeError asks main to exit with a specific code and no
-// message (used for the captured command's own exit status).
+// message. It carries the captured command's own exit status.
 type exitCodeError struct{ code int }
 
 func (e exitCodeError) Error() string { return fmt.Sprintf("exit code %d", e.code) }

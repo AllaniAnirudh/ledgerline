@@ -6,5 +6,5 @@ import _ "embed"
 var viewerHTML []byte
 
 // ViewerHTML returns the replay timeline page served at /replay.
-// It is dependency-free HTML+JS that reads the gateway's own API.
+// It is dependency-free HTML+JS. It reads the gateway's own API.
 func ViewerHTML() []byte { return viewerHTML }

@@ -3,25 +3,28 @@ package ledger
 import "time"
 
 // IdempotencyState is where one keyed execution stands. The states
-// form the durable executor's journal: a call is recorded before
-// it runs and again after, so a crash mid-flight leaves a record
-// whose outcome is honestly unknown instead of silently lost.
+// form the durable executor's journal. A call is recorded before
+// it runs and again after. A crash mid-flight leaves a record
+// whose outcome is honestly unknown, instead of silently lost.
 //
-//   - Held: the call waits for a human; it has never run.
-//   - Started: the call was forwarded; no response arrived yet.
-//   - Completed: the call ran and its (redacted) response was kept
+//   - Held: the call waits for a human. It has never run.
+//   - Started: the call was forwarded. No response arrived yet.
+//   - Completed: the call ran. Its (redacted) response was kept
 //     for replay, unless the response was too large to keep.
-//   - Denied: a human denied the held call; retries replay the
+//   - Denied: a human denied the held call. Retries replay the
 //     denial instead of queueing a new hold.
 //   - Unknown: the gateway stopped (crash or kill) with the call
-//     started, or the upstream failed without a response. The call
-//     may or may not have executed; only a human resolution says.
-//   - Resolved: a human reconciled an unknown outcome, recording
-//     whether the call executed. A resolved-executed key never
-//     re-forwards; a resolved-not-executed key may run fresh.
-//   - Discarded: the call never ran and never will under this key
-//     (held call discarded on restart, contained at forward, hold
-//     timed out). A retry runs fresh.
+//     started. Or the upstream failed without a response. The
+//     call may or may not have executed. Only a human resolution
+//     says.
+//   - Resolved: a human reconciled an unknown outcome. The human
+//     recorded whether the call executed. A resolved-executed key
+//     never re-forwards. A resolved-not-executed key may run
+//     fresh.
+//   - Discarded: the call never ran and never will under this
+//     key. This covers a held call discarded on restart, a call
+//     contained at forward, and a hold that timed out. A retry
+//     runs fresh.
 type IdempotencyState string
 
 const (
@@ -35,10 +38,10 @@ const (
 )
 
 // IdempotencyRecord is one keyed execution. Body holds the response
-// the agent actually saw (post-redaction) when the call completed
-// and the response fit the replay cap; BodyTooLarge marks a
-// completed call whose response was not kept. Resolution is
-// "executed" or "not-executed" once State is Resolved.
+// the agent actually saw (post-redaction). This applies when the
+// call completed and the response fit the replay cap. BodyTooLarge
+// marks a completed call whose response was not kept. Resolution
+// is "executed" or "not-executed" once State is Resolved.
 type IdempotencyRecord struct {
 	Key          string
 	SessionID    string
@@ -56,8 +59,8 @@ type IdempotencyRecord struct {
 	UpdatedAt    time.Time
 }
 
-// IdemGet returns the record for one (session, key), or false when
-// no record exists.
+// IdemGet returns the record for one (session, key). It returns
+// false when no record exists.
 func (l *Ledger) IdemGet(sessionID, key string) (IdempotencyRecord, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -76,13 +79,14 @@ func (l *Ledger) IdemPut(rec IdempotencyRecord) error {
 	return nil
 }
 
-// IdemClaim atomically claims a key for a new attempt: it inserts
-// rec when no record exists, or when the existing record is in a
-// terminal-never-ran state (discarded, or resolved-not-executed),
-// and reports claimed=true. Otherwise it returns the existing
-// record with claimed=false, and the caller must honor that record
-// instead of forwarding. The atomicity is what makes retries safe
-// under concurrency: two identical requests cannot both win.
+// IdemClaim atomically claims a key for a new attempt. It inserts
+// rec when no record exists. It also inserts when the existing
+// record is in a terminal-never-ran state (discarded, or
+// resolved-not-executed). It reports claimed=true. Otherwise it
+// returns the existing record with claimed=false. The caller must
+// honor that record instead of forwarding. The atomicity is what
+// makes retries safe under concurrency. Two identical requests
+// cannot both win.
 func (l *Ledger) IdemClaim(rec IdempotencyRecord) (IdempotencyRecord, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -113,8 +117,8 @@ func (l *Ledger) IdemList() ([]IdempotencyRecord, error) {
 	return out, nil
 }
 
-// IdemPurgeBefore deletes records not updated since t, and reports
-// how many were removed. Expiry is by last update, so a live held
+// IdemPurgeBefore deletes records not updated since t. It reports
+// how many were removed. Expiry is by last update. A live held
 // or started record is never purged while it is still live.
 func (l *Ledger) IdemPurgeBefore(t time.Time) (int, error) {
 	l.mu.Lock()

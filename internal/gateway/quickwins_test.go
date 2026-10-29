@@ -15,7 +15,7 @@ import (
 	"github.com/AllaniAnirudh/ledgerline/internal/policy"
 )
 
-// testProxyPolicy builds a proxy over a counting upstream: the
+// testProxyPolicy builds a proxy over a counting upstream. The
 // counter proves a call never passed the boundary.
 func testProxyPolicy(t *testing.T, p *policy.Policy) (*Proxy, *atomic.Int32) {
 	t.Helper()
@@ -60,7 +60,7 @@ rules:
 		t.Fatalf("contain rule should error with contained, got %v", out)
 	}
 
-	// The session is now frozen: even allowed tools are refused.
+	// The session is now frozen. Even allowed tools are refused.
 	code, _ := postTool(t, px, "read_file")
 	if code != http.StatusForbidden {
 		t.Fatalf("contained session should get 403, got %d", code)
@@ -164,7 +164,8 @@ rules:
 		t.Fatalf("proposal queue wrong: %+v", list)
 	}
 
-	// Apply through the control plane: recorded, never forwarded.
+	// Apply through the control plane. The proposal is recorded,
+	// never forwarded.
 	body := `{"decision":"apply","actor":"tester"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/proposals/"+list[0].ID+"/decision", strings.NewReader(body))
 	rec := httptest.NewRecorder()

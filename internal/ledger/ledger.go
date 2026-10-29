@@ -1,11 +1,13 @@
 // Package ledger is an append-only, hash-chained event log.
 //
-// Every event commits to the hash of its predecessor, so any tampering
-// with history breaks the chain. Verification proves self-consistency:
-// the log you read is the log that was written, in order.
+// Every event commits to the hash of its predecessor. Any
+// tampering with history breaks the chain. Verification proves
+// self-consistency. The log you read is the log that was written,
+// in order.
 //
-// Two Store backends implement the same chain: the in-memory Ledger
-// below and SQLiteStore (sqlite.go). The hash construction is shared.
+// Two Store backends implement the same chain. They are the
+// in-memory Ledger below and SQLiteStore (sqlite.go). The hash
+// construction is shared.
 package ledger
 
 import (
@@ -98,8 +100,8 @@ func (l *Ledger) Verify() error {
 	return VerifyEvents(events)
 }
 
-// VerifyEvents checks linkage and hashes for any slice of events,
-// e.g. ones re-loaded from an exported bundle.
+// VerifyEvents checks linkage and hashes for any slice of events.
+// An example is events re-loaded from an exported bundle.
 func VerifyEvents(events []Event) error {
 	prev := ""
 	for i, e := range events {
@@ -114,9 +116,9 @@ func VerifyEvents(events []Event) error {
 	return nil
 }
 
-// hashEvent is the current hash construction (v2): every field is
-// length-prefixed, so two different field splits can never produce
-// the same preimage.
+// hashEvent is the current hash construction (v2). Every field
+// is length-prefixed. Two different field splits can never
+// produce the same preimage.
 func hashEvent(e Event) string {
 	h := sha256.New()
 	fields := []string{
@@ -131,10 +133,11 @@ func hashEvent(e Event) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// hashMatches accepts the current construction and both v1 forms,
-// so chains written before the v2 change (and before the canonical
-// args fix) still verify instead of reporting themselves tampered.
-// New events are only ever written with the current construction.
+// hashMatches accepts the current construction and both v1 forms.
+// Chains written before the v2 change still verify. This includes
+// chains written before the canonical args fix. They verify
+// instead of reporting themselves tampered. New events are only
+// ever written with the current construction.
 func hashMatches(e Event) bool {
 	return e.Hash == hashEvent(e) ||
 		e.Hash == hashEventV1(e, true) ||
@@ -142,8 +145,8 @@ func hashMatches(e Event) bool {
 }
 
 // hashEventV1 is the original pipe-joined construction. canonical
-// selects the argument form: true hashes the compacted arguments
-// (the brief v1.1 form), false hashes the raw stored bytes (v1.0).
+// selects the argument form. True hashes the compacted arguments
+// (the brief v1.1 form). False hashes the raw stored bytes (v1.0).
 func hashEventV1(e Event, canonical bool) string {
 	args := string(e.Args)
 	if canonical {
@@ -159,8 +162,8 @@ func hashEventV1(e Event, canonical bool) string {
 }
 
 // canonicalArgs returns the compacted form of a JSON arguments blob.
-// The same call can arrive with different whitespace (Python's
-// json.dumps spaces its separators; Go's encoder compacts), and the
+// The same call can arrive with different whitespace. Python's
+// json.dumps spaces its separators. Go's encoder compacts. The
 // bundle writer compacts RawMessage again on export. Hashing the
 // canonical form keeps Append, live Verify, and offline bundle
 // verification in agreement. Invalid JSON hashes as-is.

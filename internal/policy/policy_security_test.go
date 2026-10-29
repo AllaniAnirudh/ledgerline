@@ -118,8 +118,8 @@ rules:
     args_match:
       path: "/tmp/**"
 `)
-	// Duplicate keys: the allow rule cannot be evaluated, so it must
-	// not grant; the deny default applies.
+	// Duplicate keys: the allow rule cannot be evaluated. It must
+	// not grant. The deny default applies.
 	if got, _ := p.DecideCall("write_file", json.RawMessage(`{"path":"/tmp/x","path":"/tmp/x"}`)); got != Deny {
 		t.Errorf("allow rule with broken args: got %v, want deny (default)", got)
 	}

@@ -19,15 +19,15 @@ import (
 // before each native tool runs. Native tools never cross the MCP
 // boundary, so the gateway alone cannot see them.
 //
-// Exit codes are the whole contract, and they are uniform across
+// Exit codes are the whole contract. They are uniform across
 // harnesses. Exit 0 allows the call. Exit 2 blocks it, and the
 // reason goes to stderr, where the harness shows it to the agent.
-// The bridge never exits 1: Claude Code and Gemini CLI treat any
-// exit other than 0 or 2 as a non-blocking error, so a bridge
+// The bridge never exits 1. Claude Code and Gemini CLI treat any
+// exit other than 0 or 2 as a non-blocking error. A bridge
 // failure must surface as a block, not a crash code.
 //
 // An allow from the bridge means Ledgerline does not object. It
-// does not grant harness permission: the harness still runs its
+// does not grant harness permission. The harness still runs its
 // own permission flow. A block from the bridge always wins over
 // a harness allow rule.
 //
@@ -36,10 +36,10 @@ import (
 
 const maxHookPayload = 10 << 20
 
-// hookNameMaps translate harness tool names to canonical names,
-// so one policy file reads the same across harnesses. A name with
-// no entry passes through unchanged, except for Claude Code,
-// where unknown names are lowercased to match the built-in style.
+// hookNameMaps translate harness tool names to canonical names.
+// One policy file then reads the same across harnesses. A name
+// with no entry passes through unchanged. For Claude Code,
+// unknown names are lowercased to match the built-in style.
 var hookNameMaps = map[string]map[string]string{
 	"claude-code": {
 		"Bash": "bash", "Read": "read", "Edit": "edit", "Write": "write",
@@ -134,12 +134,13 @@ type hookOutcome struct {
 }
 
 // decideHookStandalone applies the policy without a gateway. It
-// mirrors the gateway witness order: the policy decision first,
-// then the call record. A hold cannot wait without a gateway, so
-// it blocks with a note on how to approve and retry. A contain
-// rule keeps denying while it stands, because each new hook
-// invocation re-evaluates the policy. A proposal is recorded in
-// the ledger, and the agent is told the action was not executed.
+// mirrors the gateway witness order. The policy decision comes
+// first. The call record comes second. A hold cannot wait
+// without a gateway. It blocks with a note on how to approve
+// and retry. A contain rule keeps denying while it stands.
+// Each new hook invocation re-evaluates the policy. A proposal
+// is recorded in the ledger. The agent is told the action was
+// not executed.
 func decideHookStandalone(store ledger.Store, pol *policy.Policy, session, tool string, args json.RawMessage) hookOutcome {
 	decision, reason := pol.DecideCall(tool, args)
 	if _, err := store.Append(session, "policy_decision", tool, nil, decision.String(), ""); err != nil {
@@ -219,7 +220,7 @@ func decideHookGateway(gwURL, token string, timeout time.Duration, session, tool
 }
 
 // runHook never returns a plain error. Every failure path prints
-// its reason to stderr and returns exit code 2, so the harness
+// its reason to stderr and returns exit code 2. The harness then
 // blocks. Main maps exitCodeError to the process exit code.
 func runHook(args []string) error {
 	fs := flag.NewFlagSet("hook", flag.ExitOnError)

@@ -13,15 +13,15 @@ import (
 
 // POST /v1/hook is the harness-hook entry point. A harness calls
 // it before a native tool runs. Native tools never cross the MCP
-// boundary, so the gateway alone cannot see them. This endpoint
+// boundary. The gateway alone cannot see them. This endpoint
 // applies the same policy engine to them.
 //
 // The request carries the tool name, its arguments, and the
 // session. The answer is allow or deny. A hold parks the call in
-// the same approval queue the gateway uses, and waits for the
-// human decision. The harness hook timeout bounds the wait: if
+// the same approval queue the gateway uses. It waits for the
+// human decision. The harness hook timeout bounds the wait. If
 // the bridge stops waiting first, the gateway hold stays open
-// until its own timeout, and the agent must retry for a fresh
+// until its own timeout. The agent must retry for a fresh
 // hold.
 //
 // Drift detection does not apply here. It guards the upstream
@@ -128,11 +128,11 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// hookHold parks a native tool call in the approval queue, and
-// waits for the human decision. It mirrors hold() in approvals.go:
-// same queue, same timeout race handling. It differs in two ways.
-// There is no upstream call to forward, so the decision itself is
-// the answer. There is no idempotency claim, because a hook call
+// hookHold parks a native tool call in the approval queue. It
+// waits for the human decision. It mirrors hold() in approvals.go.
+// Same queue, same timeout race handling. It differs in two ways.
+// There is no upstream call to forward. The decision itself is
+// the answer. There is no idempotency claim. A hook call
 // is a check, not a forwarded call.
 func (px *Proxy) hookHold(session, tool string, args json.RawMessage) hookDecision {
 	id, err := newID()
@@ -180,7 +180,7 @@ func (px *Proxy) hookHold(session, tool string, args json.RawMessage) hookDecisi
 	case res := <-p.resultCh:
 		return px.hookDecided(session, tool, args, res)
 	case <-timer.C:
-		// Claim the entry under the lock, so a decision and a
+		// Claim the entry under the lock. A decision and a
 		// timeout can never both win the same hold.
 		px.approvals.mu.Lock()
 		if p.decided {
@@ -199,9 +199,9 @@ func (px *Proxy) hookHold(session, tool string, args json.RawMessage) hookDecisi
 	}
 }
 
-// hookDecided records a hold decision, and turns it into an
-// answer. An approval records the approval and the allowed call.
-// A denial records the denial only.
+// hookDecided records a hold decision. It turns the decision into
+// an answer. An approval records the approval and the allowed
+// call. A denial records the denial only.
 func (px *Proxy) hookDecided(session, tool string, args json.RawMessage, res decisionResult) hookDecision {
 	if res.approved {
 		if _, err := px.ledger.Append(session, "approval", tool, args, "approve", res.actor); err != nil {

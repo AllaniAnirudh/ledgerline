@@ -34,8 +34,8 @@ func TestAPITokenGuardsControlPlane(t *testing.T) {
 	if code := get("/v1/approvals", "s3cret"); code != http.StatusOK {
 		t.Fatalf("good token: want 200, got %d", code)
 	}
-	// The approvals page itself is static and loads without a token;
-	// its API calls are what get checked.
+	// The approvals page itself is static and loads without a token.
+	// Its API calls are what get checked.
 	if code := get("/approvals", ""); code != http.StatusOK {
 		t.Fatalf("approvals page: want 200, got %d", code)
 	}
@@ -48,8 +48,9 @@ func TestAPITokenGuardsControlPlane(t *testing.T) {
 
 // Regression test: a client's hop-by-hop headers (Connection: close
 // from Python urllib, say) must not be forwarded upstream. Strict
-// upstreams (the official MCP everything server on Express) answer
-// such requests with a bare 400; this was found by dogfooding.
+// upstreams answer such requests with a bare 400. The official MCP
+// everything server on Express is one such upstream. This was found
+// by dogfooding.
 func TestHopByHopHeadersStripped(t *testing.T) {
 	var gotConnection, gotAccept string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -82,8 +83,9 @@ func TestHopByHopHeadersStripped(t *testing.T) {
 	}
 }
 
-// The decision endpoint over real HTTP: token required, approver
-// token binds the recorded actor, a mismatched body actor is 403.
+// The decision endpoint over real HTTP. A token is required.
+// An approver token binds the recorded actor. A mismatched
+// body actor is 403.
 func TestDecisionEndpointBindsApproverActor(t *testing.T) {
 	px, _ := testProxy(t)
 	px.SetApproverToken("alice", "alice-token")
@@ -226,12 +228,13 @@ rules:
 		return out
 	}
 
-	// /tmp write: no rule matches, default allow, straight through.
+	// /tmp write. No rule matches. The default allows it. It goes
+	// straight through.
 	if out := post(`{"path":"/tmp/x"}`); out["result"] == nil {
 		t.Fatalf("tmp write should pass, got %v", out)
 	}
 
-	// /etc write: held, then a deny decision blocks it.
+	// /etc write. It is held. Then a deny decision blocks it.
 	done := make(chan map[string]any, 1)
 	go func() { done <- post(`{"path":"/etc/hosts"}`) }()
 	var id string

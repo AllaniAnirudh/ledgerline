@@ -11,41 +11,43 @@ import (
 	"github.com/AllaniAnirudh/ledgerline/internal/ledger"
 )
 
-// The durable executor, after Replit's Durable Executor component:
-// every keyed tool call is recorded before it runs and again after,
-// so a crash mid-flight leaves an honestly unknown outcome instead
-// of a silent double-execution on retry.
+// The durable executor, after Replit's Durable Executor component.
+// Every keyed tool call is recorded before it runs and again
+// after. A crash mid-flight leaves an honestly unknown outcome
+// instead of a silent double-execution on retry.
 //
 // A client opts in per call with the X-Ledgerline-Idempotency-Key
-// header. The key is scoped to its ledger session, and it is bound
-// to one tool and one canonical-arguments hash: reusing a key with
-// a different tool or different arguments is denied outright, the
-// way a mismatched idempotency key is everywhere else.
+// header. The key is scoped to its ledger session. It is bound
+// to one tool and one canonical-arguments hash. Reusing a key with
+// a different tool or different arguments is denied outright.
+// This matches how a mismatched idempotency key works everywhere
+// else.
 //
 // States and what a retry gets (see ledger.IdempotencyState):
 //
 //   - completed: the recorded response, verbatim, with no upstream
 //     call. A response over the replay cap completes but is not
-//     kept; its retry is refused with an explicit "check upstream"
+//     kept. Its retry is refused with an explicit "check upstream"
 //     error, never re-forwarded.
 //   - denied: the approver's denial, replayed.
 //   - held: the same hold, by approval id, without queueing a
 //     second hold. The first request still owns the forward.
-//   - started: an in-flight error. The call is running; the retry
+//   - started: an in-flight error. The call is running. The retry
 //     must wait for the first request, not run a second copy.
 //   - unknown: an error telling the caller to resolve first. Only
 //     a human resolution (executed / not-executed) moves it.
 //   - resolved-executed: refused, never re-forwarded.
-//   - resolved-not-executed, discarded: treated as fresh; the new
+//   - resolved-not-executed, discarded: treated as fresh. The new
 //     attempt claims the key again.
 //
 // What it does not do: unkeyed calls have no journal entry and no
-// replay (they behave exactly as before); policy denials leave no
-// record, so a later retry re-evaluates current policy; a replay
-// bypasses current policy by design (same key means same call),
-// but never bypasses containment, which is checked first; and in
-// in-memory mode (--db empty) the journal lives only as long as
-// the process, so restart recovery needs a SQLite ledger.
+// replay. They behave exactly as before. Policy denials leave no
+// record. A later retry re-evaluates current policy. A replay
+// bypasses current policy by design. The same key means the same
+// call. A replay never bypasses containment. Containment is
+// checked first. In in-memory mode (--db empty) the journal lives
+// only as long as the process. Restart recovery needs a SQLite
+// ledger.
 const (
 	idemHeader     = "X-Ledgerline-Idempotency-Key"
 	idemMaxKeyLen  = 256
@@ -67,10 +69,10 @@ func idemArgsHash(args json.RawMessage) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// claimIdem claims a key for a new attempt in the given state,
-// enforcing the journal cap: expired records are purged first, and
-// a still-full journal fails closed rather than dropping history.
-// The store claim itself is atomic; idemMu makes the
+// claimIdem claims a key for a new attempt in the given state.
+// It enforces the journal cap. Expired records are purged first.
+// A still-full journal fails closed rather than dropping history.
+// The store claim itself is atomic. idemMu makes the
 // purge-count-claim sequence exact under concurrency.
 func (px *Proxy) claimIdem(rec ledger.IdempotencyRecord) (ledger.IdempotencyRecord, bool, error) {
 	px.idemMu.Lock()
@@ -108,8 +110,9 @@ func (px *Proxy) purgeExpiredIdem() {
 	}
 }
 
-// idemMeta is the control-plane view of one record: everything
-// except the replay body, which only a retry with the key sees.
+// idemMeta is the control-plane view of one record. It covers
+// everything except the replay body. Only a retry with the key
+// sees the body.
 func idemMeta(rec ledger.IdempotencyRecord) map[string]any {
 	return map[string]any{
 		"key": rec.Key, "session_id": rec.SessionID, "tool": rec.Tool,
@@ -121,11 +124,11 @@ func idemMeta(rec ledger.IdempotencyRecord) map[string]any {
 	}
 }
 
-// recoverIdempotency runs once at gateway start: a call that was
-// started when the process died has an honestly unknown outcome,
-// and a held call is gone with the in-memory hold queue, so it is
+// recoverIdempotency runs once at gateway start. A call that was
+// started when the process died has an honestly unknown outcome.
+// A held call is gone with the in-memory hold queue. It is
 // discarded as never-executed. Both transitions are witnessed in
-// the chain, so a restart never silently rewrites history.
+// the chain. A restart never silently rewrites history.
 func (px *Proxy) recoverIdempotency() error {
 	list, err := px.ledger.IdemList()
 	if err != nil {
@@ -158,8 +161,8 @@ func (px *Proxy) recoverIdempotency() error {
 	return nil
 }
 
-// witnessIdem records one idempotent short-circuit in the chain,
-// failing closed like every other witness: no witness, no answer.
+// witnessIdem records one idempotent short-circuit in the chain.
+// It fails closed like every other witness: no witness, no answer.
 func (px *Proxy) witnessIdem(session, tool, decision string, w http.ResponseWriter, body []byte) bool {
 	return px.witness(session, "idempotency", tool, nil, decision, "", w, body)
 }
@@ -167,7 +170,8 @@ func (px *Proxy) witnessIdem(session, tool, decision string, w http.ResponseWrit
 // idemShortCircuit answers a retry from its journal record, when
 // the record says the call must not run again. It returns true
 // when it wrote a response. The caller passes the record it
-// already looked up; tool and argument binding were checked there.
+// already looked up. Tool and argument binding were checked
+// there.
 func (px *Proxy) idemShortCircuit(w http.ResponseWriter, body []byte, session string, rec ledger.IdempotencyRecord) bool {
 	switch rec.State {
 	case ledger.IdemCompleted:
@@ -219,8 +223,8 @@ func (px *Proxy) idemShortCircuit(w http.ResponseWriter, body []byte, session st
 	return false
 }
 
-// replayIdem writes a recorded response verbatim: status,
-// content type, and the body the agent originally saw.
+// replayIdem writes a recorded response verbatim. It covers
+// status, content type, and the body the agent originally saw.
 func replayIdem(w http.ResponseWriter, rec ledger.IdempotencyRecord) {
 	if rec.ContentType != "" {
 		w.Header().Set("Content-Type", rec.ContentType)
@@ -238,8 +242,8 @@ func writeHeldAgain(w http.ResponseWriter, body []byte, approvalID string) {
 }
 
 // limitedBuffer keeps the first cap bytes of a response and flags
-// overflow instead of failing: a response over the cap still
-// reaches the agent in full, it just is not kept for replay.
+// overflow instead of failing. A response over the cap still
+// reaches the agent in full. It just is not kept for replay.
 type limitedBuffer struct {
 	buf      []byte
 	cap      int
@@ -265,7 +269,7 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 }
 
 // captureWriter tees response bytes into a limited buffer while
-// passing them through, and records the status code.
+// passing them through. It records the status code.
 type captureWriter struct {
 	http.ResponseWriter
 	buf    *limitedBuffer
@@ -285,8 +289,8 @@ func (c *captureWriter) Write(p []byte) (int, error) {
 	return c.ResponseWriter.Write(p)
 }
 
-// serveIdempotencyList answers GET /v1/idempotency, optionally
-// filtered by ?state=.
+// serveIdempotencyList answers GET /v1/idempotency. It is
+// optionally filtered by ?state=.
 func (px *Proxy) serveIdempotencyList(w http.ResponseWriter, r *http.Request) {
 	px.purgeExpiredIdem()
 	list, err := px.ledger.IdemList()
@@ -315,7 +319,7 @@ type resolveRequest struct {
 }
 
 // serveIdempotencyResolve reconciles one unknown outcome. Only an
-// unknown record can be resolved: resolving anything else would
+// unknown record can be resolved. Resolving anything else would
 // rewrite a known outcome.
 func (px *Proxy) serveIdempotencyResolve(w http.ResponseWriter, r *http.Request) {
 	var req resolveRequest
@@ -367,8 +371,8 @@ func (px *Proxy) serveIdempotencyResolve(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, idemMeta(rec))
 }
 
-// idemTransition moves one record to a new state, best effort: it
-// is called after the agent already has its answer, so a failure
+// idemTransition moves one record to a new state, best effort.
+// It is called after the agent already has its answer. A failure
 // is logged, never turned into a second response.
 func (px *Proxy) idemTransition(session, key string, state ledger.IdempotencyState, mutate func(*ledger.IdempotencyRecord)) {
 	rec, found, err := px.ledger.IdemGet(session, key)

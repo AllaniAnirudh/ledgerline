@@ -13,7 +13,7 @@ import (
 )
 
 // postToolSession is postTool with an explicit session and upstream
-// MCP session id, for testing containment binding.
+// MCP session id. It tests containment binding.
 func postToolSession(t *testing.T, px *Proxy, tool, session, mcpID string) (int, map[string]any) {
 	t.Helper()
 	body := `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"` + tool + `","arguments":{}}}`
@@ -48,13 +48,13 @@ func TestContainBindsMCPSession(t *testing.T) {
 }
 
 // Containment must cut off a request already forwarded upstream.
-// The upstream here is a stream: it writes headers and flushes
+// The upstream here is a stream. It writes headers and flushes
 // first, as MCP streamable-HTTP responses do. That is the case
 // where the upstream observes cancellation. A plain request that
-// has not written headers yet may run to completion server-side
-// (Go's HTTP/1.1 server does not notice the close until it
-// writes), but its result is still discarded: the gateway stops
-// waiting and nothing reaches the agent.
+// has not written headers yet may run to completion server-side.
+// Go's HTTP/1.1 server does not notice the close until it
+// writes. Its result is still discarded. The gateway stops
+// waiting. Nothing reaches the agent.
 func TestContainAbortsInflight(t *testing.T) {
 	entered := make(chan struct{}, 1)
 	done := make(chan struct{}, 1)
@@ -99,9 +99,9 @@ func TestContainAbortsInflight(t *testing.T) {
 	}
 }
 
-// The forward backstop must refuse a contained session even when
-// the call reaches forward without passing the ServeHTTP gate, as
-// the hold release path does.
+// The forward backstop must refuse a contained session. This
+// applies even when the call reaches forward without passing the
+// ServeHTTP gate. The hold release path does this.
 func TestForwardRefusesContainedSession(t *testing.T) {
 	px, hits := testProxyPolicy(t, policy.New(nil, nil))
 	px.Contain("s1", "tester", "backstop test")
@@ -120,8 +120,8 @@ func TestForwardRefusesContainedSession(t *testing.T) {
 	}
 }
 
-// Retries of an identical pending proposal return the existing id,
-// and a full queue refuses new proposals.
+// Retries of an identical pending proposal return the existing id.
+// A full queue refuses new proposals.
 func TestProposeDedupAndCap(t *testing.T) {
 	p := mustPolicy(t, `version: 1
 default: allow

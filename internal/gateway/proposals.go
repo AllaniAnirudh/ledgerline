@@ -12,9 +12,9 @@ import (
 )
 
 // Proposal is one tool call recorded for out-of-band application.
-// Unlike a held call, a proposal never forwards: the agent is told
-// immediately that the action was NOT executed, and a human applies
-// it (or denies it) afterwards, outside the gateway.
+// Unlike a held call, a proposal never forwards. The agent is
+// told immediately that the action was NOT executed. A human
+// applies it (or denies it) afterwards, outside the gateway.
 type Proposal struct {
 	ID        string          `json:"id"`
 	SessionID string          `json:"session_id"`
@@ -25,10 +25,10 @@ type Proposal struct {
 }
 
 // Proposals is the pending-proposal queue. It mirrors the approvals
-// queue's bound: at most maxPending entries, so a retry storm
-// cannot grow gateway memory without limit. Entries also expire
-// after maxAge; expiry is enforced lazily by the control-plane
-// handlers, which witness each expiry in the ledger.
+// queue's bound: at most maxPending entries. A retry storm cannot
+// grow gateway memory without limit. Entries also expire after
+// maxAge. Expiry is enforced lazily by the control-plane handlers.
+// They witness each expiry in the ledger.
 type Proposals struct {
 	mu         sync.Mutex
 	pending    map[string]*Proposal
@@ -36,19 +36,20 @@ type Proposals struct {
 	maxAge     time.Duration
 }
 
-// NewProposals builds an empty queue: 1000 entries, 24h expiry.
+// NewProposals builds an empty queue. It holds 1000 entries.
+// Entries expire after 24h.
 func NewProposals() *Proposals {
 	return &Proposals{pending: map[string]*Proposal{}, maxPending: 1000, maxAge: 24 * time.Hour}
 }
 
-// SetMaxPending changes the queue bound (tests use a small one).
+// SetMaxPending changes the queue bound. Tests use a small one.
 func (p *Proposals) SetMaxPending(n int) { p.maxPending = n }
 
-// SetMaxAge changes entry expiry (tests use a short one).
+// SetMaxAge changes entry expiry. Tests use a short one.
 func (p *Proposals) SetMaxAge(d time.Duration) { p.maxAge = d }
 
-// canonicalArgs compacts a JSON blob so the same arguments compare
-// equal regardless of whitespace.
+// canonicalArgs compacts a JSON blob. The same arguments then
+// compare equal regardless of whitespace.
 func canonicalArgs(args json.RawMessage) string {
 	if len(args) == 0 {
 		return ""
@@ -60,13 +61,14 @@ func canonicalArgs(args json.RawMessage) string {
 	return buf.String()
 }
 
-// AddDedup records a proposal in the queue, or returns the existing
+// AddDedup records a proposal in the queue. It returns the existing
 // one when an identical proposal (same session, tool, and canonical
 // arguments) is already pending. Retries therefore return the same
 // proposal id instead of queueing duplicates a human could apply
-// twice. It reports whether the entry is new, and an error when the
-// queue is full. The caller witnesses a new proposal in the ledger
-// afterwards; on a ledger failure it must call Remove to roll back.
+// twice. AddDedup reports whether the entry is new, and an error
+// when the queue is full. The caller witnesses a new proposal in
+// the ledger afterwards. On a ledger failure it must call Remove
+// to roll back.
 func (p *Proposals) AddDedup(sessionID, tool string, args json.RawMessage) (*Proposal, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -110,7 +112,7 @@ func (p *Proposals) AddDedup(sessionID, tool string, args json.RawMessage) (*Pro
 	}, true, nil
 }
 
-// Remove drops a queued proposal without deciding it. Used to roll
+// Remove drops a queued proposal without deciding it. It rolls
 // back an entry whose ledger witness failed.
 func (p *Proposals) Remove(id string) {
 	p.mu.Lock()
@@ -118,8 +120,8 @@ func (p *Proposals) Remove(id string) {
 	delete(p.pending, id)
 }
 
-// PurgeExpired drops entries older than maxAge and returns them so
-// the caller can witness each expiry in the ledger.
+// PurgeExpired drops entries older than maxAge and returns them.
+// The caller witnesses each expiry in the ledger.
 func (p *Proposals) PurgeExpired(now time.Time) []*Proposal {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -137,8 +139,8 @@ func (p *Proposals) PurgeExpired(now time.Time) []*Proposal {
 }
 
 // Decide resolves a proposal and returns a copy of it for the
-// caller to witness in the ledger. Returns false when the ID is
-// unknown or already decided.
+// caller to witness in the ledger. It returns false when the ID
+// is unknown or already decided.
 func (p *Proposals) Decide(id string) (*Proposal, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -172,8 +174,8 @@ type proposalDecisionRequest struct {
 }
 
 // decideProposal resolves a pending proposal. "apply" means a human
-// applied the action out of band; the gateway never forwards a
-// proposal itself. The actor rule matches decideApproval: a caller
+// applied the action out of band. The gateway never forwards a
+// proposal itself. The actor rule matches decideApproval. A caller
 // authenticated with a per-approver token is recorded under the
 // bound name.
 func (px *Proxy) decideProposal(w http.ResponseWriter, r *http.Request) {
@@ -208,12 +210,12 @@ func (px *Proxy) decideProposal(w http.ResponseWriter, r *http.Request) {
 }
 
 // propose records a tool call as a proposal and answers the agent
-// immediately: the action was NOT executed, and nothing is forwarded.
+// immediately. The action was NOT executed. Nothing is forwarded.
 // A retry of an identical pending proposal returns the existing id
-// instead of queueing a duplicate. The ledger write fails closed:
-// without the record, there is no proposal to apply, so a failed
+// instead of queueing a duplicate. The ledger write fails closed.
+// Without the record, there is no proposal to apply. A failed
 // witness rolls the queue entry back. The human decision afterwards
-// only records apply or deny; application itself happens out of
+// only records apply or deny. Application itself happens out of
 // band, by the human, outside the gateway.
 func (px *Proxy) propose(w http.ResponseWriter, session string, body []byte, tool string, args json.RawMessage) {
 	pr, isNew, err := px.proposals.AddDedup(session, tool, args)
@@ -254,8 +256,8 @@ func (px *Proxy) proposeResult(w http.ResponseWriter, body []byte, text string) 
 }
 
 // purgeExpiredProposals drops stale proposals and witnesses each
-// expiry in the ledger. Called by the control-plane handlers before
-// they list or decide, so expiry needs no background goroutine.
+// expiry in the ledger. The control-plane handlers call it before
+// they list or decide. Expiry needs no background goroutine.
 func (px *Proxy) purgeExpiredProposals() {
 	for _, pr := range px.proposals.PurgeExpired(time.Now().UTC()) {
 		if _, err := px.ledger.Append(pr.SessionID, "proposal", pr.Tool, pr.Args, "expired", ""); err != nil {

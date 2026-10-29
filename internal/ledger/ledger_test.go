@@ -72,7 +72,7 @@ func TestSQLiteRoundTrip(t *testing.T) {
 		t.Fatalf("sqlite chain should verify: %v", err)
 	}
 
-	// Reopen the same file: the chain must survive the process.
+	// Reopen the same file. The chain must survive the process.
 	path := filepath.Join(t.TempDir(), "persist.db")
 	s, err = OpenSQLite(path)
 	if err != nil {

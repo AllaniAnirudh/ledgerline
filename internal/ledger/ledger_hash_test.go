@@ -6,11 +6,11 @@ import (
 	"testing"
 )
 
-// Regression test (found dogfooding against the real MCP everything
-// server with a Python client): a client that sends arguments with
+// Regression test, found dogfooding against the real MCP everything
+// server with a Python client. A client that sends arguments with
 // spaces after separators must still produce a bundle that verifies
-// after export, even though the JSON encoder compacts RawMessage on
-// the way out.
+// after export. The JSON encoder compacts RawMessage on the way
+// out.
 func TestVerifySurvivesArgsWhitespaceRoundTrip(t *testing.T) {
 	for _, store := range map[string]func() Store{
 		"memory": func() Store { return New() },
@@ -35,7 +35,7 @@ func TestVerifySurvivesArgsWhitespaceRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Simulate the bundle path: marshal (compacts args), unmarshal, verify.
+		// Simulate the bundle path. Marshal, unmarshal, then verify.
 		raw, err := json.Marshal(events)
 		if err != nil {
 			t.Fatal(err)
@@ -68,7 +68,7 @@ func TestValueChangeBreaksChain(t *testing.T) {
 }
 
 // Events hashed with either v1 construction (raw or canonical args)
-// must still verify, so pre-v2 chains do not read as tampered.
+// must still verify. Pre-v2 chains then do not read as tampered.
 func TestLegacyHashFormsVerify(t *testing.T) {
 	for _, canonical := range []bool{false, true} {
 		s := New()

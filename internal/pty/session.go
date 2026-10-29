@@ -1,10 +1,11 @@
-// Package pty runs an agent command inside a pseudo-terminal and feeds
-// its output into the ledger as terminal_output events, alongside the
-// boundary's tool-call events. Same session id, one timeline.
+// Package pty runs an agent command inside a pseudo-terminal. It
+// feeds output into the ledger as terminal_output events, alongside
+// the boundary's tool-call events. Same session id, one timeline.
 //
-// This is the co-capture plane: the boundary gateway sees tool calls,
-// the PTY sees everything the terminal sees. The technique mirrors
-// Backseat's capture; here it feeds the trust ledger instead of a relay.
+// This is the co-capture plane. The boundary gateway sees tool
+// calls. The PTY sees everything the terminal sees. The technique
+// mirrors Backseat's capture. Here it feeds the trust ledger
+// instead of a relay.
 package pty
 
 import (
@@ -17,7 +18,7 @@ import (
 	"github.com/creack/pty"
 )
 
-// Session runs one command inside a PTY, witnessing its output.
+// Session runs one command inside a PTY. It witnesses output.
 type Session struct {
 	cmd       *exec.Cmd
 	ptmx      *os.File
@@ -32,11 +33,12 @@ type Session struct {
 }
 
 // Start launches command inside a new PTY and begins witnessing.
-// Output flows to the ledger; call OnOutput to also mirror it (e.g. to
-// the local terminal).
+// Output flows to the ledger. Call OnOutput to also mirror it
+// (e.g. to the local terminal).
 func Start(store ledger.Store, sessionID, command string, args ...string) (*Session, error) {
 	cmd := exec.Command(command, args...)
-	// Inherit a sane terminal size; resizing is a v1 gap, noted in docs.
+	// Inherit a sane terminal size. Resizing is a v1 gap, noted
+	// in docs.
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
@@ -51,17 +53,18 @@ func Start(store ledger.Store, sessionID, command string, args ...string) (*Sess
 	return s, nil
 }
 
-// OnOutput sets a callback invoked with every output chunk.
+// OnOutput sets a callback. It runs with every output chunk.
 func (s *Session) OnOutput(fn func([]byte)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onOutput = fn
 }
 
-// Write sends input to the terminal (stdin of the command).
+// Write sends input to the terminal. This is stdin of the
+// command.
 func (s *Session) Write(p []byte) (int, error) { return s.ptmx.Write(p) }
 
-// Wait blocks until the command exits and records the exit.
+// Wait blocks until the command exits. It records the exit.
 func (s *Session) Wait() error {
 	err := s.cmd.Wait()
 	code := 0

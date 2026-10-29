@@ -6,5 +6,5 @@ import _ "embed"
 var approvalsHTML []byte
 
 // ApprovalsHTML returns the human approval page served at /approvals.
-// It is dependency-free HTML+JS that talks to the gateway's own API.
+// It is dependency-free HTML+JS. It talks to the gateway's own API.
 func ApprovalsHTML() []byte { return approvalsHTML }

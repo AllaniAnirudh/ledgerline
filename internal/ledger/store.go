@@ -7,10 +7,10 @@ import (
 
 // Store is the persistence backend for the event chain and the
 // idempotency journal. The in-memory Ledger and the SQLiteStore
-// both implement it; the gateway only ever talks to this interface.
-// The journal rows are durable, not hash-chained: the chain stays
-// the audit trail of exceptional transitions (unknown, resolved),
-// while the table is the execution journal itself.
+// both implement it. The gateway only ever talks to this
+// interface. The journal rows are durable, not hash-chained.
+// The chain stays the audit trail of exceptional transitions
+// (unknown, resolved). The table is the execution journal itself.
 type Store interface {
 	Append(sessionID, kind, tool string, args json.RawMessage, decision, actor string) (Event, error)
 	Events() ([]Event, error)

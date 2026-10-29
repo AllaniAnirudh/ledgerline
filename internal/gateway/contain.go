@@ -9,8 +9,8 @@ import (
 	"time"
 )
 
-// containedSession is one frozen session: every further call from it
-// is denied, and its pending held calls were denied when it froze.
+// containedSession is one frozen session. Every further call from
+// it is denied. Its pending held calls were denied when it froze.
 type containedSession struct {
 	SessionID   string    `json:"session_id"`
 	Actor       string    `json:"actor,omitempty"`
@@ -19,7 +19,7 @@ type containedSession struct {
 }
 
 // observeMCP records that an upstream MCP session id was seen on a
-// ledger session, so a later containment of that ledger session
+// ledger session. A later containment of that ledger session then
 // freezes the MCP session too.
 func (px *Proxy) observeMCP(sessionID, mcpID string) {
 	if mcpID == "" {
@@ -38,14 +38,15 @@ func (px *Proxy) observeMCP(sessionID, mcpID string) {
 	set[mcpID] = true
 }
 
-// Contain freezes a session: it is marked contained, every upstream
-// MCP session observed on it is frozen too, its pending held calls
-// are denied, and its in-flight upstream requests are cancelled
-// gateway-side (see forward for the exact guarantee). The freeze
-// is witnessed in the ledger, with the frozen MCP sessions in the
-// event arguments. The session stays contained even if the ledger
-// write fails: containment denies passage, so keeping it is the
-// fail-closed direction, and the failure is logged loudly.
+// Contain freezes a session. It is marked contained. Every
+// upstream MCP session observed on it is frozen too. Its pending
+// held calls are denied. Its in-flight upstream requests are
+// cancelled gateway-side (see forward for the exact guarantee).
+// The freeze is witnessed in the ledger, with the frozen MCP
+// sessions in the event arguments. The session stays contained
+// even if the ledger write fails. Containment denies passage,
+// so keeping it is the fail-closed direction. The failure is
+// logged loudly.
 func (px *Proxy) Contain(sessionID, actor, reason string) {
 	px.containedMu.Lock()
 	if px.contained == nil {
@@ -88,13 +89,13 @@ type containRequest struct {
 	Reason string `json:"reason"`
 }
 
-// containSessionAPI freezes one session from the control plane. The
-// actor rule matches decideApproval: a caller authenticated with a
-// per-approver token is recorded under the bound name, and a body
-// name that disagrees with the credential is rejected.
+// containSessionAPI freezes one session from the control plane.
+// The actor rule matches decideApproval. A caller authenticated
+// with a per-approver token is recorded under the bound name.
+// A body name that disagrees with the credential is rejected.
 func (px *Proxy) containSessionAPI(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/contain")
-	// The CLI escapes the id; unescape it here so session ids
+	// The CLI escapes the id. Unescape it here so session ids
 	// containing ?, #, or % route to the session they name.
 	if unescaped, err := url.PathUnescape(id); err == nil {
 		id = unescaped

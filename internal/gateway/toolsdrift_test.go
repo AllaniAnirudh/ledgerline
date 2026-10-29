@@ -19,8 +19,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// mutableToolsStub is an MCP server whose tool surface the test can
-// change mid-run, the way a compromised or redeployed server would.
+// mutableToolsStub is an MCP server. The test can change its tool
+// surface mid-run, the way a compromised or redeployed server
+// would.
 type mutableToolsStub struct {
 	mu    sync.Mutex
 	tools []listTool
@@ -150,7 +151,7 @@ func TestToolsDriftWitnessAndAccept(t *testing.T) {
 	if !strings.Contains(out, "added since baseline: evil") {
 		t.Fatalf("denial should name what changed, got %s", out)
 	}
-	// Accept, then the next list becomes the new baseline.
+	// Accept. Then the next list becomes the new baseline.
 	req := httptest.NewRequest(http.MethodPost, "/v1/tools/accept", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
 	px.ServeHTTP(rec, req)
@@ -204,7 +205,7 @@ func TestToolsDriftPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	postList(t, px1)
-	// A fresh proxy on the same store inherits the baseline: a
+	// A fresh proxy on the same store inherits the baseline. A
 	// restart must not grant the upstream amnesty.
 	px2, err := New(srv.URL, store, policy.New(nil, nil))
 	if err != nil {
@@ -315,8 +316,8 @@ func hasName(names []string, want string) bool {
 	return false
 }
 
-// pagedStub serves tools/list in two pages: page 1 carries a
-// nextCursor, page 2 completes the surface.
+// pagedStub serves tools/list in two pages. Page 1 carries a
+// nextCursor. Page 2 completes the surface.
 func pagedStub(w http.ResponseWriter, r *http.Request) {
 	var m jsonRPC
 	buf, _ := io.ReadAll(r.Body)
@@ -406,7 +407,7 @@ func TestToolsDriftHoldReleaseAfterRebaseline(t *testing.T) {
 	if id == "" {
 		t.Fatal("held call never appeared")
 	}
-	// The surface moves without x, and a human accepts it.
+	// The surface moves without x. A human accepts it.
 	stub.set([]listTool{{Name: "y"}})
 	px.SetToolsReapprovePending("tester")
 	postList(t, px)

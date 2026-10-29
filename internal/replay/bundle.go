@@ -1,9 +1,10 @@
-// Package replay exports a session's events as an offline bundle and
-// verifies bundles without trusting the host they came from.
+// Package replay exports a session's events as an offline bundle.
+// It verifies bundles without trusting the host they came from.
 //
-// A bundle proves self-consistency: the events link to each other,
-// untampered, in order. It does not prove who wrote them; that needs
-// the trust root (gateway key) or external anchoring, which is Phase 2.
+// A bundle proves self-consistency. The events link to each other,
+// untampered, in order. It does not prove who wrote them. That
+// needs the trust root (gateway key) or external anchoring, which
+// is Phase 2.
 package replay
 
 import (
@@ -16,7 +17,7 @@ import (
 )
 
 // ExportJSONL writes every event in the store as one JSON object per
-// line. The file is the offline bundle: replay it anywhere.
+// line. The file is the offline bundle. Replay it anywhere.
 func ExportJSONL(s ledger.Store, path string) error {
 	events, err := s.Events()
 	if err != nil {
@@ -25,11 +26,12 @@ func ExportJSONL(s ledger.Store, path string) error {
 	return writeBundle(path, events)
 }
 
-// ExportSessionJSONL writes a prefix-closed bundle: every event from
-// the chain start through the session's last event. Prefix-closure is
-// what keeps the bundle verifiable — a session-filtered slice would
-// break the chain at its first event, since prev hashes point at
-// events from other sessions. Filter by session when displaying.
+// ExportSessionJSONL writes a prefix-closed bundle. It covers every
+// event from the chain start through the session's last event.
+// Prefix-closure is what keeps the bundle verifiable. A
+// session-filtered slice would break the chain at its first event.
+// Prev hashes point at events from other sessions. Filter by
+// session when displaying.
 func ExportSessionJSONL(s ledger.Store, sessionID, path string) error {
 	events, err := s.Events()
 	if err != nil {
@@ -63,7 +65,8 @@ func writeBundle(path string, events []ledger.Event) error {
 }
 
 // VerifyBundle re-reads a bundle file and checks the chain.
-// Anyone with the file can run this; no access to the host needed.
+// Anyone with the file can run this. No access to the host is
+// needed.
 func VerifyBundle(path string) error {
 	f, err := os.Open(path)
 	if err != nil {

@@ -15,9 +15,9 @@ import (
 	"github.com/AllaniAnirudh/ledgerline/internal/replay"
 )
 
-// PendingApproval is one tool call held at the boundary waiting for a
-// human. The agent's request blocks until it is approved, denied, or
-// the hold times out.
+// PendingApproval is one tool call held at the boundary waiting for
+// a human. The agent's request blocks until it is approved,
+// denied, or the hold times out.
 type PendingApproval struct {
 	ID        string          `json:"id"`
 	SessionID string          `json:"session_id"`
@@ -43,7 +43,7 @@ type Approvals struct {
 	maxPending int
 }
 
-// NewApprovals builds a queue with a 5 minute hold timeout.
+// NewApprovals builds a queue. The hold timeout is 5 minutes.
 func NewApprovals() *Approvals {
 	return &Approvals{pending: map[string]*PendingApproval{}, timeout: 5 * time.Minute, maxPending: 1000}
 }
@@ -65,11 +65,11 @@ func (a *Approvals) List() []*PendingApproval {
 	return out
 }
 
-// Decide resolves a pending approval and records the actor who won
-// the decision, atomically: the actor is set under the same lock that
-// claims the decision, so the ledger can never record a loser's name
-// against the winner's call. Returns false when the ID is unknown or
-// already decided.
+// Decide resolves a pending approval. It records the actor who won
+// the decision, atomically. The actor is set under the same lock
+// that claims the decision. The ledger can never record a loser's
+// name against the winner's call. Decide returns false when the
+// ID is unknown or already decided.
 func (a *Approvals) Decide(id string, ok bool, actor string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -84,8 +84,8 @@ func (a *Approvals) Decide(id string, ok bool, actor string) bool {
 }
 
 // DenySession resolves every pending approval from one session as
-// denied, so a contained session's held calls do not hang until
-// timeout. Returns how many were denied.
+// denied. A contained session's held calls then do not hang until
+// timeout. DenySession returns how many were denied.
 func (a *Approvals) DenySession(sessionID, actor string) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -110,11 +110,11 @@ func newID() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// hold parks the agent's request until a human decides.
-// On approval the original call is forwarded upstream and the real
+// hold parks the agent's request until a human decides. On
+// approval the original call is forwarded upstream. The real
 // response goes back to the waiting agent. The release path fails
-// closed, like the rest of the boundary: if the approval cannot be
-// written to the ledger, the call does not pass.
+// closed, like the rest of the boundary. If the approval cannot
+// be written to the ledger, the call does not pass.
 func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, body []byte, tool string, args json.RawMessage, claim *idemClaim) {
 	id, err := newID()
 	if err != nil {
@@ -158,9 +158,10 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 	}
 
 	// A keyed hold claims the journal before the ledger hold
-	// event: a concurrent identical retry must see this hold,
-	// not queue a second one. A losing retry is answered from
-	// the winner's record, and this entry is rolled back.
+	// event. A concurrent identical retry must see this
+	// hold, not queue a second one. A losing retry is
+	// answered from the winner's record. This entry is
+	// rolled back.
 	if claim != nil {
 		now := time.Now().UTC()
 		existing, claimed, err := px.claimIdem(ledger.IdempotencyRecord{Key: claim.key, SessionID: session, Tool: tool, ArgsHash: claim.argsHash, State: ledger.IdemHeld, ApprovalID: p.ID, CreatedAt: now, UpdatedAt: now})
@@ -183,7 +184,7 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 	if _, err := px.ledger.Append(session, "approval", tool, args, "hold", ""); err != nil {
 		removePending()
 		if claim != nil {
-			// The hold never stood, so its journal entry must
+			// The hold never stood. Its journal entry must
 			// not block retries as "held".
 			px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
 		}
@@ -197,11 +198,11 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 	case res := <-p.resultCh:
 		px.release(w, r, session, body, tool, args, res, claim)
 	case <-timer.C:
-		// Claim the entry under the lock so a decision and a
+		// Claim the entry under the lock. A decision and a
 		// timeout can never both win the same hold.
 		px.approvals.mu.Lock()
 		if p.decided {
-			// The decision won the race; its result is already
+			// The decision won the race. Its result is already
 			// in the buffered channel.
 			px.approvals.mu.Unlock()
 			px.release(w, r, session, body, tool, args, <-p.resultCh, claim)
@@ -214,23 +215,23 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 			log.Printf("ledger write failed on approval timeout: %v", err)
 		}
 		if claim != nil {
-			// A timed-out hold never ran: a retry runs fresh.
+			// A timed-out hold never ran. A retry runs fresh.
 			px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
 		}
 		writeJSONRPCError(w, body, fmt.Sprintf("ledgerline: approval timed out after %s", px.approvals.timeout))
 	}
 }
 
-// release records the human's decision and, when it is an approval,
-// forwards the held call upstream. Any ledger failure closes the
-// boundary instead of letting the call through unrecorded.
+// release records the human's decision. When it is an approval,
+// it forwards the held call upstream. Any ledger failure closes
+// the boundary instead of letting the call through unrecorded.
 func (px *Proxy) release(w http.ResponseWriter, r *http.Request, session string, body []byte, tool string, args json.RawMessage, res decisionResult, claim *idemClaim) {
 	if !res.approved {
 		if _, err := px.ledger.Append(session, "approval", tool, args, "deny", res.actor); err != nil {
 			log.Printf("ledger write failed on approval deny: %v", err)
 		}
 		if claim != nil {
-			// A denied hold never ran; retries replay the
+			// A denied hold never ran. Retries replay the
 			// denial instead of queueing a new hold.
 			px.idemTransition(session, claim.key, ledger.IdemDenied, nil)
 		}
@@ -248,11 +249,11 @@ func (px *Proxy) release(w http.ResponseWriter, r *http.Request, session string,
 	px.forward(w, r, body, claim)
 }
 
-// serveAPI handles the control plane: approvals, session events,
-// chain verification, and the replay viewer.
+// serveAPI handles the control plane. It covers approvals,
+// session events, chain verification, and the replay viewer.
 func (px *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
-	// The pages themselves are static and carry no data; every /v1
-	// call behind them checks the API token when one is set.
+	// The pages themselves are static and carry no data. Every
+	// /v1 call behind them checks the API token when one is set.
 	if strings.HasPrefix(r.URL.Path, "/v1/") && !px.tokenOK(r) {
 		http.Error(w, "ledgerline: missing or bad API token", http.StatusUnauthorized)
 		return
@@ -330,8 +331,8 @@ func (px *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// writePage serves one of the built-in pages with headers that keep
-// it from being framed or extended by injected content.
+// writePage serves one of the built-in pages. Its headers keep
+// the page from being framed or extended by injected content.
 func writePage(w http.ResponseWriter, html []byte) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")
@@ -358,9 +359,10 @@ func (px *Proxy) decideApproval(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// When the caller authenticated with a per-approver token, the
-	// actor recorded in the ledger is the name bound to that token,
-	// not the free-text name in the body. A body name that disagrees
-	// with the credential is rejected outright.
+	// actor recorded in the ledger is the name bound to that
+	// token. It is not the free-text name in the body. A body
+	// name that disagrees with the credential is rejected
+	// outright.
 	actor := req.Actor
 	if name, bound := px.approverActor(r); bound {
 		if actor != "" && actor != name {
