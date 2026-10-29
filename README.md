@@ -142,6 +142,35 @@ go build -o ledgerline ./cmd/ledgerline
 # reach the port can accept a new surface, including the agent
 # itself. The gateway logs a warning at startup in that case.
 
+# Hook bridge: check native tool calls, not just MCP calls.
+# Native tools (Bash, file edits) never cross the MCP boundary.
+# A harness calls the bridge before each native tool runs.
+# The bridge uses the same policy engine as the gateway.
+# It records each call in the ledger.
+# Exit 0 allows the call. Exit 2 blocks it, and the reason goes
+# to stderr, where the harness shows it to the agent.
+# The bridge never exits 1: Claude Code and Gemini CLI treat
+# any exit other than 0 or 2 as a non-blocking error.
+# An allow means Ledgerline does not object. It does not grant
+# harness permission: the harness still runs its own flow.
+# With a gateway, a hold waits for a human decision, in the
+# same queue as MCP holds. Without a gateway, a hold blocks
+# with a note on how to approve and retry.
+# Set the harness hook timeout above --hold-timeout (120s by
+# default), and set onFailure to block, so a killed bridge
+# blocks instead of waving the call through.
+# Tool names map to one canonical set, so one policy file works
+# across harnesses: Bash becomes bash, run_shell_command becomes
+# bash, replace becomes edit. Names with no map pass through.
+#   # Claude Code (settings.json, PreToolUse, matcher "*"):
+#   #   "command": "ledgerline hook --harness claude-code --db ledger.db --policy policy.yaml"
+#   # Gemini CLI (settings.json, BeforeTool, matcher "*"):
+#   #   "command": "ledgerline hook --harness gemini --db ledger.db --policy policy.yaml"
+#   # With a gateway (holds wait for approval):
+#   #   ledgerline hook --harness claude-code --gateway http://localhost:8080 --token "$LEDGERLINE_API_TOKEN"
+# Drift detection does not apply to hook calls: it guards the
+# upstream MCP tool surface, not native harness tools.
+
 # Guard the control plane before exposing the gateway beyond
 # loopback. With no token, anyone who can reach the port can read
 # the ledger (arguments included) and decide approvals. The proxy
@@ -169,7 +198,7 @@ go build -o ledgerline ./cmd/ledgerline
 
 ## Layout
 
-- `cmd/ledgerline` — CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `idempotency`, `resolve`, `tools`, `accept-tools`, `export`, `verify`, `run`
+- `cmd/ledgerline` — CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `idempotency`, `resolve`, `tools`, `accept-tools`, `export`, `verify`, `run`, `hook`
 - `internal/gateway` — the boundary proxy: intercepts `tools/call`, consults policy, holds for approval, contains sessions, records proposals, brokers upstream credentials, forwards the rest; serves the `/v1/*` API, the `/approvals` page, and `/replay`
 - `internal/ledger` — `Store` interface; in-memory chain and SQLite backend; chain verification
 - `internal/policy` — allow/deny/hold/contain/propose decisions from a YAML policy file (ordered rules, glob tool names, decoded-JSON argument matching that fails closed, configurable default) or static lists (entries are tool globs)

@@ -86,6 +86,8 @@ func main() {
 		err = runVerify(os.Args[2:])
 	case "run":
 		err = runPTY(os.Args[2:])
+	case "hook":
+		err = runHook(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", os.Args[1])
 		usage()
@@ -102,7 +104,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ledgerline <gateway|approvals|approve|deny|contain|contained|proposals|apply|idempotency|resolve|tools|accept-tools|export|verify|run> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: ledgerline <gateway|approvals|approve|deny|contain|contained|proposals|apply|idempotency|resolve|tools|accept-tools|export|verify|run|hook> [flags]")
 }
 
 // openStore returns the ledger backend: SQLite when --db is set,
