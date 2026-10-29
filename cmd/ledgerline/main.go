@@ -249,7 +249,7 @@ func runGateway(args []string) error {
 		backend = *dbPath
 	}
 	if *apiToken == "" && len(approverTokens) == 0 {
-		log.Printf("ledgerline: WARNING: no API token set. The control plane is unauthenticated: anyone who can reach %s can read the ledger (arguments included) and decide approvals. Set --api-token or --approver-token before exposing this port beyond loopback.", *listen)
+		log.Printf("ledgerline: WARNING: no API token set. The control plane is unauthenticated: anyone who can reach %s can read the ledger (arguments included), decide approvals, and accept a new tool surface (drift re-baseline). Set --api-token or --approver-token before exposing this port beyond loopback.", *listen)
 	}
 	log.Printf("ledgerline: boundary up on %s -> %s (ledger: %s, policy: %s)", *listen, gateway.RedactURL(*upstream), backend, policyDesc)
 	log.Printf("ledgerline: approvals page at http://localhost%s/approvals, replay at /replay", *listen)

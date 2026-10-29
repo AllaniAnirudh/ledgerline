@@ -130,7 +130,17 @@ go build -o ledgerline ./cmd/ledgerline
 # in the ledger. Or accept at startup:
 #   ./ledgerline gateway ... --reapprove-tools
 # With no baseline at all (upstream never answered tools/list),
-# calls stay allowed: there is nothing to drift from yet.
+# calls stay allowed: there is nothing to drift from yet. When
+# the upstream is not up at startup, the gateway retries the
+# probe quietly every 10s until a baseline exists.
+# A paginated tools/list (nextCursor present) is never treated
+# as a surface: the probe follows cursors to build the full
+# baseline, and a partial page passing through is ignored, so
+# page-2 tools are never denied as drift.
+# Drift enforcement needs a control-plane token to mean what it
+# says: with no --api-token or --approver-token, anyone who can
+# reach the port can accept a new surface, including the agent
+# itself. The gateway logs a warning at startup in that case.
 
 # Guard the control plane before exposing the gateway beyond
 # loopback. With no token, anyone who can reach the port can read
@@ -182,7 +192,7 @@ Honest limits of the current build (also in `SECURITY.md`):
 - Upstream pinning covers the configured upstream URL only. It does not verify what the upstream server is, and it does not cover MCP servers reached any other way. The pin proves the configured upstream string matches the pin file, nothing more: the pin file itself is unprotected against a same-user process, and the first run trusts whatever upstream was passed.
 - Proposal "apply" records claim a human applied the action out of band. With no control-plane token, anyone who can reach the port can create that record, so treat no-token local use as single-user only.
 - Idempotency is per key, per session, for 24 hours, up to 1000 journal records. A replay bypasses current policy by design (same key means same call) but never bypasses containment. A resolved-executed key never re-forwards, even if the resolution was wrong: the human, not the gateway, owns that call. Journal rows are durable, not hash-chained; only the unknown and resolved transitions are witnessed in the chain.
-- Tools-drift enforcement denies unknown tool names only, and only once a baseline exists. The first sighting is trusted (TOFU): a server already compromised before the first gateway start baselines its malicious tools. A tools/list response the gateway cannot parse changes nothing, and in-memory mode loses the baseline on restart.
+- Tools-drift enforcement denies unknown tool names only, and only once a baseline exists. The first sighting is trusted (TOFU): a server already compromised before the first gateway start baselines its malicious tools. A tools/list response the gateway cannot parse changes nothing, and in-memory mode loses the baseline on restart. The stored baseline row is not covered by chain verification: a process that can write the ledger DB can rewrite it while verify stays green (the same conceded DB-write power as the chain itself). Session bundles exclude gateway-wide baseline and drift events; the full chain holds them.
 
 ## Dogfood note
 

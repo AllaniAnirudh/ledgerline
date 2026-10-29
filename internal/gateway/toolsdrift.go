@@ -40,9 +40,24 @@ import (
 //   - Acceptance is explicit and witnessed: --reapprove-tools at
 //     startup, or POST /v1/tools/accept, makes the NEXT observed
 //     list the new baseline. There is no silent re-baselining.
+//     Acceptance is only as trustworthy as the control-plane
+//     token: with no --api-token and no per-approver tokens, the
+//     accept endpoint is open to anyone who can reach the port,
+//     including the agent itself, so drift enforcement in that
+//     configuration is a tripwire for a human watching the
+//     ledger, not a boundary the agent cannot cross. The
+//     gateway logs a warning at startup in that case, and the
+//     drift docs carry the same caveat.
+//   - Pagination is never a surface: a tools/list page carrying
+//     nextCursor is one page, not the whole list. The probe
+//     follows cursors to build the full baseline, and a partial
+//     page passing through is ignored for baseline purposes, so
+//     page-2 tools are never denied as drift.
 //   - A tools/list response the gateway cannot parse (including
 //     an SSE stream it cannot decode) changes nothing: no
-//     baseline, no drift event, no enforcement change.
+//     baseline, no drift event, no enforcement change. SSE
+//     payloads split across several data lines are joined before
+//     parsing, then each line is tried alone.
 //   - With no baseline at all, everything is allowed: there is
 //     nothing to drift from yet.
 
@@ -61,7 +76,8 @@ type listTool struct {
 }
 
 type listResult struct {
-	Tools []listTool `json:"tools"`
+	Tools      []listTool `json:"tools"`
+	NextCursor string     `json:"nextCursor"`
 }
 
 type listResponse struct {
@@ -69,40 +85,93 @@ type listResponse struct {
 }
 
 // parseToolsList extracts the tool surface from a tools/list
-// response body. It accepts a plain JSON body, and, failing that,
-// the data payloads of an SSE stream (each data line tried as a
-// JSON-RPC response). It returns false when nothing parses.
-func parseToolsList(body []byte) (ledger.ToolsBaseline, bool) {
-	if b, ok := parseToolsListJSON(body); ok {
-		return b, true
+// response body, plus the pagination cursor when the response is
+// one page of many ("" means a complete surface). It accepts a
+// plain JSON body, and, failing that, the data payloads of an SSE
+// stream: payloads split across several data lines are joined
+// first, then each line is tried alone. It returns false when
+// nothing parses.
+func parseToolsList(body []byte) (ledger.ToolsBaseline, string, bool) {
+	if b, cursor, ok := parseToolsListJSON(body); ok {
+		return b, cursor, true
 	}
+	var data []string
 	for _, line := range strings.Split(string(body), "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		if b, ok := parseToolsListJSON([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:")))); ok {
-			return b, true
+		data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+	}
+	if len(data) > 0 {
+		if b, cursor, ok := parseToolsListJSON([]byte(strings.Join(data, "\n"))); ok {
+			return b, cursor, true
+		}
+		for _, d := range data {
+			if b, cursor, ok := parseToolsListJSON([]byte(d)); ok {
+				return b, cursor, true
+			}
 		}
 	}
-	return ledger.ToolsBaseline{}, false
+	return ledger.ToolsBaseline{}, "", false
 }
 
-func parseToolsListJSON(body []byte) (ledger.ToolsBaseline, bool) {
+func parseToolsListJSON(body []byte) (ledger.ToolsBaseline, string, bool) {
 	var resp listResponse
 	if err := json.Unmarshal(body, &resp); err != nil || resp.Result.Tools == nil {
-		return ledger.ToolsBaseline{}, false
+		return ledger.ToolsBaseline{}, "", false
 	}
 	tools := make([]ledger.BaselineTool, 0, len(resp.Result.Tools))
 	for _, t := range resp.Result.Tools {
 		if t.Name == "" {
 			continue
 		}
-		tools = append(tools, ledger.BaselineTool{Name: t.Name, Description: t.Description, Schema: canonicalArgs(t.InputSchema)})
+		tools = append(tools, ledger.BaselineTool{Name: t.Name, Description: t.Description, Schema: canonicalSchema(t.InputSchema)})
 	}
 	sort.Slice(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
+	return ledger.ToolsBaseline{Tools: tools, Hash: hashTools(tools)}, resp.Result.NextCursor, true
+}
+
+// canonicalSchema canonicalizes an inputSchema the way the
+// baseline hash needs it: key order must not matter, or a server
+// that serializes the same schema with keys in a different order
+// reports phantom drift on every list. encoding/json sorts map
+// keys on marshal; UseNumber keeps number literals intact. This
+// is baseline-only: the ledger chain keeps its own compacting
+// canonical form, which must never change.
+func canonicalSchema(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return canonicalArgs(raw)
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return canonicalArgs(raw)
+	}
+	return string(out)
+}
+
+// hashTools identifies a surface: tools sorted by name, then
+// description, then schema, so duplicate names hash
+// deterministically instead of wobbling with input order.
+func hashTools(tools []ledger.BaselineTool) string {
+	sorted := append([]ledger.BaselineTool(nil), tools...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Name != sorted[j].Name {
+			return sorted[i].Name < sorted[j].Name
+		}
+		if sorted[i].Description != sorted[j].Description {
+			return sorted[i].Description < sorted[j].Description
+		}
+		return sorted[i].Schema < sorted[j].Schema
+	})
 	var buf bytes.Buffer
-	for _, t := range tools {
+	for _, t := range sorted {
 		buf.WriteString(t.Name)
 		buf.WriteByte(0)
 		buf.WriteString(t.Description)
@@ -111,7 +180,7 @@ func parseToolsListJSON(body []byte) (ledger.ToolsBaseline, bool) {
 		buf.WriteByte('\n')
 	}
 	sum := sha256.Sum256(buf.Bytes())
-	return ledger.ToolsBaseline{Tools: tools, Hash: hex.EncodeToString(sum[:])}, true
+	return hex.EncodeToString(sum[:])
 }
 
 // diffTools compares an old surface with a new one: names present
@@ -144,8 +213,13 @@ func diffTools(old, new []ledger.BaselineTool) (added, removed, changed []string
 	return added, removed, changed
 }
 
-func driftArgs(added, removed, changed []string) json.RawMessage {
-	raw, _ := json.Marshal(map[string][]string{"added": added, "removed": removed, "changed": changed})
+func hashArgs(hash string) json.RawMessage {
+	raw, _ := json.Marshal(map[string]string{"hash": hash})
+	return raw
+}
+
+func driftArgs(added, removed, changed []string, baselineHash string) json.RawMessage {
+	raw, _ := json.Marshal(map[string]any{"added": added, "removed": removed, "changed": changed, "baseline_hash": baselineHash})
 	return raw
 }
 
@@ -167,6 +241,12 @@ func (px *Proxy) loadToolsBaseline() error {
 	if !found {
 		return nil
 	}
+	// Recompute the hash from the stored tools: the hash function
+	// is baseline-only, so a row written by an older build may
+	// carry a hash in the old form. Recomputing heals it silently
+	// instead of reporting phantom drift on the first list after
+	// an upgrade.
+	b.Hash = hashTools(b.Tools)
 	px.toolsBaseline = &b
 	cp := b
 	px.toolsLatest = &cp
@@ -215,14 +295,41 @@ func (px *Proxy) SetToolsReapprovePending(actor string) {
 // applyToolsList folds one observed surface into the baseline
 // state: establish, reapprove, drift, or no change. It witnesses
 // every transition except no-change, and persists baseline moves.
-// Callers hold no lock; this takes toolsMu.
+// Callers hold no lock; this takes toolsMu. The in-memory anchor
+// moves before the ledger writes, so a failing write restores
+// the previous state instead of leaving a move the chain never
+// saw. Witness args carry the baseline hash, so the chain shows
+// what surface was trusted when; the baseline row itself is not
+// covered by chain verification (see SECURITY.md).
 func (px *Proxy) applyToolsList(observed ledger.ToolsBaseline, actor string) error {
 	px.toolsMu.Lock()
 	defer px.toolsMu.Unlock()
 	now := time.Now().UTC()
 	observed.CreatedAt = now
 	observed.UpdatedAt = now
+	prevBaseline, prevLatest := px.toolsBaseline, px.toolsLatest
+	prevPending, prevActor := px.toolsReapprovePending, px.toolsReapproveActor
+	restore := func() {
+		px.toolsBaseline, px.toolsLatest = prevBaseline, prevLatest
+		px.toolsReapprovePending, px.toolsReapproveActor = prevPending, prevActor
+	}
 	switch {
+	case px.toolsBaseline == nil:
+		// Establishment wins over a pending re-approval: there
+		// is no earlier baseline to re-approve, so a first list
+		// witnesses "establish" and consumes the pending flag.
+		px.toolsReapprovePending = false
+		px.toolsBaseline = &observed
+		cp := observed
+		px.toolsLatest = &cp
+		if err := px.ledger.ToolsBaselinePut(observed); err != nil {
+			restore()
+			return err
+		}
+		if _, err := px.ledger.Append("", "tools_baseline", "", hashArgs(observed.Hash), "establish", actor); err != nil {
+			restore()
+			return err
+		}
 	case px.toolsReapprovePending:
 		px.toolsReapprovePending = false
 		actor = px.toolsReapproveActor
@@ -230,19 +337,11 @@ func (px *Proxy) applyToolsList(observed ledger.ToolsBaseline, actor string) err
 		cp := observed
 		px.toolsLatest = &cp
 		if err := px.ledger.ToolsBaselinePut(observed); err != nil {
+			restore()
 			return err
 		}
-		if _, err := px.ledger.Append("", "tools_baseline", "", nil, "reapprove", actor); err != nil {
-			return err
-		}
-	case px.toolsBaseline == nil:
-		px.toolsBaseline = &observed
-		cp := observed
-		px.toolsLatest = &cp
-		if err := px.ledger.ToolsBaselinePut(observed); err != nil {
-			return err
-		}
-		if _, err := px.ledger.Append("", "tools_baseline", "", nil, "establish", actor); err != nil {
+		if _, err := px.ledger.Append("", "tools_baseline", "", hashArgs(observed.Hash), "reapprove", actor); err != nil {
+			restore()
 			return err
 		}
 	case px.toolsBaseline.Hash == observed.Hash:
@@ -250,9 +349,11 @@ func (px *Proxy) applyToolsList(observed ledger.ToolsBaseline, actor string) err
 		px.toolsLatest = &cp
 	default:
 		added, removed, changed := diffTools(px.toolsBaseline.Tools, observed.Tools)
+		anchor := px.toolsBaseline.Hash
 		cp := observed
 		px.toolsLatest = &cp
-		if _, err := px.ledger.Append("", "tools_drift", "", driftArgs(added, removed, changed), "drift", actor); err != nil {
+		if _, err := px.ledger.Append("", "tools_drift", "", driftArgs(added, removed, changed, anchor), "drift", actor); err != nil {
+			restore()
 			return err
 		}
 	}
@@ -290,45 +391,76 @@ func (px *Proxy) probeToolsBaseline(quiet bool) error {
 			log.Printf("tools baseline probe: %s", msg)
 		}
 	}
-	body := []byte(`{"jsonrpc":"2.0","id":"ledgerline-baseline","method":"tools/list","params":{}}`)
-	req, err := http.NewRequest(http.MethodPost, px.upstream.String(), bytes.NewReader(body))
-	if err != nil {
-		return err
+	// Follow pagination cursors: the baseline is the whole
+	// surface, not page 1 of it.
+	var all []ledger.BaselineTool
+	cursor := ""
+	for page := 0; page < 100; page++ {
+		params := map[string]any{}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		paramsJSON, _ := json.Marshal(params)
+		body := []byte(`{"jsonrpc":"2.0","id":"ledgerline-baseline","method":"tools/list","params":` + string(paramsJSON) + `}`)
+		req, err := http.NewRequest(http.MethodPost, px.upstream.String(), bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if px.broker != nil {
+			px.broker.InjectHeaders(req.Header)
+		}
+		// The probe has its own timeout: a hung upstream must
+		// not hang gateway startup. Forwarding keeps its
+		// no-timeout posture for long-lived streams.
+		resp, err := px.probeClient.Do(req)
+		if err != nil {
+			note("upstream unreachable, baseline deferred to first tools/list")
+			return nil
+		}
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+		resp.Body.Close()
+		if err != nil || len(raw) > maxBodyBytes {
+			note("unreadable response, baseline deferred to first tools/list")
+			return nil
+		}
+		if px.broker != nil {
+			raw = []byte(px.broker.RedactString(string(raw)))
+		}
+		observed, next, ok := parseToolsList(raw)
+		if !ok {
+			note("tools/list did not parse, baseline deferred to first tools/list")
+			return nil
+		}
+		all = append(all, observed.Tools...)
+		if next == "" {
+			break
+		}
+		cursor = next
+		if page == 99 {
+			note("too many pages, baseline deferred to first tools/list")
+			return nil
+		}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if px.broker != nil {
-		px.broker.InjectHeaders(req.Header)
-	}
-	resp, err := px.client.Do(req)
-	if err != nil {
-		note("upstream unreachable, baseline deferred to first tools/list")
-		return nil
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
-	if err != nil || len(raw) > maxBodyBytes {
-		note("unreadable response, baseline deferred to first tools/list")
-		return nil
-	}
-	if px.broker != nil {
-		raw = []byte(px.broker.RedactString(string(raw)))
-	}
-	observed, ok := parseToolsList(raw)
-	if !ok {
-		note("tools/list did not parse, baseline deferred to first tools/list")
-		return nil
-	}
+	combined := ledger.ToolsBaseline{Tools: all, Hash: hashTools(all)}
+	sort.Slice(combined.Tools, func(i, j int) bool { return combined.Tools[i].Name < combined.Tools[j].Name })
 	// applyToolsList itself decides establish, reapprove (when a
 	// re-approval is pending), drift, or no change.
-	return px.applyToolsList(observed, "gateway")
+	return px.applyToolsList(combined, "gateway")
 }
 
 // observeToolsList folds a tools/list response that passed through
-// the proxy into the baseline state. Unparseable or oversize
-// responses change nothing.
+// the proxy into the baseline state. Unparseable, oversize, or
+// paginated (partial-page) responses change nothing: a partial
+// page is not a surface, and treating it as one would deny
+// page-2 tools as drift.
 func (px *Proxy) observeToolsList(raw []byte) {
-	observed, ok := parseToolsList(raw)
+	observed, cursor, ok := parseToolsList(raw)
 	if !ok {
+		return
+	}
+	if cursor != "" {
+		log.Printf("tools/list page ignored for baseline: paginated response, next page not fetched")
 		return
 	}
 	if err := px.applyToolsList(observed, "gateway"); err != nil {
@@ -368,7 +500,10 @@ func (px *Proxy) serveToolsAccept(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Actor string `json:"actor"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		http.Error(w, "bad accept body", http.StatusBadRequest)
+		return
+	}
 	actor := req.Actor
 	if name, bound := px.approverActor(r); bound {
 		if actor != "" && actor != name {

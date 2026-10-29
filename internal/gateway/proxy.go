@@ -33,17 +33,25 @@ import (
 // unbounded request into memory.
 const maxBodyBytes = 10 << 20
 
+// maxListBytes caps one captured tools/list response. Tool lists
+// are rarely near 1 MiB, and each in-flight list pins its capture
+// buffer, so the list cap is deliberately far below the request
+// cap: an agent-triggered upstream cannot amplify memory 10 MiB
+// per concurrent list.
+const maxListBytes = 1 << 20
+
 // Proxy forwards MCP traffic while witnessing and policing tool calls.
 type Proxy struct {
-	upstream  *url.URL
-	ledger    ledger.Store
-	policy    *policy.Policy
-	client    *http.Client
-	approvals *Approvals
-	proposals *Proposals
-	broker    *Broker
-	apiToken  string
-	approvers map[string]string // token -> approver name
+	upstream    *url.URL
+	ledger      ledger.Store
+	policy      *policy.Policy
+	client      *http.Client
+	probeClient *http.Client // baseline probe only: a hung upstream must not hang startup
+	approvals   *Approvals
+	proposals   *Proposals
+	broker      *Broker
+	apiToken    string
+	approvers   map[string]string // token -> approver name
 
 	containedMu   sync.Mutex
 	contained     map[string]containedSession
@@ -146,7 +154,7 @@ func New(upstream string, l ledger.Store, p *policy.Policy) (*Proxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	px := &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, approvals: NewApprovals(), proposals: NewProposals()}
+	px := &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, probeClient: &http.Client{Timeout: 30 * time.Second}, approvals: NewApprovals(), proposals: NewProposals()}
 	if err := px.recoverIdempotency(); err != nil {
 		return nil, err
 	}
@@ -481,6 +489,27 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 		return
 	}
 
+	// Drift re-check at the last point before upstream: a held
+	// call waited while the surface changed, and a concurrent
+	// list can move it even for a fresh call, so the gate the
+	// call passed at arrival may no longer hold. A denied
+	// release never ran, so a keyed retry runs fresh (and hits
+	// the gate again) instead of replaying a denial.
+	if r.Method == http.MethodPost && isToolCall(body) {
+		if tool, _ := toolCallDetails(body); tool != "" {
+			if msg, denied := px.toolsGate(tool); denied {
+				if _, err := px.ledger.Append(session, "tools_drift", tool, nil, "deny", ""); err != nil {
+					log.Printf("ledger write failed on drift-denied forward: %v", err)
+				}
+				if claim != nil {
+					px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
+				}
+				writeJSONRPCError(w, body, msg)
+				return
+			}
+		}
+	}
+
 	// A keyed call is journaled as started before the upstream
 	// sees it: if the process dies from here on, recovery marks
 	// it unknown instead of losing it. A journal failure closes
@@ -509,7 +538,7 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	// own buffer while passing bytes through.
 	var listBuf *limitedBuffer
 	if r.Method == http.MethodPost && isToolsList(body) {
-		listBuf = &limitedBuffer{cap: maxBodyBytes}
+		listBuf = &limitedBuffer{cap: maxListBytes}
 		out = &captureWriter{ResponseWriter: out, buf: listBuf}
 	}
 
@@ -592,6 +621,8 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	}
 	if listBuf != nil && !listBuf.overflow && copyErr == nil {
 		px.observeToolsList(listBuf.buf)
+	} else if listBuf != nil && listBuf.overflow {
+		log.Printf("tools/list response over %d bytes, ignored for baseline", maxListBytes)
 	}
 }
 
