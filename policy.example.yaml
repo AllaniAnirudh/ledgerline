@@ -56,8 +56,11 @@ rules:
     args_contains: "confidential"
 
   # A destructive tool freezes the session that called it: the call
-  # is denied, and every further call from that session is denied
-  # until a new gateway start.
+  # is denied, new calls from that session (and from its upstream
+  # MCP sessions) are denied, in-flight requests are aborted, and
+  # pending held calls are denied. The freeze lasts until a new
+  # gateway start, and it does not stop a fresh upstream MCP
+  # session: without proxy-path client auth, that is a new identity.
   - tool: "drop_*"
     action: contain
     reason: "destructive tool: session frozen"

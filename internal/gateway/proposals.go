@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -22,23 +24,67 @@ type Proposal struct {
 	decided   bool
 }
 
-// Proposals is the pending-proposal queue.
+// Proposals is the pending-proposal queue. It mirrors the approvals
+// queue's bound: at most maxPending entries, so a retry storm
+// cannot grow gateway memory without limit. Entries also expire
+// after maxAge; expiry is enforced lazily by the control-plane
+// handlers, which witness each expiry in the ledger.
 type Proposals struct {
-	mu      sync.Mutex
-	pending map[string]*Proposal
+	mu         sync.Mutex
+	pending    map[string]*Proposal
+	maxPending int
+	maxAge     time.Duration
 }
 
-// NewProposals builds an empty queue.
+// NewProposals builds an empty queue: 1000 entries, 24h expiry.
 func NewProposals() *Proposals {
-	return &Proposals{pending: map[string]*Proposal{}}
+	return &Proposals{pending: map[string]*Proposal{}, maxPending: 1000, maxAge: 24 * time.Hour}
 }
 
-// Add records a proposal in the queue. The caller witnesses it in
-// the ledger first; Add only tracks it for a later human decision.
-func (p *Proposals) Add(sessionID, tool string, args json.RawMessage) (*Proposal, error) {
+// SetMaxPending changes the queue bound (tests use a small one).
+func (p *Proposals) SetMaxPending(n int) { p.maxPending = n }
+
+// SetMaxAge changes entry expiry (tests use a short one).
+func (p *Proposals) SetMaxAge(d time.Duration) { p.maxAge = d }
+
+// canonicalArgs compacts a JSON blob so the same arguments compare
+// equal regardless of whitespace.
+func canonicalArgs(args json.RawMessage) string {
+	if len(args) == 0 {
+		return ""
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, args); err != nil {
+		return string(args)
+	}
+	return buf.String()
+}
+
+// AddDedup records a proposal in the queue, or returns the existing
+// one when an identical proposal (same session, tool, and canonical
+// arguments) is already pending. Retries therefore return the same
+// proposal id instead of queueing duplicates a human could apply
+// twice. It reports whether the entry is new, and an error when the
+// queue is full. The caller witnesses a new proposal in the ledger
+// afterwards; on a ledger failure it must call Remove to roll back.
+func (p *Proposals) AddDedup(sessionID, tool string, args json.RawMessage) (*Proposal, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := canonicalArgs(args)
+	for _, pr := range p.pending {
+		if pr.SessionID == sessionID && pr.Tool == tool && canonicalArgs(pr.Args) == key {
+			return &Proposal{
+				ID: pr.ID, SessionID: pr.SessionID, Tool: pr.Tool,
+				Args: pr.Args, CreatedAt: pr.CreatedAt,
+			}, false, nil
+		}
+	}
+	if len(p.pending) >= p.maxPending {
+		return nil, false, fmt.Errorf("proposal queue full")
+	}
 	id, err := newID()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	pr := &Proposal{
 		ID:        id,
@@ -47,20 +93,47 @@ func (p *Proposals) Add(sessionID, tool string, args json.RawMessage) (*Proposal
 		Args:      args,
 		CreatedAt: time.Now().UTC(),
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	for {
 		if _, exists := p.pending[pr.ID]; !exists {
 			break
 		}
 		fresh, err := newID()
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		pr.ID = fresh
 	}
 	p.pending[pr.ID] = pr
-	return pr, nil
+	return &Proposal{
+		ID: pr.ID, SessionID: pr.SessionID, Tool: pr.Tool,
+		Args: pr.Args, CreatedAt: pr.CreatedAt,
+	}, true, nil
+}
+
+// Remove drops a queued proposal without deciding it. Used to roll
+// back an entry whose ledger witness failed.
+func (p *Proposals) Remove(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.pending, id)
+}
+
+// PurgeExpired drops entries older than maxAge and returns them so
+// the caller can witness each expiry in the ledger.
+func (p *Proposals) PurgeExpired(now time.Time) []*Proposal {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []*Proposal
+	for id, pr := range p.pending {
+		if now.Sub(pr.CreatedAt) > p.maxAge {
+			delete(p.pending, id)
+			out = append(out, &Proposal{
+				ID: pr.ID, SessionID: pr.SessionID, Tool: pr.Tool,
+				Args: pr.Args, CreatedAt: pr.CreatedAt,
+			})
+		}
+	}
+	return out
 }
 
 // Decide resolves a proposal and returns a copy of it for the
@@ -136,21 +209,34 @@ func (px *Proxy) decideProposal(w http.ResponseWriter, r *http.Request) {
 
 // propose records a tool call as a proposal and answers the agent
 // immediately: the action was NOT executed, and nothing is forwarded.
-// The ledger write comes first and fails closed: without the record,
-// there is no proposal to apply. The human decision afterwards only
-// records apply or deny; application itself happens out of band,
-// by the human, outside the gateway.
+// A retry of an identical pending proposal returns the existing id
+// instead of queueing a duplicate. The ledger write fails closed:
+// without the record, there is no proposal to apply, so a failed
+// witness rolls the queue entry back. The human decision afterwards
+// only records apply or deny; application itself happens out of
+// band, by the human, outside the gateway.
 func (px *Proxy) propose(w http.ResponseWriter, session string, body []byte, tool string, args json.RawMessage) {
+	pr, isNew, err := px.proposals.AddDedup(session, tool, args)
+	if err != nil {
+		writeJSONRPCError(w, body, "ledgerline: proposal queue full, boundary closed")
+		return
+	}
+	text := "ledgerline: action NOT executed; recorded as proposal " + pr.ID + " for human application out of band"
+	if !isNew {
+		text = "ledgerline: action NOT executed; already proposed as " + pr.ID + " for human application out of band"
+		px.proposeResult(w, body, text)
+		return
+	}
 	if _, err := px.ledger.Append(session, "proposal", tool, args, "propose", ""); err != nil {
+		px.proposals.Remove(pr.ID)
 		log.Printf("ledger write failed on proposal: %v", err)
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
 		return
 	}
-	pr, err := px.proposals.Add(session, tool, args)
-	if err != nil {
-		writeJSONRPCError(w, body, "ledgerline: cannot allocate proposal id, boundary closed")
-		return
-	}
+	px.proposeResult(w, body, text)
+}
+
+func (px *Proxy) proposeResult(w http.ResponseWriter, body []byte, text string) {
 	var m jsonRPC
 	_ = json.Unmarshal(body, &m)
 	w.Header().Set("Content-Type", "application/json")
@@ -160,9 +246,20 @@ func (px *Proxy) propose(w http.ResponseWriter, session string, body []byte, too
 		"result": map[string]any{
 			"content": []map[string]any{{
 				"type": "text",
-				"text": "ledgerline: action NOT executed; recorded as proposal " + pr.ID + " for human application out of band",
+				"text": text,
 			}},
 			"isError": true,
 		},
 	})
+}
+
+// purgeExpiredProposals drops stale proposals and witnesses each
+// expiry in the ledger. Called by the control-plane handlers before
+// they list or decide, so expiry needs no background goroutine.
+func (px *Proxy) purgeExpiredProposals() {
+	for _, pr := range px.proposals.PurgeExpired(time.Now().UTC()) {
+		if _, err := px.ledger.Append(pr.SessionID, "proposal", pr.Tool, pr.Args, "expired", ""); err != nil {
+			log.Printf("ledger write failed on proposal expiry: %v", err)
+		}
+	}
 }

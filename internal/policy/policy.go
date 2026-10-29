@@ -54,8 +54,10 @@ func (d Decision) String() string {
 		return "hold"
 	case Contain:
 		return "contain"
-	default:
+	case Propose:
 		return "propose"
+	default:
+		return "unknown"
 	}
 }
 

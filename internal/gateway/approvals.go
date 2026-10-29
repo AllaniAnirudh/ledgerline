@@ -236,13 +236,15 @@ func (px *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, px.ContainedList())
 
 	case r.URL.Path == "/v1/proposals" && r.Method == http.MethodGet:
+		px.purgeExpiredProposals()
 		writeJSON(w, px.proposals.List())
 
 	case strings.HasPrefix(r.URL.Path, "/v1/proposals/") && strings.HasSuffix(r.URL.Path, "/decision") && r.Method == http.MethodPost:
+		px.purgeExpiredProposals()
 		px.decideProposal(w, r)
 
 	case r.URL.Path == "/v1/upstream" && r.Method == http.MethodGet:
-		writeJSON(w, map[string]any{"upstream": px.upstream.String(), "pin": px.upstreamPin, "pinned": px.pinConfigured})
+		writeJSON(w, map[string]any{"upstream": RedactURL(px.upstream.String()), "pin": px.upstreamPin, "pinned": px.pinConfigured})
 
 	case strings.HasPrefix(r.URL.Path, "/v1/sessions/") && strings.HasSuffix(r.URL.Path, "/events") && r.Method == http.MethodGet:
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/events")

@@ -119,7 +119,7 @@ func TestContainAPI(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("contain API should return 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if !px.IsContained("test-session") {
+	if !px.IsContained("test-session", "") {
 		t.Fatal("session should be contained after API call")
 	}
 	req = httptest.NewRequest(http.MethodGet, "/v1/contained", nil)
@@ -209,9 +209,9 @@ rules:
 	if _, err := px.ledger.Append("test-session", "proposal", "deploy", json.RawMessage(`{}`), "propose", ""); err != nil {
 		t.Fatal(err)
 	}
-	pr, err := px.proposals.Add("test-session", "deploy", json.RawMessage(`{}`))
-	if err != nil {
-		t.Fatal(err)
+	pr, isNew, err := px.proposals.AddDedup("test-session", "deploy", json.RawMessage(`{}`))
+	if err != nil || !isNew {
+		t.Fatal(err, isNew)
 	}
 	body := `{"decision":"deny","actor":"tester"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/proposals/"+pr.ID+"/decision", strings.NewReader(body))

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -17,15 +18,41 @@ type containedSession struct {
 	ContainedAt time.Time `json:"contained_at"`
 }
 
-// Contain freezes a session: it is marked contained, its pending held
-// calls are denied, and the freeze is witnessed in the ledger. The
-// session stays contained even if the ledger write fails: containment
-// denies passage, so keeping it is the fail-closed direction, and
-// the failure is logged loudly.
+// observeMCP records that an upstream MCP session id was seen on a
+// ledger session, so a later containment of that ledger session
+// freezes the MCP session too.
+func (px *Proxy) observeMCP(sessionID, mcpID string) {
+	if mcpID == "" {
+		return
+	}
+	px.containedMu.Lock()
+	defer px.containedMu.Unlock()
+	if px.observed == nil {
+		px.observed = map[string]map[string]bool{}
+	}
+	set := px.observed[sessionID]
+	if set == nil {
+		set = map[string]bool{}
+		px.observed[sessionID] = set
+	}
+	set[mcpID] = true
+}
+
+// Contain freezes a session: it is marked contained, every upstream
+// MCP session observed on it is frozen too, its pending held calls
+// are denied, and its in-flight upstream requests are cancelled
+// gateway-side (see forward for the exact guarantee). The freeze
+// is witnessed in the ledger, with the frozen MCP sessions in the
+// event arguments. The session stays contained even if the ledger
+// write fails: containment denies passage, so keeping it is the
+// fail-closed direction, and the failure is logged loudly.
 func (px *Proxy) Contain(sessionID, actor, reason string) {
 	px.containedMu.Lock()
 	if px.contained == nil {
 		px.contained = map[string]containedSession{}
+	}
+	if px.containedMCP == nil {
+		px.containedMCP = map[string]bool{}
 	}
 	px.contained[sessionID] = containedSession{
 		SessionID:   sessionID,
@@ -33,11 +60,24 @@ func (px *Proxy) Contain(sessionID, actor, reason string) {
 		Reason:      reason,
 		ContainedAt: time.Now().UTC(),
 	}
+	var mcpIDs []string
+	for id := range px.observed[sessionID] {
+		px.containedMCP[id] = true
+		mcpIDs = append(mcpIDs, id)
+	}
 	px.containedMu.Unlock()
 
 	denied := px.approvals.DenySession(sessionID, actor)
-	if _, err := px.ledger.Append(sessionID, "containment", "(session)", nil, "contain", actor); err != nil {
+	px.cancelInflight(sessionID)
+	var args json.RawMessage
+	if len(mcpIDs) > 0 {
+		args, _ = json.Marshal(map[string][]string{"mcp_sessions": mcpIDs})
+	}
+	if _, err := px.ledger.Append(sessionID, "containment", "(session)", args, "contain", actor); err != nil {
 		log.Printf("ledgerline: ledger write failed on containment of session %s: %v", sessionID, err)
+	}
+	if sessionID == "default" {
+		log.Printf("ledgerline: WARNING: containing the shared default session blocks every headerless client")
 	}
 	log.Printf("ledgerline: session %s contained by %s (%s); %d held calls denied", sessionID, actor, reason, denied)
 }
@@ -54,6 +94,11 @@ type containRequest struct {
 // name that disagrees with the credential is rejected.
 func (px *Proxy) containSessionAPI(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/contain")
+	// The CLI escapes the id; unescape it here so session ids
+	// containing ?, #, or % route to the session they name.
+	if unescaped, err := url.PathUnescape(id); err == nil {
+		id = unescaped
+	}
 	if id == "" {
 		http.Error(w, "missing session id", http.StatusBadRequest)
 		return
@@ -74,12 +119,20 @@ func (px *Proxy) containSessionAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "session_id": id})
 }
 
-// IsContained reports whether a session is frozen.
-func (px *Proxy) IsContained(sessionID string) bool {
+// IsContained reports whether a ledger session or an upstream MCP
+// session id is frozen.
+func (px *Proxy) IsContained(sessionID, mcpID string) bool {
 	px.containedMu.Lock()
 	defer px.containedMu.Unlock()
-	_, ok := px.contained[sessionID]
-	return ok
+	if _, ok := px.contained[sessionID]; ok {
+		return true
+	}
+	if mcpID != "" {
+		if _, ok := px.containedMCP[mcpID]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ContainedList returns a snapshot of frozen sessions.

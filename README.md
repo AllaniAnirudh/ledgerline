@@ -48,14 +48,29 @@ go build -o ledgerline ./cmd/ledgerline
 ./ledgerline approve <id> --actor alice
 
 # Three more policy actions exist. Contain freezes a session: the
-# triggering call is denied, every further call from the session is
-# denied, and its pending held calls are denied too. A human can
-# also freeze a session from the control plane at any time:
+# triggering call is denied, new calls from the session are denied,
+# in-flight requests for it are cut off at the gateway, and its pending
+# held calls are denied too. Containment is keyed on the session
+# header AND on every upstream MCP session id observed on it, so
+# rotating the session header alone does not evade it; the agent
+# must also abandon its upstream MCP session. That raises the cost
+# of evasion but does not eliminate it: the proxy path is
+# unauthenticated by design, so a fresh MCP session is a new
+# identity, and full binding needs proxy-path client auth. A human
+# can also freeze a session from the control plane at any time:
 #   ./ledgerline contain <session-id> --reason "suspicious holds"
 #   ./ledgerline contained
+# Note: clients that send no session header share the "default"
+# session, so containing "default" blocks every headerless client.
 # Propose records a call for out-of-band application and never
 # forwards it: the agent is told the action was NOT executed, and a
-# human applies it (or denies it) afterwards, outside the gateway:
+# human applies it (or denies it) afterwards, outside the gateway.
+# Identical retries return the existing proposal id instead of
+# queueing duplicates. The queue holds 1000 proposals and entries
+# expire after 24 hours. An "apply" record is only as trustworthy
+# as the control-plane token: with no token set, anyone who can
+# reach the port can mark a proposal applied, so treat no-token
+# local use as single-user only:
 #   ./ledgerline proposals
 #   ./ledgerline apply <proposal-id>
 #   ./ledgerline deny <proposal-id>
@@ -114,8 +129,10 @@ Honest limits of the current build (also in `SECURITY.md`):
 - No redaction at capture yet. Arguments and terminal output are stored as sent.
 - The gateway sets no timeout on upstream calls, so long-lived streaming sessions are never cut off, and a hung upstream holds a request open.
 - Capture records the call and its policy outcome, not the upstream result or its duration.
-- Containment is a session freeze inside a running gateway, not a kill switch that survives a gateway restart. A contained session unfreezes if the gateway restarts.
-- Upstream pinning covers the configured upstream URL only. It does not verify what the upstream server is, and it does not cover MCP servers reached any other way.
+- Containment is a session freeze inside a running gateway, not a kill switch that survives a gateway restart. A contained session unfreezes if the gateway restarts. Cancelling an in-flight request stops the gateway waiting and cuts its response, so nothing from it reaches the agent; whether the upstream itself stops depends on it observing cancellation (a started stream does, a plain request still awaiting its first byte may run to completion server-side, with its result discarded). It never undoes a side effect the upstream already executed.
+- Containment binds the ledger session header and the upstream MCP sessions observed on it. Rotating the ledger header alone does not evade it, but starting a fresh upstream MCP session does: without proxy-path client authentication, a new MCP session is a new identity.
+- Upstream pinning covers the configured upstream URL only. It does not verify what the upstream server is, and it does not cover MCP servers reached any other way. The pin proves the configured upstream string matches the pin file, nothing more: the pin file itself is unprotected against a same-user process, and the first run trusts whatever upstream was passed.
+- Proposal "apply" records claim a human applied the action out of band. With no control-plane token, anyone who can reach the port can create that record, so treat no-token local use as single-user only.
 
 ## Dogfood note
 

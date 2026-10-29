@@ -20,6 +20,12 @@ func TestParseContainPropose(t *testing.T) {
 	}
 }
 
+func TestDecisionStringUnknown(t *testing.T) {
+	if Decision(99).String() != "unknown" {
+		t.Fatalf("unknown decision should render as unknown, got %q", Decision(99).String())
+	}
+}
+
 func TestContainProposeDecisions(t *testing.T) {
 	p, err := Parse([]byte(`version: 1
 default: allow

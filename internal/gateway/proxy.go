@@ -12,6 +12,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
@@ -44,8 +45,19 @@ type Proxy struct {
 
 	containedMu   sync.Mutex
 	contained     map[string]containedSession
+	containedMCP  map[string]bool            // upstream MCP session ids frozen with their sessions
+	observed      map[string]map[string]bool // ledger session -> MCP session ids seen on it
 	upstreamPin   string
 	pinConfigured bool
+
+	inflightMu sync.Mutex
+	inflight   map[string]map[*inflightReq]struct{}
+}
+
+// inflightReq is one cancellable upstream request. It is keyed by
+// pointer because a CancelFunc itself is not a map key.
+type inflightReq struct {
+	cancel context.CancelFunc
 }
 
 // SetAPIToken guards the /v1 control plane. When a token is set,
@@ -176,10 +188,9 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session := r.Header.Get("X-Ledgerline-Session")
-	if session == "" {
-		session = "default"
-	}
+	session := sessionOf(r)
+	mcpID := r.Header.Get("Mcp-Session-Id")
+	px.observeMCP(session, mcpID)
 
 	// A contained session is cut off entirely: no tool call, no
 	// list, no other proxied traffic passes. The control plane
@@ -187,8 +198,15 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// session, and it stays contained until a new gateway start.
 	// Containment holds only while this gateway process lives: it
 	// is a session freeze, not a kill switch that survives a
-	// gateway restart.
-	if px.IsContained(session) {
+	// gateway restart. It is keyed on the ledger session AND on
+	// every upstream MCP session id observed on it, so rotating
+	// the ledger header alone does not evade it: the agent must
+	// also abandon its upstream MCP session. That raises the cost
+	// of evasion; it does not eliminate it, because the proxy path
+	// is unauthenticated by design and a fresh MCP session is a
+	// new identity. Full binding needs proxy-path client auth,
+	// which this build does not add (see SECURITY.md).
+	if px.IsContained(session, mcpID) {
 		if r.Method == http.MethodPost {
 			if !px.witness(session, "containment", "(session)", nil, "deny", "", w, body) {
 				return
@@ -251,6 +269,47 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // isBatch reports whether the body is a JSON array (a JSON-RPC batch).
+// trackInflight registers a cancellable upstream request under its
+// session; untrackInflight removes it when the request finishes.
+func (px *Proxy) trackInflight(session string, cancel context.CancelFunc) *inflightReq {
+	req := &inflightReq{cancel: cancel}
+	px.inflightMu.Lock()
+	defer px.inflightMu.Unlock()
+	if px.inflight == nil {
+		px.inflight = map[string]map[*inflightReq]struct{}{}
+	}
+	set := px.inflight[session]
+	if set == nil {
+		set = map[*inflightReq]struct{}{}
+		px.inflight[session] = set
+	}
+	set[req] = struct{}{}
+	return req
+}
+
+func (px *Proxy) untrackInflight(session string, req *inflightReq) {
+	px.inflightMu.Lock()
+	defer px.inflightMu.Unlock()
+	if set := px.inflight[session]; set != nil {
+		delete(set, req)
+		if len(set) == 0 {
+			delete(px.inflight, session)
+		}
+	}
+}
+
+// cancelInflight aborts every in-flight upstream request for a
+// session. Called by Contain.
+func (px *Proxy) cancelInflight(session string) {
+	px.inflightMu.Lock()
+	set := px.inflight[session]
+	delete(px.inflight, session)
+	px.inflightMu.Unlock()
+	for req := range set {
+		req.cancel()
+	}
+}
+
 func isBatch(body []byte) bool {
 	return len(bytes.TrimSpace(body)) > 0 && bytes.TrimSpace(body)[0] == '['
 }
@@ -266,13 +325,49 @@ func (px *Proxy) witness(session, kind, tool string, args json.RawMessage, decis
 	return true
 }
 
+// sessionOf reads the ledger session from the request, defaulting
+// to the shared "default" session when the header is absent.
+func sessionOf(r *http.Request) string {
+	if s := r.Header.Get("X-Ledgerline-Session"); s != "" {
+		return s
+	}
+	return "default"
+}
+
 // forward passes the request upstream and streams the response back.
+// The request is registered as in-flight under its session, so
+// Contain cancels it mid-flight: the gateway stops waiting and
+// cuts the response, so nothing from it reaches the agent. Whether
+// the upstream itself stops depends on it observing cancellation:
+// a stream it already started does (the server notices the closed
+// connection), while a plain request still awaiting its first byte
+// may run to completion server-side, with its result discarded.
+// Cancelling never undoes a side effect the upstream already
+// executed.
+// forward also re-checks containment at its own entry: the hold
+// release path reaches forward without passing the ServeHTTP gate,
+// so a session contained after its hold was approved must still
+// never forward.
 func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte) {
+	session := sessionOf(r)
+	if px.IsContained(session, r.Header.Get("Mcp-Session-Id")) {
+		if _, err := px.ledger.Append(session, "containment", "(session)", nil, "deny", ""); err != nil {
+			log.Printf("ledger write failed on contained forward: %v", err)
+		}
+		writeJSONRPCError(w, body, "ledgerline: session contained")
+		return
+	}
+
 	target := *px.upstream
 	target.Path = singleJoin(px.upstream.Path, r.URL.Path)
 	target.RawQuery = r.URL.RawQuery
 
-	out, err := http.NewRequest(r.Method, target.String(), bytes.NewReader(body))
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	req := px.trackInflight(session, cancel)
+	defer px.untrackInflight(session, req)
+
+	out, err := http.NewRequestWithContext(ctx, r.Method, target.String(), bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "bad upstream request", http.StatusBadGateway)
 		return

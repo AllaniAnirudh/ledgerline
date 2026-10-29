@@ -34,6 +34,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -167,15 +168,15 @@ func runGateway(args []string) error {
 		px.SetUpstreamPin(pin)
 		switch st {
 		case "created":
-			log.Printf("ledgerline: upstream pin created for %s", *upstream)
+			log.Printf("ledgerline: upstream pin created for %s", gateway.RedactURL(*upstream))
 		case "ok":
-			log.Printf("ledgerline: upstream pin verified for %s", *upstream)
+			log.Printf("ledgerline: upstream pin verified for %s", gateway.RedactURL(*upstream))
 		case "reapproved":
 			argsJSON, _ := json.Marshal(map[string]string{"pin": pin})
 			if _, err := store.Append("gateway", "upstream", "(upstream)", argsJSON, "reapprove", *reapproveActor); err != nil {
 				log.Printf("ledgerline: WARNING: could not witness upstream re-approval: %v", err)
 			}
-			log.Printf("ledgerline: upstream pin re-approved for %s by %s", *upstream, *reapproveActor)
+			log.Printf("ledgerline: upstream pin re-approved for %s by %s", gateway.RedactURL(*upstream), *reapproveActor)
 		}
 	}
 	if *apiToken != "" {
@@ -196,7 +197,7 @@ func runGateway(args []string) error {
 	if *apiToken == "" && len(approverTokens) == 0 {
 		log.Printf("ledgerline: WARNING: no API token set. The control plane is unauthenticated: anyone who can reach %s can read the ledger (arguments included) and decide approvals. Set --api-token or --approver-token before exposing this port beyond loopback.", *listen)
 	}
-	log.Printf("ledgerline: boundary up on %s -> %s (ledger: %s, policy: %s)", *listen, *upstream, backend, policyDesc)
+	log.Printf("ledgerline: boundary up on %s -> %s (ledger: %s, policy: %s)", *listen, gateway.RedactURL(*upstream), backend, policyDesc)
 	log.Printf("ledgerline: approvals page at http://localhost%s/approvals, replay at /replay", *listen)
 	srv := &http.Server{Addr: *listen, Handler: px, ReadHeaderTimeout: 10 * time.Second}
 	return srv.ListenAndServe()
@@ -363,11 +364,20 @@ func runDecide(args []string, approve bool) error {
 		// A deny for an unknown approval may be a proposal: deny
 		// falls through to the proposal queue before giving up.
 		// Approve has no fallback: proposals are applied, not
-		// approved, so an approval miss on approve is an error.
-		if !approve && resp.StatusCode == http.StatusNotFound {
-			if err := denyProposal(*gw, id, *actor, *token); err == nil {
-				fmt.Printf("denied %s by %s\n", id, *actor)
-				return nil
+		// approved, but a miss that turns out to be a proposal
+		// says so instead of leaving a bare 404.
+		if resp.StatusCode == http.StatusNotFound {
+			if !approve {
+				if err := denyProposal(*gw, id, *actor, *token); err == nil {
+					fmt.Printf("denied %s by %s\n", id, *actor)
+					return nil
+				}
+			} else if list, err := fetchProposals(*gw, *token); err == nil {
+				for _, p := range list {
+					if p["id"] == id {
+						return fmt.Errorf("id %s is a proposal, not a held call; use 'ledgerline apply %s'", id, id)
+					}
+				}
 			}
 		}
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
@@ -445,7 +455,7 @@ func runContain(args []string) error {
 		return fmt.Errorf("usage: ledgerline contain <session-id>")
 	}
 	body, _ := json.Marshal(map[string]string{"actor": *actor, "reason": *reason})
-	url := strings.TrimSuffix(*gw, "/") + "/v1/sessions/" + id + "/contain"
+	url := strings.TrimSuffix(*gw, "/") + "/v1/sessions/" + url.PathEscape(id) + "/contain"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
