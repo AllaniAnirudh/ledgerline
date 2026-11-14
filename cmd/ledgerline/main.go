@@ -411,6 +411,25 @@ func runApprovals(args []string) error {
 	}
 }
 
+// maxGatewayResponseBytes caps one gateway response body. It
+// matches the gateway control-plane cap. A larger body is a
+// fault, not a list.
+const maxGatewayResponseBytes = 1 << 20
+
+// decodeGatewayResponse decodes one JSON gateway response. It
+// rejects bodies over the cap. A compromised gateway cannot
+// grow CLI memory without bound.
+func decodeGatewayResponse(body io.Reader, v any) error {
+	raw, err := io.ReadAll(io.LimitReader(body, maxGatewayResponseBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(raw) > maxGatewayResponseBytes {
+		return fmt.Errorf("gateway response over the %d byte limit", maxGatewayResponseBytes)
+	}
+	return json.Unmarshal(raw, v)
+}
+
 func fetchApprovals(gw, token string) ([]map[string]any, error) {
 	req, err := http.NewRequest(http.MethodGet, strings.TrimSuffix(gw, "/")+"/v1/approvals", nil)
 	if err != nil {
@@ -429,7 +448,7 @@ func fetchApprovals(gw, token string) ([]map[string]any, error) {
 		return nil, fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
 	}
 	var list []map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+	if err := decodeGatewayResponse(resp.Body, &list); err != nil {
 		return nil, err
 	}
 	return list, nil
@@ -644,7 +663,7 @@ func runContained(args []string) error {
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
 	}
 	var list []map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+	if err := decodeGatewayResponse(resp.Body, &list); err != nil {
 		return err
 	}
 	if len(list) == 0 {
@@ -684,7 +703,7 @@ func fetchProposals(gw, token string) ([]map[string]any, error) {
 		return nil, fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
 	}
 	var list []map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+	if err := decodeGatewayResponse(resp.Body, &list); err != nil {
 		return nil, err
 	}
 	return list, nil
@@ -816,7 +835,7 @@ func runIdempotency(args []string) error {
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
 	}
 	var list []map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+	if err := decodeGatewayResponse(resp.Body, &list); err != nil {
 		return err
 	}
 	if len(list) == 0 {
@@ -927,7 +946,7 @@ func runTools(args []string) error {
 		Detail   map[string][]string `json:"drift_detail"`
 		Pending  bool                `json:"pending_reapprove"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+	if err := decodeGatewayResponse(resp.Body, &status); err != nil {
 		return err
 	}
 	names := func(v map[string]any) string {
