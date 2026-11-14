@@ -79,23 +79,21 @@ func TestFixDriftDetectForwards(t *testing.T) {
 		t.Fatalf("drifted tool in detect mode should reach upstream, hits went %d to %d", before, stub.hits.Load())
 	}
 	events := sessionEvents(t, px, "test-session")
-	if len(events) != 2 {
-		t.Fatalf("want policy_decision plus tool_call, got %d: %+v", len(events), events)
+	if len(events) != 3 {
+		t.Fatalf("want policy_decision plus tools_drift plus tool_call, got %d: %+v", len(events), events)
 	}
-	pd, tc := events[0], events[1]
+	pd, drift, tc := events[0], events[1], events[2]
 	if pd.Kind != "policy_decision" || pd.Tool != "evil" || pd.Decision != "deny" || pd.Mode != "detect" {
 		t.Fatalf("policy_decision = %+v, want deny/detect for evil", pd)
+	}
+	if drift.Kind != "tools_drift" || drift.Tool != "evil" || drift.Decision != "deny" || drift.Mode != "detect" {
+		t.Fatalf("tools_drift = %+v, want deny/detect for evil", drift)
 	}
 	if tc.Kind != "tool_call" || tc.Tool != "evil" || tc.Decision != "allow" || tc.Mode != "detect" {
 		t.Fatalf("tool_call = %+v, want allow/detect for evil", tc)
 	}
-	if tc.DecisionID == "" || tc.DecisionID != pd.DecisionID {
-		t.Fatalf("tool_call id %q does not match policy_decision id %q", tc.DecisionID, pd.DecisionID)
-	}
-	for _, e := range events {
-		if e.Kind == "tools_drift" {
-			t.Fatalf("detect-mode drift must not record a tools_drift denial: %+v", e)
-		}
+	if pd.DecisionID == "" || drift.DecisionID != pd.DecisionID || tc.DecisionID != pd.DecisionID {
+		t.Fatalf("ids %q, %q, %q should match as one call", pd.DecisionID, drift.DecisionID, tc.DecisionID)
 	}
 }
 
@@ -110,11 +108,18 @@ func TestFixDriftPreventDeniesWithoutAllow(t *testing.T) {
 		t.Fatalf("drift-denied call must not reach upstream, hits went %d to %d", before, stub.hits.Load())
 	}
 	events := sessionEvents(t, px, "test-session")
-	if len(events) != 1 {
-		t.Fatalf("want one tools_drift denial, got %d: %+v", len(events), events)
+	if len(events) != 2 {
+		t.Fatalf("want policy_decision plus tools_drift, got %d: %+v", len(events), events)
 	}
-	if events[0].Kind != "tools_drift" || events[0].Decision != "deny" {
-		t.Fatalf("event = %+v, want tools_drift deny", events[0])
+	pd, drift := events[0], events[1]
+	if pd.Kind != "policy_decision" || pd.Tool != "evil" || pd.Decision != "deny" || pd.Mode != "prevent" {
+		t.Fatalf("policy_decision = %+v, want deny/prevent for evil", pd)
+	}
+	if drift.Kind != "tools_drift" || drift.Tool != "evil" || drift.Decision != "deny" || drift.Mode != "prevent" {
+		t.Fatalf("tools_drift = %+v, want deny/prevent for evil", drift)
+	}
+	if pd.DecisionID == "" || drift.DecisionID != pd.DecisionID {
+		t.Fatalf("tools_drift id %q does not match policy_decision id %q", drift.DecisionID, pd.DecisionID)
 	}
 }
 
@@ -144,6 +149,9 @@ func TestFixForwardDriftDetectForwards(t *testing.T) {
 	for _, e := range events {
 		if e.Kind == "tools_drift" && e.Decision == "deny" && e.Mode == "detect" {
 			sawDrift = true
+			if e.DecisionID != "0123456789abcdef0123456789abcdef" {
+				t.Fatalf("forward tools_drift id %q should reuse the witness id", e.DecisionID)
+			}
 		}
 		if e.Kind == "tool_call" && e.Decision == "allow" {
 			sawAllow = true
@@ -180,8 +188,155 @@ func TestFixForwardDriftPreventDeniesWithoutAllow(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("want one tools_drift denial and no allow, got %d: %+v", len(events), events)
 	}
-	if events[0].Kind != "tools_drift" || events[0].Decision != "deny" {
-		t.Fatalf("event = %+v, want tools_drift deny", events[0])
+	if events[0].Kind != "tools_drift" || events[0].Decision != "deny" || events[0].Mode != "prevent" {
+		t.Fatalf("event = %+v, want tools_drift deny/prevent", events[0])
+	}
+	if events[0].DecisionID != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("forward tools_drift id %q should reuse the witness id", events[0].DecisionID)
+	}
+}
+
+func TestFixDriftDetectRosterCountsOnce(t *testing.T) {
+	px, _ := driftProxy(t, "version: 1\nrules:\n  - tool: evil\n    action: deny\n    mode: detect\n", []listTool{{Name: "read"}})
+	_, out := postToolHeaders(t, px, "evil", `{}`, nil)
+	if strings.Contains(out, "error") {
+		t.Fatalf("drifted tool in detect mode should run, got %s", out)
+	}
+	code, raw := getAPI(t, px, "/v1/sessions")
+	if code != http.StatusOK {
+		t.Fatalf("GET /v1/sessions: want 200, got %d (%s)", code, raw)
+	}
+	var rows []sessionRow
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].SessionID != "test-session" {
+		t.Fatalf("roster = %v, want one test-session row", rows)
+	}
+	if rows[0].Detected != 1 {
+		t.Fatalf("detected = %d, want 1 for one drifted call", rows[0].Detected)
+	}
+	if rows[0].Denied != 0 {
+		t.Fatalf("denied_calls = %d, want 0 in detect mode", rows[0].Denied)
+	}
+	if rows[0].TotalCalls != 1 || rows[0].Allowed != 1 {
+		t.Fatalf("row = %+v, want one call and one allowed", rows[0])
+	}
+}
+
+func TestFixDriftPreventAllowRuleCountsOnce(t *testing.T) {
+	px, stub := driftProxy(t, "version: 1\ndefault: allow\n", []listTool{{Name: "read"}})
+	before := stub.hits.Load()
+	_, out := postToolHeaders(t, px, "evil", `{}`, nil)
+	if !strings.Contains(out, "not in baseline") {
+		t.Fatalf("drifted tool in prevent mode should be denied as drift, got %s", out)
+	}
+	if stub.hits.Load() != before {
+		t.Fatalf("drift-denied call must not reach upstream, hits went %d to %d", before, stub.hits.Load())
+	}
+	events := sessionEvents(t, px, "test-session")
+	if len(events) != 2 {
+		t.Fatalf("want policy_decision plus tools_drift, got %d: %+v", len(events), events)
+	}
+	if events[0].Kind != "policy_decision" || events[0].Decision != "allow" || events[0].Mode != "prevent" {
+		t.Fatalf("policy_decision = %+v, want allow/prevent for the rule", events[0])
+	}
+	if events[1].Kind != "tools_drift" || events[1].Decision != "deny" || events[1].Mode != "prevent" {
+		t.Fatalf("tools_drift = %+v, want deny/prevent for evil", events[1])
+	}
+	if events[0].DecisionID == "" || events[1].DecisionID != events[0].DecisionID {
+		t.Fatalf("ids %q and %q should match as one call", events[0].DecisionID, events[1].DecisionID)
+	}
+	code, raw := getAPI(t, px, "/v1/sessions")
+	if code != http.StatusOK {
+		t.Fatalf("GET /v1/sessions: want 200, got %d (%s)", code, raw)
+	}
+	var rows []sessionRow
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Denied != 1 {
+		t.Fatalf("roster = %v, want one row with denied_calls 1", rows)
+	}
+	if rows[0].TotalCalls != 0 || rows[0].Allowed != 0 {
+		t.Fatalf("row = %+v, want zero calls and zero allowed", rows[0])
+	}
+}
+
+func TestFixDriftDetectHoldRuleCountsOnce(t *testing.T) {
+	px, _ := driftProxy(t, "version: 1\nrules:\n  - tool: evil\n    action: hold\n    mode: detect\n", []listTool{{Name: "read"}})
+	_, out := postToolHeaders(t, px, "evil", `{}`, nil)
+	if strings.Contains(out, "error") {
+		t.Fatalf("drifted tool in detect mode should run, got %s", out)
+	}
+	events := sessionEvents(t, px, "test-session")
+	if len(events) != 3 {
+		t.Fatalf("want policy_decision plus tools_drift plus tool_call, got %d: %+v", len(events), events)
+	}
+	if events[0].Kind != "policy_decision" || events[0].Decision != "hold" || events[0].Mode != "detect" {
+		t.Fatalf("policy_decision = %+v, want hold/detect for evil", events[0])
+	}
+	if events[1].Kind != "tools_drift" || events[1].Decision != "deny" || events[1].Mode != "detect" {
+		t.Fatalf("tools_drift = %+v, want deny/detect for evil", events[1])
+	}
+	if events[2].Kind != "tool_call" || events[2].Decision != "allow" || events[2].Mode != "detect" {
+		t.Fatalf("tool_call = %+v, want allow/detect for evil", events[2])
+	}
+	if events[0].DecisionID == "" || events[1].DecisionID != events[0].DecisionID || events[2].DecisionID != events[0].DecisionID {
+		t.Fatalf("ids %q, %q, %q should match as one call", events[0].DecisionID, events[1].DecisionID, events[2].DecisionID)
+	}
+	code, raw := getAPI(t, px, "/v1/sessions")
+	if code != http.StatusOK {
+		t.Fatalf("GET /v1/sessions: want 200, got %d (%s)", code, raw)
+	}
+	var rows []sessionRow
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Detected != 1 {
+		t.Fatalf("roster = %v, want one row with detected 1", rows)
+	}
+	if rows[0].Denied != 0 || rows[0].Holds != 0 {
+		t.Fatalf("row = %+v, want zero denied and zero holds in detect mode", rows[0])
+	}
+}
+
+func TestFixForwardDriftRosterCountsOnce(t *testing.T) {
+	px, stub := driftProxy(t, "version: 1\ndefault: allow\n", []listTool{{Name: "read"}})
+	px.SetToolsReapprovePending("tester")
+	if err := px.applyToolsList(ledger.ToolsBaseline{Tools: []ledger.BaselineTool{{Name: "other"}}}, "gateway"); err != nil {
+		t.Fatal(err)
+	}
+	id := "0123456789abcdef0123456789abcdef"
+	if _, err := px.Ledger().AppendDetailed("test-session", "policy_decision", "read", nil, "deny", "", ledger.EventDetail{Mode: "detect", DecisionID: id, AgentID: ""}); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read","arguments":{}}}`
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set("X-Ledgerline-Session", "test-session")
+	req = withToolCallWitness(req, toolCallWitness{tool: "read", args: json.RawMessage(`{}`), decisionID: id, mode: "detect", detect: true})
+	rec := httptest.NewRecorder()
+	before := stub.hits.Load()
+	px.forward(rec, req, []byte(body), nil)
+	if strings.Contains(rec.Body.String(), "error") {
+		t.Fatalf("forward-time drift in detect mode should run, got %s", rec.Body.String())
+	}
+	if stub.hits.Load() != before+1 {
+		t.Fatalf("forward-time drift in detect mode should reach upstream, hits went %d to %d", before, stub.hits.Load())
+	}
+	code, raw := getAPI(t, px, "/v1/sessions")
+	if code != http.StatusOK {
+		t.Fatalf("GET /v1/sessions: want 200, got %d (%s)", code, raw)
+	}
+	var rows []sessionRow
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Detected != 1 {
+		t.Fatalf("roster = %v, want one row with detected 1", rows)
+	}
+	if rows[0].TotalCalls != 1 || rows[0].Allowed != 1 {
+		t.Fatalf("row = %+v, want one call and one allowed", rows[0])
 	}
 }
 

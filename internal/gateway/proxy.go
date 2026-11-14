@@ -406,26 +406,32 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// the new surface. Drift is a boundary gate, not a
 		// policy rule. In prevent mode it denies. In detect
 		// mode the denial is observed and the call runs.
-		// The policy_decision carries deny with mode detect.
-		// The tool_call below reuses its id. A drifted tool
-		// is untrusted, but detect mode is the posture the
-		// human chose for this tool. The ledger shows both
-		// events, so the observation is explicit.
+		// The rule decision is recorded first, then the
+		// drift denial. Both share one decision id. The
+		// policy_decision carries the rule action and the
+		// rule mode, so per-rule attribution survives the
+		// drift denial. The tool_call below reuses the id.
+		// A drifted tool is untrusted, but detect mode is
+		// the posture the human chose for this tool. The
+		// ledger shows both events, so the observation is
+		// explicit. The roster counts the pair once: it
+		// skips a second denied or detected count under
+		// the same id.
 		driftDetected := false
 		var decisionID string
 		var ok bool
 		if msg, denied := px.toolsGate(tool); denied {
+			decisionID, ok = px.witnessPolicyDecision(session, tool, decision.String(), mode.String(), agentID, w, body)
+			if !ok {
+				return
+			}
+			if !px.witnessDetailed(session, "tools_drift", tool, nil, "deny", "", ledger.EventDetail{Mode: mode.String(), DecisionID: decisionID, AgentID: agentID}, w, body) {
+				return
+			}
 			if mode == policy.ModeDetect {
-				decisionID, ok = px.witnessPolicyDecision(session, tool, policy.Deny.String(), policy.ModeDetect.String(), agentID, w, body)
-				if !ok {
-					return
-				}
 				driftDetected = true
 				detect = true
 			} else {
-				if !px.witness(session, "tools_drift", tool, nil, "deny", "", agentID, w, body) {
-					return
-				}
 				writeJSONRPCError(w, body, msg)
 				return
 			}
@@ -757,17 +763,21 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	// mode the call is denied. No allow was witnessed yet
 	// for a fresh call or a held call, so the ledger holds
 	// no false allow. Both paths carry their witness here.
+	// A forward-time drift reuses the arrival decision id
+	// when the witness carries one. The roster then counts
+	// the call once, not once per event.
 	if r.Method == http.MethodPost && isToolCall(body) {
 		if tool, _ := toolCallDetails(body); tool != "" {
 			if msg, denied := px.toolsGate(tool); denied {
 				tw, hasWitness := toolCallWitnessOf(r)
 				if hasWitness && tw.driftDetected {
 					// The drift was already observed at
-					// arrival as a policy_decision. Do not
-					// record it twice. The call runs. The
-					// allow below reuses that id.
+					// arrival as a policy_decision and a
+					// tools_drift event. Do not record it
+					// twice. The call runs. The allow below
+					// reuses that id.
 				} else if hasWitness && tw.detect {
-					if _, err := px.ledger.AppendDetailed(session, "tools_drift", tool, nil, "deny", "", ledger.EventDetail{Mode: policy.ModeDetect.String(), AgentID: agentIDOf(r)}); err != nil {
+					if _, err := px.ledger.AppendDetailed(session, "tools_drift", tool, nil, "deny", "", ledger.EventDetail{Mode: policy.ModeDetect.String(), DecisionID: tw.decisionID, AgentID: agentIDOf(r)}); err != nil {
 						log.Printf("ledger write failed on drift-denied forward: %v", err)
 						if claim != nil {
 							px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
@@ -776,7 +786,7 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 						return
 					}
 				} else {
-					if _, err := px.ledger.AppendDetailed(session, "tools_drift", tool, nil, "deny", "", ledger.EventDetail{AgentID: agentIDOf(r)}); err != nil {
+					if _, err := px.ledger.AppendDetailed(session, "tools_drift", tool, nil, "deny", "", ledger.EventDetail{Mode: policy.ModePrevent.String(), DecisionID: tw.decisionID, AgentID: agentIDOf(r)}); err != nil {
 						log.Printf("ledger write failed on drift-denied forward: %v", err)
 					}
 					if claim != nil {

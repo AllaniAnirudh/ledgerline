@@ -33,11 +33,15 @@ type eventsResponse struct {
 // merge across the local gateway and all peers. The merged
 // timeline sorts by timestamp. The answer says so with
 // merged_by. Each event carries its gateway name. A peer that
-// does not answer during a merge is named in unreachable. Its
-// events are absent, not silent. With gateway=local only local
-// events return. With gateway=<peer name> only that peer
-// returns. An unknown name is a 404. A peer that does not
-// answer a direct pull is a 502.
+// does not answer during a merge is named in unreachable. A
+// peer that answered but whose chain did not verify is named
+// in unverified. A peer skipped for a pull cycle is named in
+// skipped. Their events are absent, not silent. With
+// gateway=local only local events return. With gateway=<peer
+// name> only that peer returns. An unknown name is a 404. A
+// peer that does not answer a direct pull is a 502. A peer
+// that answers a direct pull but whose chain did not verify
+// is a 422, with a body that names the peer unverified.
 func (px *Proxy) serveEvents(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var from, to time.Time
@@ -102,11 +106,11 @@ func (px *Proxy) serveEvents(w http.ResponseWriter, r *http.Request) {
 			for _, e := range local {
 				rows = append(rows, gatewayEvent{Event: e, Gateway: "local"})
 			}
-			writeJSON(w, pageGatewayEvents(rows, limit, offset, "", nil, nil, nil))
+			writeJSON(w, pageGatewayEvents(rows, limit, offset, "", nil, nil, nil, nil, nil))
 			return
 		}
 		merged, down, info := px.mergePeerEvents(peerFilterQuery(q), local, visited)
-		writeJSON(w, pageGatewayEvents(merged, limit, offset, "timestamp", down, info.truncated, info.totals))
+		writeJSON(w, pageGatewayEvents(merged, limit, offset, "timestamp", down, info.unverified, info.skipped, info.truncated, info.totals))
 		return
 	default:
 		px.peersMu.RLock()
@@ -132,10 +136,14 @@ func (px *Proxy) serveEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		// The peer chain is verified here before its events
 		// are trusted. Paging happens here, after the check.
+		// A peer that answered but whose chain did not
+		// verify is not down. It gets a 422 with a body
+		// that names it unverified. A peer that did not
+		// answer stays a 502.
 		chain, _, err := px.fetchVerifiedPeerChain(peer, visited)
 		if err != nil {
 			if errors.Is(err, errPeerChainInvalid) {
-				http.Error(w, "peer "+gateway+" chain did not verify: "+err.Error(), http.StatusBadGateway)
+				writePeerUnverified(w, gateway, err)
 				return
 			}
 			http.Error(w, "peer "+gateway+" unreachable: "+err.Error(), http.StatusBadGateway)
@@ -146,9 +154,30 @@ func (px *Proxy) serveEvents(w http.ResponseWriter, r *http.Request) {
 		for _, e := range events {
 			rows = append(rows, gatewayEvent{Event: e, Gateway: gateway})
 		}
-		writeJSON(w, pageGatewayEvents(rows, limit, offset, "", nil, nil, nil))
+		writeJSON(w, pageGatewayEvents(rows, limit, offset, "", nil, nil, nil, nil, nil))
 		return
 	}
+}
+
+// peerChainErrorResponse is the body of a direct pull of a
+// peer that answered but whose chain did not verify. The peer
+// is reachable, so chain_ok is false and the error text
+// names the local verify failure.
+type peerChainErrorResponse struct {
+	Gateway    string `json:"gateway"`
+	Reachable  bool   `json:"reachable"`
+	ChainOK    bool   `json:"chain_ok"`
+	ChainError string `json:"chain_error,omitempty"`
+}
+
+// writePeerUnverified answers a direct pull of a reachable
+// peer whose chain did not verify. The answer is a 422, not
+// a 502. The peer answered. Only its chain failed. The body
+// names the peer unverified, with chain_ok false.
+func writePeerUnverified(w http.ResponseWriter, gateway string, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnprocessableEntity)
+	_ = json.NewEncoder(w).Encode(peerChainErrorResponse{Gateway: gateway, Reachable: true, ChainOK: false, ChainError: err.Error()})
 }
 
 // eventFilter carries the parsed GET /v1/events filters.
@@ -193,9 +222,11 @@ func filterEvents(events []ledger.Event, f eventFilter) []ledger.Event {
 }
 
 // pageGatewayEvents pages a gateway-labelled list. MergedBy
-// and down are set only on a merged answer. Truncated and
-// totals carry the per peer cap detail of a merged answer.
-func pageGatewayEvents(rows []gatewayEvent, limit, offset int, mergedBy string, down []string, truncated []string, totals map[string]int) mergedEventsResponse {
+// and down are set only on a merged answer. Unverified and
+// skipped carry the merged answer peer split by cause. Down
+// holds only peers that did not answer. Truncated and totals
+// carry the per peer cap detail of a merged answer.
+func pageGatewayEvents(rows []gatewayEvent, limit, offset int, mergedBy string, down []string, unverified []string, skipped []string, truncated []string, totals map[string]int) mergedEventsResponse {
 	total := len(rows)
 	if offset > total {
 		offset = total
@@ -208,7 +239,7 @@ func pageGatewayEvents(rows []gatewayEvent, limit, offset int, mergedBy string, 
 	if page == nil {
 		page = []gatewayEvent{}
 	}
-	return mergedEventsResponse{Events: page, Total: total, Limit: limit, Offset: offset, MergedBy: mergedBy, Unreachable: down, Truncated: truncated, PeerTotals: totals}
+	return mergedEventsResponse{Events: page, Total: total, Limit: limit, Offset: offset, MergedBy: mergedBy, Unreachable: down, Unverified: unverified, Skipped: skipped, Truncated: truncated, PeerTotals: totals}
 }
 
 // sessionRow is one row of GET /v1/sessions. The group key is
@@ -262,6 +293,28 @@ func (px *Proxy) serveSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	rows := map[string]*sessionRow{}
 	agents := map[string]map[string]bool{}
+	// counted holds decision ids already counted as one
+	// denied or detected call. A drifted call writes a
+	// policy_decision and a tools_drift event under one id.
+	// Each would count alone. The second event under the
+	// same id counts nothing. An empty id counts as before.
+	// Old tools_drift events carry none. A tool_call or a
+	// proposal under the same id counts its own kind, so
+	// only denied and detected counts use this map.
+	counted := map[string]bool{}
+	countOnce := func(row *sessionRow, id string, detected bool) {
+		if id != "" {
+			if counted[id] {
+				return
+			}
+			counted[id] = true
+		}
+		if detected {
+			row.Detected++
+		} else {
+			row.Denied++
+		}
+	}
 	for _, e := range events {
 		// System rows are filtered by kind, not by session
 		// name. A session named "gateway" is rejected at
@@ -294,9 +347,9 @@ func (px *Proxy) serveSessions(w http.ResponseWriter, r *http.Request) {
 			}
 		case "policy_decision":
 			if e.Mode == "detect" && isRestrictive(e.Decision) {
-				row.Detected++
+				countOnce(row, e.DecisionID, true)
 			} else if e.Decision == "deny" {
-				row.Denied++
+				countOnce(row, e.DecisionID, false)
 			}
 		case "approval":
 			switch e.Decision {
@@ -314,11 +367,14 @@ func (px *Proxy) serveSessions(w http.ResponseWriter, r *http.Request) {
 			// mode the drift was observed and the call ran,
 			// so it counts as detected instead. A drift
 			// observation with no denial changes no count.
+			// A drift event that shares its decision id
+			// with the call's policy_decision is the same
+			// call. It counts nothing twice.
 			if e.Decision == "deny" {
 				if e.Mode == "detect" {
-					row.Detected++
+					countOnce(row, e.DecisionID, true)
 				} else {
-					row.Denied++
+					countOnce(row, e.DecisionID, false)
 				}
 			}
 		case "containment":
