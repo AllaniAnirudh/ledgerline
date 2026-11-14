@@ -1,9 +1,11 @@
 // Peer gateways feed the dashboard pull. Each peer keeps its
-// own SQLite chain. This gateway pulls the full peer chain and
+// own SQLite chain. This gateway pulls the peer chain and
 // verifies it here, with ledger.VerifyEvents. It never trusts
-// the peer own /v1/verify answer. A peer that does not answer
-// shows as down. It is never silent. The merged timeline sorts
-// by timestamp. It never claims one global chain order.
+// the peer own /v1/verify answer. A verified chain is cached
+// per peer. A later poll re-checks the chain ends and fetches
+// only the new suffix. A peer that does not answer shows as
+// down. It is never silent. The merged timeline sorts by
+// timestamp. It never claims one global chain order.
 package gateway
 
 import (
@@ -56,6 +58,100 @@ const peerVisitedHeader = "X-Ledgerline-Visited"
 // large to pull. Callers treat this as reachable but not
 // chain-ok. Other errors mean the peer did not answer.
 var errPeerChainInvalid = errors.New("peer chain did not verify locally")
+
+// cachedPeerChain is one verified peer chain. The chain was
+// verified in this process. Entries are never mutated after
+// they are stored. An update replaces the map value. Total is
+// the chain length. LastSeq and LastHash describe the last
+// event. They are the watermark for the next poll.
+type cachedPeerChain struct {
+	chain    []ledger.Event
+	total    int
+	lastSeq  uint64
+	lastHash string
+}
+
+// peerChainCache holds the verified chains for one gateway.
+// The mutex guards the map. No lock is ever held across a
+// network call. Callers copy an entry out, then release the
+// lock before they pull.
+type peerChainCache struct {
+	mu    sync.Mutex
+	byURL map[string]*cachedPeerChain
+}
+
+// peerChainCaches holds one cache per gateway. The Proxy type
+// lives in proxy.go, outside this lane, so the cache cannot
+// sit on the struct. The map is keyed by gateway pointer.
+// Each gateway gets its own cache. Entries are small. The
+// gateway count in one process stays low.
+var peerChainCaches sync.Map // *Proxy -> *peerChainCache
+
+// peerCache returns the verified-chain cache for this
+// gateway. It creates the cache on first use.
+func (px *Proxy) peerCache() *peerChainCache {
+	c, _ := peerChainCaches.LoadOrStore(px, &peerChainCache{byURL: map[string]*cachedPeerChain{}})
+	return c.(*peerChainCache)
+}
+
+// cachedPeerChainFor returns the cached chain for one peer
+// url, when one exists. The entry is never mutated after it
+// is stored, so the caller may read it without the lock.
+func (px *Proxy) cachedPeerChainFor(peerURL string) (*cachedPeerChain, bool) {
+	c := px.peerCache()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.byURL[peerURL]
+	return e, ok
+}
+
+// storePeerChain caches one verified chain. The chain is
+// copied, so later caller use cannot mutate the cache. The
+// stored total must equal the stored chain length.
+func (px *Proxy) storePeerChain(peerURL string, chain []ledger.Event, total int) {
+	cp := make([]ledger.Event, len(chain))
+	copy(cp, chain)
+	e := &cachedPeerChain{chain: cp, total: total}
+	if len(cp) > 0 {
+		e.lastSeq = cp[len(cp)-1].Seq
+		e.lastHash = cp[len(cp)-1].Hash
+	}
+	c := px.peerCache()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.byURL[peerURL] = e
+}
+
+// dropPeerChain removes the cached chain for one peer url.
+// A dropped chain is never served again. The next poll pulls
+// it from scratch.
+func (px *Proxy) dropPeerChain(peerURL string) {
+	c := px.peerCache()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.byURL, peerURL)
+}
+
+// sameEvent reports whether two events carry the same fields.
+// The watermark check compares the fetched first and last
+// events with the cached ends. Any field change counts as a
+// mismatch, even when the stored hash field is unchanged.
+func sameEvent(a, b ledger.Event) bool {
+	return a.Seq == b.Seq &&
+		a.Timestamp.Equal(b.Timestamp) &&
+		a.SessionID == b.SessionID &&
+		a.Kind == b.Kind &&
+		a.Tool == b.Tool &&
+		string(a.Args) == string(b.Args) &&
+		a.Decision == b.Decision &&
+		a.Actor == b.Actor &&
+		a.Mode == b.Mode &&
+		a.DecisionID == b.DecisionID &&
+		a.PolicyHash == b.PolicyHash &&
+		a.AgentID == b.AgentID &&
+		a.PrevHash == b.PrevHash &&
+		a.Hash == b.Hash
+}
 
 // PeerConfig is one entry in the peer gateways file. The file
 // holds tokens. Keep it readable only by the operator.
@@ -208,26 +304,115 @@ func (px *Proxy) fetchPeerEvents(p PeerConfig, q url.Values, visited map[string]
 	return r.Events, r.Total, nil
 }
 
-// fetchVerifiedPeerChain pulls one peer full chain and verifies
-// it here. The pull asks for the peer own events only, pages
-// through /v1/events, and runs ledger.VerifyEvents on the
-// whole chain. It never reads the peer /v1/verify answer. A
-// chain over the verify limit is refused without paging. A
-// chain that fails the local check is refused with
-// errPeerChainInvalid. A peer that does not answer returns a
-// plain fetch error.
+// fetchVerifiedPeerChain pulls one peer chain and verifies
+// it here. The pull asks for the peer own events only. It
+// never reads the peer /v1/verify answer. A chain over the
+// verify limit is refused without paging. A chain that fails
+// the local check is refused with errPeerChainInvalid. A peer
+// that does not answer returns a plain fetch error.
+//
+// A verified chain is cached per peer url. A later poll
+// probes the total first. When the total is unchanged, the
+// poll compares the fetched first and last events with the
+// cached ends. When both ends match, the cached chain is
+// served. No full pull runs. When the chain grew, the poll
+// fetches only the new suffix and verifies the cached chain
+// plus the suffix with ledger.VerifyEvents. The suffix fetch
+// is network only. The hash check still runs in this process,
+// because the ledger exposes no suffix-only verifier. On any
+// watermark mismatch, the cache is dropped and the chain is
+// pulled and verified from scratch. On any verification
+// failure, the cache is dropped and the peer reports
+// unverified. A chain over the limit is never cached as
+// verified. A cached chain is served only after its ends were
+// confirmed on this poll. A peer that rewrites middle history
+// while keeping the length and both ends bit-identical is not
+// caught by this check. That case needs a full pull.
 func (px *Proxy) fetchVerifiedPeerChain(p PeerConfig, visited map[string]bool) ([]ledger.Event, int, error) {
 	probe := url.Values{}
 	probe.Set("gateway", "local")
 	probe.Set("limit", "1")
 	probe.Set("offset", "0")
-	_, total, err := px.fetchPeerEvents(p, probe, visited)
+	probeEvents, total, err := px.fetchPeerEvents(p, probe, visited)
 	if err != nil {
 		return nil, 0, err
 	}
 	if total > peerVerifyMaxEvents {
+		px.dropPeerChain(p.URL)
 		return nil, total, fmt.Errorf("peer chain has %d events, over the %d-event local verify limit: %w", total, peerVerifyMaxEvents, errPeerChainInvalid)
 	}
+	if total == 0 {
+		px.storePeerChain(p.URL, nil, 0)
+		return []ledger.Event{}, 0, nil
+	}
+	cached, haveCache := px.cachedPeerChainFor(p.URL)
+	if haveCache && len(cached.chain) == cached.total {
+		switch {
+		case cached.total == total:
+			// The length is unchanged. Check both ends.
+			// The probe already fetched the first event.
+			// Fetch the last event next.
+			if len(probeEvents) == 1 && sameEvent(probeEvents[0], cached.chain[0]) {
+				tip := url.Values{}
+				tip.Set("gateway", "local")
+				tip.Set("limit", "1")
+				tip.Set("offset", strconv.Itoa(total-1))
+				tipEvents, tipTotal, tipErr := px.fetchPeerEvents(p, tip, visited)
+				if tipErr == nil {
+					if tipTotal == total && len(tipEvents) == 1 && sameEvent(tipEvents[0], cached.chain[len(cached.chain)-1]) {
+						out := make([]ledger.Event, len(cached.chain))
+						copy(out, cached.chain)
+						return out, total, nil
+					}
+					px.dropPeerChain(p.URL)
+				}
+				// A tip fetch error is a network failure,
+				// not a chain failure. Keep the cache and
+				// fall through to a full pull. The full
+				// pull either refreshes the cache or
+				// reports the fetch error.
+			} else {
+				px.dropPeerChain(p.URL)
+			}
+			return px.pullAndVerifyPeerChain(p, visited, total)
+		case cached.total < total:
+			// The chain grew. Fetch only the new suffix.
+			suffix, err := px.fetchPeerSuffix(p, visited, cached.total, total)
+			if err != nil {
+				if errors.Is(err, errPeerChainInvalid) {
+					px.dropPeerChain(p.URL)
+				}
+				return nil, total, err
+			}
+			full := make([]ledger.Event, 0, total)
+			full = append(full, cached.chain...)
+			full = append(full, suffix...)
+			if err := ledger.VerifyEvents(full); err != nil {
+				px.dropPeerChain(p.URL)
+				return nil, total, fmt.Errorf("peer chain failed local verify (%v): %w", err, errPeerChainInvalid)
+			}
+			px.storePeerChain(p.URL, full, total)
+			return full, total, nil
+		default:
+			// The chain shrank. A shorter chain is a
+			// watermark mismatch. Drop the cache and pull
+			// the chain from scratch.
+			px.dropPeerChain(p.URL)
+			return px.pullAndVerifyPeerChain(p, visited, total)
+		}
+	}
+	if haveCache {
+		px.dropPeerChain(p.URL)
+	}
+	return px.pullAndVerifyPeerChain(p, visited, total)
+}
+
+// pullAndVerifyPeerChain pulls one peer full chain and
+// verifies it here. The pull pages through /v1/events. A page
+// total that changes mid-pull refuses the chain. A short pull
+// refuses the chain. A failed local check refuses the chain
+// with errPeerChainInvalid. A verified chain is cached.
+func (px *Proxy) pullAndVerifyPeerChain(p PeerConfig, visited map[string]bool, total int) ([]ledger.Event, int, error) {
 	chain := make([]ledger.Event, 0, total)
 	for offset := 0; offset < total; offset += peerEventCap {
 		q := url.Values{}
@@ -239,17 +424,48 @@ func (px *Proxy) fetchVerifiedPeerChain(p PeerConfig, visited map[string]bool) (
 			return nil, total, err
 		}
 		if pageTotal != total {
+			px.dropPeerChain(p.URL)
 			return nil, total, fmt.Errorf("peer event total changed mid-pull (%d, was %d): %w", pageTotal, total, errPeerChainInvalid)
 		}
 		chain = append(chain, page...)
 	}
 	if len(chain) != total {
+		px.dropPeerChain(p.URL)
 		return nil, total, fmt.Errorf("peer chain pull short: got %d events, total %d: %w", len(chain), total, errPeerChainInvalid)
 	}
 	if err := ledger.VerifyEvents(chain); err != nil {
+		px.dropPeerChain(p.URL)
 		return nil, total, fmt.Errorf("peer chain failed local verify (%v): %w", err, errPeerChainInvalid)
 	}
+	px.storePeerChain(p.URL, chain, total)
 	return chain, total, nil
+}
+
+// fetchPeerSuffix pulls only the events a cached chain does
+// not hold yet, from offset from to the total. A page total
+// that changes mid-pull refuses the suffix. A short suffix
+// pull refuses the suffix. Both failures carry
+// errPeerChainInvalid. A plain fetch error passes through.
+func (px *Proxy) fetchPeerSuffix(p PeerConfig, visited map[string]bool, from, total int) ([]ledger.Event, error) {
+	out := make([]ledger.Event, 0, total-from)
+	for offset := from; offset < total; offset += peerEventCap {
+		q := url.Values{}
+		q.Set("gateway", "local")
+		q.Set("limit", strconv.Itoa(peerEventCap))
+		q.Set("offset", strconv.Itoa(offset))
+		page, pageTotal, err := px.fetchPeerEvents(p, q, visited)
+		if err != nil {
+			return nil, err
+		}
+		if pageTotal != total {
+			return nil, fmt.Errorf("peer event total changed mid-pull (%d, was %d): %w", pageTotal, total, errPeerChainInvalid)
+		}
+		out = append(out, page...)
+	}
+	if len(out) != total-from {
+		return nil, fmt.Errorf("peer chain suffix pull short: got %d events, want %d: %w", len(out), total-from, errPeerChainInvalid)
+	}
+	return out, nil
 }
 
 // peerStatusFor builds one peer row. The chain is verified
@@ -326,10 +542,14 @@ type gatewayEvent struct {
 // mergedEventsResponse is the shape of a merged GET /v1/events
 // answer. MergedBy is set only when the timeline merges more
 // than one source. Unreachable names peers that did not answer
-// during the merge. Their events are absent, not silent.
-// Truncated names peers whose filtered events passed the per
-// peer cap, so only their newest rows are present. PeerTotals
-// holds each pulled peer filtered total before the cap.
+// during the merge. Unverified names peers that answered but
+// whose chain did not verify here. Skipped names peers that
+// were already visited in this pull chain. Their events are
+// absent, not silent. The three lists never overlap. A peer
+// lands in exactly one list. Truncated names peers whose
+// filtered events passed the per peer cap, so only their
+// newest rows are present. PeerTotals holds each pulled peer
+// filtered total before the cap.
 type mergedEventsResponse struct {
 	Events      []gatewayEvent `json:"events"`
 	Total       int            `json:"total"`
@@ -337,14 +557,20 @@ type mergedEventsResponse struct {
 	Offset      int            `json:"offset"`
 	MergedBy    string         `json:"merged_by,omitempty"`
 	Unreachable []string       `json:"unreachable,omitempty"`
+	Unverified  []string       `json:"unverified,omitempty"`
+	Skipped     []string       `json:"skipped,omitempty"`
 	Truncated   []string       `json:"truncated,omitempty"`
 	PeerTotals  map[string]int `json:"peer_totals,omitempty"`
 }
 
 // peerMergeInfo carries the per peer cap detail of a merge.
+// It also carries the peers that contributed nothing, split
+// by cause: unverified chains and cycle skips.
 type peerMergeInfo struct {
-	truncated []string
-	totals    map[string]int
+	truncated  []string
+	totals     map[string]int
+	unverified []string
+	skipped    []string
 }
 
 // filterFromQuery parses the caller event filters out of a
@@ -373,9 +599,11 @@ func filterFromQuery(q url.Values) eventFilter {
 // chain fails verification contributes nothing. Rows sort by
 // timestamp. Ties sort by gateway name, then by chain
 // sequence. The result is stable. A down peer contributes
-// nothing and is named in the returned list. A peer already
-// in the visited set is skipped, never pulled. That stops
-// mutual peers from recursing.
+// nothing and is named in the returned list. A peer whose
+// chain did not verify is named in info.unverified, not in
+// the down list. A peer already in the visited set is
+// skipped, never pulled, and is named in info.skipped. That
+// stops mutual peers from recursing.
 func (px *Proxy) mergePeerEvents(q url.Values, local []ledger.Event, visited map[string]bool) ([]gatewayEvent, []string, peerMergeInfo) {
 	px.peersMu.RLock()
 	peers := px.peers
@@ -423,12 +651,16 @@ func (px *Proxy) mergePeerEvents(q url.Values, local []ledger.Event, visited map
 	var down []string
 	info := peerMergeInfo{totals: map[string]int{}}
 	for i, p := range peers {
-		if results[i].err != nil {
-			down = append(down, p.Name)
+		if results[i].skipped {
+			info.skipped = append(info.skipped, p.Name)
 			continue
 		}
-		if results[i].skipped {
-			down = append(down, p.Name)
+		if results[i].err != nil {
+			if errors.Is(results[i].err, errPeerChainInvalid) {
+				info.unverified = append(info.unverified, p.Name)
+			} else {
+				down = append(down, p.Name)
+			}
 			continue
 		}
 		info.totals[p.Name] = results[i].total

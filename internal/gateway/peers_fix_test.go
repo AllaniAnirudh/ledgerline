@@ -108,9 +108,12 @@ func TestFabricatedPeerNeverChainOK(t *testing.T) {
 	}
 
 	// The invented event must not reach the merged timeline.
+	// The peer answered, so it is unverified, not
+	// unreachable.
 	type mergedResp struct {
 		Events      []gatewayEvent `json:"events"`
 		Unreachable []string       `json:"unreachable"`
+		Unverified  []string       `json:"unverified"`
 	}
 	code, raw = getAPI(t, px, "/v1/events")
 	if code != http.StatusOK {
@@ -125,20 +128,34 @@ func TestFabricatedPeerNeverChainOK(t *testing.T) {
 			t.Fatalf("invented peer event reached the merged timeline: %+v", e)
 		}
 	}
-	found := false
 	for _, n := range m.Unreachable {
+		if n == "fab" {
+			t.Fatalf("unreachable = %v, must not name fab: the peer answered", m.Unreachable)
+		}
+	}
+	found := false
+	for _, n := range m.Unverified {
 		if n == "fab" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("unreachable = %v, want it to name fab", m.Unreachable)
+		t.Fatalf("unverified = %v, want it to name fab", m.Unverified)
 	}
 
 	// A direct pull of the fabricated peer must refuse too.
-	code, _ = getAPI(t, px, "/v1/events?gateway=fab")
-	if code != http.StatusBadGateway {
-		t.Fatalf("direct fabricated pull: want 502, got %d", code)
+	// The peer answered, so the answer is a 422 that names
+	// it unverified, not a 502.
+	code, raw = getAPI(t, px, "/v1/events?gateway=fab")
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("direct fabricated pull: want 422, got %d (%s)", code, raw)
+	}
+	var direct peerChainErrorResponse
+	if err := json.Unmarshal(raw, &direct); err != nil {
+		t.Fatal(err)
+	}
+	if direct.Gateway != "fab" || !direct.Reachable || direct.ChainOK || direct.ChainError == "" {
+		t.Fatalf("direct fabricated pull body: want fab reachable with chain_ok false, got %+v", direct)
 	}
 }
 
@@ -428,5 +445,38 @@ func TestLoadPeersFileRefusesRemotePlainHTTP(t *testing.T) {
 		if _, err := LoadPeersFile(write(fmt.Sprintf("ok%d.json", i), body)); err != nil {
 			t.Fatalf("case %d must load, got %v", i, err)
 		}
+	}
+}
+
+func TestMergedCyclePeerIsSkippedNotUnreachable(t *testing.T) {
+	px, _ := testProxy(t)
+	px.SetAPIToken("s3cret")
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		writePagedEvents(w, r, chainEvents(t, "peer_tool"))
+	}))
+	t.Cleanup(srv.Close)
+	px.SetPeers([]PeerConfig{{Name: "cyc", URL: srv.URL}})
+
+	// The peer url is already visited. The merge must skip
+	// it, never pull it, and name it skipped. It must not
+	// land in unreachable.
+	visited := map[string]bool{srv.URL: true}
+	merged, down, info := px.mergePeerEvents(url.Values{}, nil, visited)
+	if len(merged) != 0 {
+		t.Fatalf("merged = %v, want no rows", merged)
+	}
+	if len(down) != 0 {
+		t.Fatalf("unreachable = %v, want none: the peer was skipped, not down", down)
+	}
+	if len(info.skipped) != 1 || info.skipped[0] != "cyc" {
+		t.Fatalf("skipped = %v, want [cyc]", info.skipped)
+	}
+	if len(info.unverified) != 0 {
+		t.Fatalf("unverified = %v, want none", info.unverified)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("peer hits = %d, want 0: a skipped peer is never pulled", hits.Load())
 	}
 }
