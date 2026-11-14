@@ -180,15 +180,12 @@ func TestPeersCoverageRows(t *testing.T) {
 	postTool(t, px, "read_file")
 	postTool(t, px, "exec")
 
-	now := time.Now().UTC()
-	up := fakePeer(t, "peer-tok", true, "", []ledger.Event{
-		peerEvent(0, now.Add(-time.Hour), "read_file", "allow"),
-		peerEvent(1, now, "read_file", "allow"),
-		peerEvent(2, now.Add(time.Hour), "read_file", "allow"),
-	})
-	broken := fakePeer(t, "", false, "chain broken at seq 4", []ledger.Event{
-		peerEvent(0, now, "read_file", "allow"),
-	})
+	up := fakePeer(t, "peer-tok", true, "", chainEvents(t, "read_file", "read_file", "read_file"))
+	// The broken peer claims its chain is fine, but one event
+	// is tampered, so the local check must fail it.
+	brokenChain := chainEvents(t, "read_file")
+	brokenChain[0].Tool = "evil_tool"
+	broken := fakePeer(t, "", true, "", brokenChain)
 	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	downURL := down.URL
 	down.Close()
@@ -229,8 +226,8 @@ func TestPeersCoverageRows(t *testing.T) {
 		t.Fatal("up row needs a last sync time")
 	}
 	brokenRow := byName["broken"]
-	if !brokenRow.Reachable || brokenRow.ChainOK || brokenRow.ChainError != "chain broken at seq 4" {
-		t.Fatalf("broken row: want reachable with chain failure, got %+v", brokenRow)
+	if !brokenRow.Reachable || brokenRow.ChainOK || !strings.Contains(brokenRow.ChainError, "hash mismatch") {
+		t.Fatalf("broken row: want reachable with a local chain failure, got %+v", brokenRow)
 	}
 	downRow := byName["down"]
 	if downRow.Reachable || downRow.Error == "" {
@@ -251,11 +248,7 @@ func TestMergedEvents(t *testing.T) {
 	postTool(t, px, "read_file") // local allow, timestamp near now
 	postTool(t, px, "exec")      // local deny, timestamp near now
 
-	now := time.Now().UTC()
-	up := fakePeer(t, "", true, "", []ledger.Event{
-		peerEvent(0, now.Add(-2*time.Hour), "old_tool", "allow"),
-		peerEvent(1, now.Add(2*time.Hour), "new_tool", "allow"),
-	})
+	up := fakePeer(t, "", true, "", chainEvents(t, "old_tool", "new_tool"))
 	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	downURL := down.URL
 	down.Close()
@@ -300,11 +293,12 @@ func TestMergedEvents(t *testing.T) {
 			t.Fatalf("merged timeline is not sorted by timestamp: %+v", r.Events)
 		}
 	}
-	if r.Events[0].Gateway != "up" || r.Events[0].Tool != "old_tool" {
-		t.Fatalf("first merged row should be the old peer event, got %+v", r.Events[0])
+	seenTools := map[string]bool{}
+	for _, e := range r.Events {
+		seenTools[e.Tool] = true
 	}
-	if r.Events[len(r.Events)-1].Gateway != "up" || r.Events[len(r.Events)-1].Tool != "new_tool" {
-		t.Fatalf("last merged row should be the new peer event, got %+v", r.Events[len(r.Events)-1])
+	if !seenTools["old_tool"] || !seenTools["new_tool"] {
+		t.Fatalf("merged rows must carry both peer tools, got %+v", r.Events)
 	}
 	seen := map[string]bool{}
 	for _, e := range r.Events {
