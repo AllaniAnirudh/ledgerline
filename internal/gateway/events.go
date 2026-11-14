@@ -286,6 +286,14 @@ func (px *Proxy) serveSessions(w http.ResponseWriter, r *http.Request) {
 	out := make([]sessionRow, 0, len(rows))
 	now := time.Now().UTC()
 	for _, row := range rows {
+		// System events carry no agent session. The tools
+		// baseline and drift writers use an empty session.
+		// Token revokes, policy changes, and upstream
+		// re-approvals write under "gateway". Neither is an
+		// agent session. The roster shows agent sessions only.
+		if row.SessionID == "" || row.SessionID == "gateway" {
+			continue
+		}
 		ids := make([]string, 0, len(agents[row.SessionID]))
 		for id := range agents[row.SessionID] {
 			ids = append(ids, id)

@@ -463,3 +463,39 @@ rules:
 		t.Fatalf("s2 agent ids: want [agent-2], got %v", s2.AgentIDs)
 	}
 }
+
+// TestSessionsSkipsSystemSessions checks that system events
+// never appear as roster rows. The tools baseline writes with
+// an empty session. Token revokes and policy changes write
+// under "gateway". Neither is an agent session.
+func TestSessionsSkipsSystemSessions(t *testing.T) {
+	p, err := policy.Parse([]byte(`
+version: 1
+default: allow
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	px, _ := authProxy(t, p)
+	tok := mintAgent(t, "agent-1", time.Hour)
+	if _, err := px.Ledger().Append("", "tools_baseline", "", nil, "establish", "gateway"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := px.Ledger().Append("gateway", "token_revoked", "(token)", nil, "revoke", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := postToolAuth(t, px, "read_file", "s1", tok); code != 200 {
+		t.Fatalf("read: want 200, got %d", code)
+	}
+	code, raw := getAPI(t, px, "/v1/sessions")
+	if code != http.StatusOK {
+		t.Fatalf("GET /v1/sessions: want 200, got %d (%s)", code, raw)
+	}
+	var rows []sessionRow
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].SessionID != "s1" {
+		t.Fatalf("sessions: want only s1, got %v", rows)
+	}
+}
