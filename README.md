@@ -284,6 +284,14 @@ go build -o ledgerline ./cmd/ledgerline
 # upstream URL. A token with an audience works only on a
 # gateway that fronts that upstream. A token with no audience
 # is a legacy token. It works on any gateway until it expires.
+# The audience is the upstream URL exactly as configured.
+# Spell it the same way on every restart. A different spelling
+# breaks all audience-bound tokens. Use --token-audience to set
+# a fixed audience instead of the upstream URL. Use
+# --token-strict-audience to refuse tokens with no audience.
+# Turn strict mode on only after every client holds an
+# audience-bound token. Mint one with:
+#   ./ledgerline token issue --agent agent-1 --owner buppy --aud <audience> --key-file token.key
 # Turn checks on at the gateway. The flag without a key refuses
 # to start:
 #   ./ledgerline gateway ... --token-key-file token.key --require-agent-token

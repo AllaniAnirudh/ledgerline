@@ -114,9 +114,9 @@ func IssueWithAudience(key []byte, agentID, owner string, ttl time.Duration, aud
 
 // Validate checks a token against a key. It checks the shape,
 // the signature, the agent id, the jti, and the expiry. It
-// returns the claims when every check passes. It enforces no
-// audience. A token that carries an audience is refused. Use
-// ValidateWithAudience when the gateway has an audience.
+// returns the claims when every check passes. It expects no
+// audience. A token that carries an audience is refused here.
+// Use ValidateWithAudience when the gateway has an audience.
 func Validate(key []byte, tok string) (*Claims, error) {
 	return ValidateWithAudience(key, tok, "")
 }
