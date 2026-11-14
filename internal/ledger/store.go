@@ -13,6 +13,7 @@ import (
 // (unknown, resolved). The table is the execution journal itself.
 type Store interface {
 	Append(sessionID, kind, tool string, args json.RawMessage, decision, actor string) (Event, error)
+	AppendDetailed(sessionID, kind, tool string, args json.RawMessage, decision, actor string, detail EventDetail) (Event, error)
 	Events() ([]Event, error)
 	EventsBySession(sessionID string) ([]Event, error)
 	Verify() error

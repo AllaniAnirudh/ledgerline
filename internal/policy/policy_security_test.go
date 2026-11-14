@@ -47,7 +47,7 @@ rules:
 		{`{"body":"hello"}`, Allow},
 	}
 	for _, c := range cases {
-		if got, _ := p.DecideCall("send_email", json.RawMessage(c.args)); got != c.want {
+		if got, _, _ := p.DecideCall("send_email", json.RawMessage(c.args)); got != c.want {
 			t.Errorf("args %s: got %v, want %v", c.args, got, c.want)
 		}
 	}
@@ -71,7 +71,7 @@ func TestArgsMatchFailsClosedOnShape(t *testing.T) {
 		{`{"file":{"path":"/tmp/x"}}`, Allow},            // nested, but value does not match
 	}
 	for _, c := range cases {
-		if got, _ := p.DecideCall("write_file", json.RawMessage(c.args)); got != c.want {
+		if got, _, _ := p.DecideCall("write_file", json.RawMessage(c.args)); got != c.want {
 			t.Errorf("args %s: got %v, want %v", c.args, got, c.want)
 		}
 	}
@@ -87,10 +87,10 @@ rules:
     args_match:
       file.path: "/etc/**"
 `)
-	if got, _ := p.DecideCall("write_file", json.RawMessage(`{"file":{"path":"/etc/passwd"}}`)); got != Hold {
+	if got, _, _ := p.DecideCall("write_file", json.RawMessage(`{"file":{"path":"/etc/passwd"}}`)); got != Hold {
 		t.Errorf("dotted path nested match: got %v, want hold", got)
 	}
-	if got, _ := p.DecideCall("write_file", json.RawMessage(`{"file":{"path":"/tmp/x"}}`)); got != Allow {
+	if got, _, _ := p.DecideCall("write_file", json.RawMessage(`{"file":{"path":"/tmp/x"}}`)); got != Allow {
 		t.Errorf("dotted path nested miss: got %v, want allow", got)
 	}
 }
@@ -99,11 +99,11 @@ func TestRecursiveGlob(t *testing.T) {
 	p := mustParse(t, holdEtc)
 	for _, path := range []string{"/etc/hosts", "/etc/cron.d/evil", "/etc/a/b/c/d"} {
 		args := json.RawMessage(`{"path":"` + path + `"}`)
-		if got, _ := p.DecideCall("write_file", args); got != Hold {
+		if got, _, _ := p.DecideCall("write_file", args); got != Hold {
 			t.Errorf("path %s: got %v, want hold", path, got)
 		}
 	}
-	if got, _ := p.DecideCall("write_file", json.RawMessage(`{"path":"/etcx/hosts"}`)); got != Allow {
+	if got, _, _ := p.DecideCall("write_file", json.RawMessage(`{"path":"/etcx/hosts"}`)); got != Allow {
 		t.Errorf("/etcx should not match /etc/**: got %v", got)
 	}
 }
@@ -120,10 +120,10 @@ rules:
 `)
 	// Duplicate keys: the allow rule cannot be evaluated. It must
 	// not grant. The deny default applies.
-	if got, _ := p.DecideCall("write_file", json.RawMessage(`{"path":"/tmp/x","path":"/tmp/x"}`)); got != Deny {
+	if got, _, _ := p.DecideCall("write_file", json.RawMessage(`{"path":"/tmp/x","path":"/tmp/x"}`)); got != Deny {
 		t.Errorf("allow rule with broken args: got %v, want deny (default)", got)
 	}
-	if got, _ := p.DecideCall("write_file", json.RawMessage(`{"path":"/tmp/x"}`)); got != Allow {
+	if got, _, _ := p.DecideCall("write_file", json.RawMessage(`{"path":"/tmp/x"}`)); got != Allow {
 		t.Errorf("clean allow: got %v, want allow", got)
 	}
 }

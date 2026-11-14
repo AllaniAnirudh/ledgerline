@@ -162,6 +162,70 @@ func TestDecideHookStandaloneContainPropose(t *testing.T) {
 	}
 }
 
+func TestDecideHookStandaloneDetectDenyAllows(t *testing.T) {
+	p, err := policy.Parse([]byte("version: 1\nrules:\n  - tool: bash\n    action: deny\n    mode: detect\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := ledger.New()
+	out := decideHookStandalone(store, p, nil, "s1", "bash", json.RawMessage(`{}`))
+	if !out.allow {
+		t.Fatalf("deny in detect should allow, got %+v", out)
+	}
+	events, err := store.Events()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("want 2 ledger events, got %d: %+v", len(events), events)
+	}
+	pd, tc := events[0], events[1]
+	if pd.Kind != "policy_decision" || pd.Decision != "deny" || pd.Mode != "detect" || pd.DecisionID == "" || pd.PolicyHash != p.Hash() {
+		t.Fatalf("policy_decision = %+v, want deny/detect with id and policy hash", pd)
+	}
+	if tc.Kind != "tool_call" || tc.Decision != "allow" || tc.Mode != "detect" || tc.DecisionID != pd.DecisionID {
+		t.Fatalf("tool_call = %+v, want allow/detect with the same id", tc)
+	}
+}
+
+func TestDecideHookStandaloneDetectHoldContainProposeAllow(t *testing.T) {
+	for _, action := range []string{"hold", "contain", "propose"} {
+		p, err := policy.Parse([]byte("version: 1\nrules:\n  - tool: bash\n    action: " + action + "\n    mode: detect\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		store := ledger.New()
+		out := decideHookStandalone(store, p, nil, "s1", "bash", json.RawMessage(`{}`))
+		if !out.allow {
+			t.Fatalf("%s in detect should allow, got %+v", action, out)
+		}
+		events, err := store.Events()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) < 2 {
+			t.Fatalf("%s in detect should record at least 2 events, got %d", action, len(events))
+		}
+		pd := events[0]
+		if pd.Kind != "policy_decision" || pd.Decision != action || pd.Mode != "detect" || pd.DecisionID == "" {
+			t.Fatalf("policy_decision = %+v, want %s/detect with id", pd, action)
+		}
+		tc := events[len(events)-1]
+		if tc.Kind != "tool_call" || tc.Decision != "allow" || tc.DecisionID != pd.DecisionID {
+			t.Fatalf("tool_call = %+v, want allow with the same id", tc)
+		}
+		if action == "propose" {
+			if len(events) != 3 {
+				t.Fatalf("propose in detect should record 3 events, got %d", len(events))
+			}
+			pr := events[1]
+			if pr.Kind != "proposal" || pr.Mode != "detect" || pr.DecisionID != pd.DecisionID {
+				t.Fatalf("proposal = %+v, want mode detect with the same id", pr)
+			}
+		}
+	}
+}
+
 func TestDecideHookStandaloneLedgerFailure(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "closed.db")
 	store, err := ledger.OpenSQLite(dbPath)

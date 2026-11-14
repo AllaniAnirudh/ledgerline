@@ -77,6 +77,20 @@ go build -o ledgerline ./cmd/ledgerline
 #   ./ledgerline proposals
 #   ./ledgerline apply <proposal-id>
 #   ./ledgerline deny <proposal-id>
+# Detection mode: a rule can observe instead of enforce.
+# Set mode: detect on a rule. A deny, hold, contain, or propose
+# rule in detect mode lets the call run. The ledger records a
+# policy_decision event with the would-be action and mode detect.
+# Then it records a tool_call event with decision allow. Both
+# events share one decision id. A detected hold queues nothing
+# and asks no human. A detected contain freezes nothing. A
+# detected propose records a proposal marked detected and never
+# queues it. A human must never apply a call that already ran.
+# A rule with no mode means prevent. New rules start in detect
+# mode. Flip a rule to prevent only after a review window with
+# zero false positives. Every policy_decision event also carries
+# the policy hash. The hash is the SHA-256 of the policy file.
+# It says which policy version made the decision.
 
 # Pin the upstream server. A changed upstream then cannot slip
 # in silently. The first run writes the pin. Later runs refuse
@@ -260,7 +274,7 @@ go build -o ledgerline ./cmd/ledgerline
 - `cmd/ledgerline` holds the CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `idempotency`, `resolve`, `tools`, `accept-tools`, `export`, `verify`, `run`, `hook`
 - `internal/gateway` is the boundary proxy. It intercepts `tools/call`. It consults policy. It holds calls for approval. It contains sessions. It records proposals. It brokers upstream credentials. It forwards the rest. It serves the `/v1/*` API, the `/approvals` page, and `/replay`
 - `internal/ledger` holds the `Store` interface, the in-memory chain, the SQLite backend, and chain verification
-- `internal/policy` makes allow/deny/hold/contain/propose decisions from a YAML policy file or static lists. The YAML file uses ordered rules, glob tool names, and decoded-JSON argument matching that fails closed. It has a configurable default. Static list entries are tool globs
+- `internal/policy` makes allow/deny/hold/contain/propose decisions from a YAML policy file or static lists. The YAML file uses ordered rules, glob tool names, and decoded-JSON argument matching that fails closed. It has a configurable default. Static list entries are tool globs. Each rule carries a mode: prevent enforces the action, detect only records what would have happened and lets the call run. A rule with no mode means prevent
 - `internal/pty` is PTY co-capture. It runs a command. It witnesses terminal output into the same ledger
 - `internal/replay` is offline bundle export and the timeline viewer. Bundles are prefix-closed, so the chain verifies
 - `docs/VISION.md` is the full vision and architecture doc
@@ -281,6 +295,7 @@ Honest limits of the current build (also in `SECURITY.md`):
 - Proposal "apply" records claim a human applied the action out of band. With no control-plane token, anyone who can reach the port can create that record. Treat no-token local use as single-user only.
 - Idempotency is per key, per session, for 24 hours, up to 1000 journal records. A replay bypasses current policy by design. The same key means the same call. A replay never bypasses containment. A resolved-executed key never re-forwards, even if the resolution was wrong. The human owns that call, not the gateway. Journal rows are durable, not hash-chained. Only the unknown and resolved transitions go into the chain.
 - Tools-drift enforcement denies unknown tool names only. It acts only once a baseline exists. The first sighting is trusted (TOFU). A server already compromised before the first gateway start baselines its malicious tools. A tools/list response the gateway cannot parse changes nothing. In-memory mode loses the baseline on restart. The stored baseline row is not covered by chain verification. A process that can write the ledger DB can rewrite it while verify stays green. This is the same conceded DB-write power as the chain itself. Session bundles exclude gateway-wide baseline and drift events. The full chain holds them.
+- Ledger events carry mode, decision id, policy hash, and agent id (schema v3). Old v1 and v2 chains still verify. A database from an older build migrates on open. Detection mode doubles the events per matched call: one policy_decision plus one tool_call.
 
 ## Dogfood note
 

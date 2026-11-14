@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AllaniAnirudh/ledgerline/internal/ledger"
 	"github.com/AllaniAnirudh/ledgerline/internal/policy"
 )
 
@@ -82,7 +83,7 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 	// witness records those arguments. This matches the proxy
 	// path.
 	if px.broker != nil && px.broker.ContainsSecret(args) {
-		if _, err := px.ledger.Append(session, "policy_decision", tool, nil, "deny", ""); err != nil {
+		if _, err := px.appendPolicyDecision(session, tool, "deny", policy.ModePrevent); err != nil {
 			http.Error(w, "ledgerline: ledger unavailable, boundary closed", http.StatusServiceUnavailable)
 			return
 		}
@@ -90,10 +91,26 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	decision, reason := px.policy.DecideCall(tool, args)
-	if _, err := px.ledger.Append(session, "policy_decision", tool, nil, decision.String(), ""); err != nil {
+	decision, reason, mode := px.policy.DecideCall(tool, args)
+	// Detect mode changes every restrictive action the same way
+	// as the proxy path. The call is allowed. The ledger records
+	// the would-be decision first, then the tool_call that ran.
+	// Both carry one decision id. Hold in detect queues nothing.
+	// Contain in detect freezes nothing. Propose in detect
+	// records a proposal marked detected and never queues it.
+	detect := mode == policy.ModeDetect && decision != policy.Allow
+	decisionID, err := px.appendPolicyDecision(session, tool, decision.String(), mode)
+	if err != nil {
 		http.Error(w, "ledgerline: ledger unavailable, boundary closed", http.StatusServiceUnavailable)
 		return
+	}
+	detectDetail := ledger.EventDetail{Mode: mode.String(), DecisionID: decisionID}
+	allowDetected := func() {
+		if _, err := px.ledger.AppendDetailed(session, "tool_call", tool, args, "allow", "", detectDetail); err != nil {
+			http.Error(w, "ledgerline: ledger unavailable, boundary closed", http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, hookDecision{Decision: "allow"})
 	}
 	switch decision {
 	case policy.Allow:
@@ -103,12 +120,20 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, hookDecision{Decision: "allow"})
 	case policy.Deny:
+		if detect {
+			allowDetected()
+			return
+		}
 		msg := "ledgerline: tool call denied by policy"
 		if reason != "" {
 			msg += ": " + reason
 		}
 		writeJSON(w, hookDecision{Decision: "deny", Reason: msg})
 	case policy.Contain:
+		if detect {
+			allowDetected()
+			return
+		}
 		msg := "ledgerline: session contained by policy"
 		if reason != "" {
 			msg += ": " + reason
@@ -116,6 +141,17 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 		px.Contain(session, "", reason)
 		writeJSON(w, hookDecision{Decision: "deny", Reason: msg})
 	case policy.Propose:
+		if detect {
+			// Record the proposal, marked detected. Do not
+			// queue it. A human must never apply a call that
+			// already ran.
+			if _, err := px.ledger.AppendDetailed(session, "proposal", tool, args, "propose", "", detectDetail); err != nil {
+				http.Error(w, "ledgerline: ledger unavailable, boundary closed", http.StatusServiceUnavailable)
+				return
+			}
+			allowDetected()
+			return
+		}
 		pr, isNew, err := px.proposals.AddDedup(session, tool, args)
 		if err != nil {
 			http.Error(w, "ledgerline: proposal queue full, boundary closed", http.StatusServiceUnavailable)
@@ -134,6 +170,10 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, hookDecision{Decision: "deny", Reason: text})
 	case policy.Hold:
+		if detect {
+			allowDetected()
+			return
+		}
 		writeJSON(w, px.hookHold(r, session, tool, args))
 	default:
 		writeJSON(w, hookDecision{Decision: "deny", Reason: "ledgerline: unknown policy decision"})

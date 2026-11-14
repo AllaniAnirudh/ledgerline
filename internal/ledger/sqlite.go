@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS events (
 	args       TEXT,
 	decision   TEXT,
 	actor      TEXT,
+	mode       TEXT NOT NULL DEFAULT '',
+	decision_id TEXT NOT NULL DEFAULT '',
+	policy_hash TEXT NOT NULL DEFAULT '',
+	agent_id   TEXT NOT NULL DEFAULT '',
 	prev_hash  TEXT NOT NULL,
 	hash       TEXT NOT NULL
 );
@@ -58,13 +62,20 @@ CREATE TABLE IF NOT EXISTS idempotency (
 `
 
 // OpenSQLite opens the ledger database at path. It creates the
-// database if needed.
+// database if needed. It migrates a pre-v3 database to the v3
+// event schema. The migration adds the new columns and stamps
+// PRAGMA user_version = 3. It runs once. A later open sees
+// version 3 and skips it.
 func OpenSQLite(path string) (*SQLiteStore, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := migrateToV3(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -78,12 +89,60 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	return &SQLiteStore{db: db}, nil
 }
 
+// migrateToV3 adds the v3 event columns to a database created by
+// an older build. It checks each column first, so a partial past
+// run cannot fail it. It stamps user_version = 3 when done.
+// Fresh databases already carry the columns from the schema.
+// They only get the stamp.
+func migrateToV3(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(events)`)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, col := range []string{"mode", "decision_id", "policy_hash", "agent_id"} {
+		if have[col] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE events ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("migrate events to v3: %w", err)
+		}
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
+		return fmt.Errorf("migrate events to v3: %w", err)
+	}
+	return nil
+}
+
 // Close releases the database.
 func (s *SQLiteStore) Close() error { return s.db.Close() }
 
 // Append records one event inside a transaction. The chain can
 // never fork under concurrency.
 func (s *SQLiteStore) Append(sessionID, kind, tool string, args json.RawMessage, decision, actor string) (Event, error) {
+	return s.AppendDetailed(sessionID, kind, tool, args, decision, actor, EventDetail{})
+}
+
+// AppendDetailed records one event with extra fields inside a
+// transaction. The chain can never fork under concurrency.
+func (s *SQLiteStore) AppendDetailed(sessionID, kind, tool string, args json.RawMessage, decision, actor string, detail EventDetail) (Event, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return Event{}, err
@@ -100,15 +159,19 @@ func (s *SQLiteStore) Append(sessionID, kind, tool string, args json.RawMessage,
 	}
 
 	e := Event{
-		Seq:       uint64(lastSeq + 1),
-		Timestamp: time.Now().UTC(),
-		SessionID: sessionID,
-		Kind:      kind,
-		Tool:      tool,
-		Args:      args,
-		Decision:  decision,
-		Actor:     actor,
-		PrevHash:  prevHash,
+		Seq:        uint64(lastSeq + 1),
+		Timestamp:  time.Now().UTC(),
+		SessionID:  sessionID,
+		Kind:       kind,
+		Tool:       tool,
+		Args:       args,
+		Decision:   decision,
+		Actor:      actor,
+		Mode:       detail.Mode,
+		DecisionID: detail.DecisionID,
+		PolicyHash: detail.PolicyHash,
+		AgentID:    detail.AgentID,
+		PrevHash:   prevHash,
 	}
 	e.Hash = hashEvent(e)
 
@@ -118,10 +181,10 @@ func (s *SQLiteStore) Append(sessionID, kind, tool string, args json.RawMessage,
 		argsStr = &a
 	}
 	_, err = tx.Exec(
-		`INSERT INTO events(seq, timestamp, session_id, kind, tool, args, decision, actor, prev_hash, hash)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO events(seq, timestamp, session_id, kind, tool, args, decision, actor, mode, decision_id, policy_hash, agent_id, prev_hash, hash)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.Seq, e.Timestamp.Format(time.RFC3339Nano), e.SessionID, e.Kind,
-		e.Tool, argsStr, e.Decision, e.Actor, e.PrevHash, e.Hash)
+		e.Tool, argsStr, e.Decision, e.Actor, e.Mode, e.DecisionID, e.PolicyHash, e.AgentID, e.PrevHash, e.Hash)
 	if err != nil {
 		return Event{}, err
 	}
@@ -133,12 +196,12 @@ func (s *SQLiteStore) Append(sessionID, kind, tool string, args json.RawMessage,
 
 // Events returns the whole chain in order.
 func (s *SQLiteStore) Events() ([]Event, error) {
-	return s.query(`SELECT seq, timestamp, session_id, kind, tool, args, decision, actor, prev_hash, hash FROM events ORDER BY seq`)
+	return s.query(`SELECT seq, timestamp, session_id, kind, tool, args, decision, actor, mode, decision_id, policy_hash, agent_id, prev_hash, hash FROM events ORDER BY seq`)
 }
 
 // EventsBySession returns one session's events in order.
 func (s *SQLiteStore) EventsBySession(sessionID string) ([]Event, error) {
-	return s.query(`SELECT seq, timestamp, session_id, kind, tool, args, decision, actor, prev_hash, hash FROM events WHERE session_id = ? ORDER BY seq`, sessionID)
+	return s.query(`SELECT seq, timestamp, session_id, kind, tool, args, decision, actor, mode, decision_id, policy_hash, agent_id, prev_hash, hash FROM events WHERE session_id = ? ORDER BY seq`, sessionID)
 }
 
 func (s *SQLiteStore) query(q string, args ...any) ([]Event, error) {
@@ -153,7 +216,7 @@ func (s *SQLiteStore) query(q string, args ...any) ([]Event, error) {
 		var e Event
 		var ts, argsStr sql.NullString
 		var tool, decision, actor sql.NullString
-		if err := rows.Scan(&e.Seq, &ts, &e.SessionID, &e.Kind, &tool, &argsStr, &decision, &actor, &e.PrevHash, &e.Hash); err != nil {
+		if err := rows.Scan(&e.Seq, &ts, &e.SessionID, &e.Kind, &tool, &argsStr, &decision, &actor, &e.Mode, &e.DecisionID, &e.PolicyHash, &e.AgentID, &e.PrevHash, &e.Hash); err != nil {
 			return nil, err
 		}
 		e.Timestamp, err = time.Parse(time.RFC3339Nano, ts.String)

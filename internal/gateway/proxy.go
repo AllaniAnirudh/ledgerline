@@ -60,6 +60,7 @@ type Proxy struct {
 	observed      map[string]map[string]bool // ledger session -> MCP session ids seen on it
 	upstreamPin   string
 	pinConfigured bool
+	policyHash    string // SHA-256 hex of the policy file, captured at startup
 
 	inflightMu sync.Mutex
 	inflight   map[string]map[*inflightReq]struct{}
@@ -157,7 +158,7 @@ func New(upstream string, l ledger.Store, p *policy.Policy) (*Proxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	px := &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, probeClient: &http.Client{Timeout: 30 * time.Second}, approvals: NewApprovals(), proposals: NewProposals()}
+	px := &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, probeClient: &http.Client{Timeout: 30 * time.Second}, approvals: NewApprovals(), proposals: NewProposals(), policyHash: p.Hash()}
 	if err := px.recoverIdempotency(); err != nil {
 		return nil, err
 	}
@@ -259,7 +260,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodPost {
 				if isToolCall(body) {
 					tool, _ := toolCallDetails(body)
-					if !px.witness(session, "policy_decision", tool, nil, "deny", "", w, body) {
+					if _, ok := px.witnessPolicyDecision(session, tool, "deny", policy.ModePrevent.String(), w, body); !ok {
 						return
 					}
 				}
@@ -280,7 +281,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// secret must never reach the ledger, the hold queue,
 		// or the proposal queue.
 		if px.broker != nil && px.broker.ContainsSecret(args) {
-			if !px.witness(session, "policy_decision", tool, nil, "deny", "", w, body) {
+			if _, ok := px.witnessPolicyDecision(session, tool, "deny", policy.ModePrevent.String(), w, body); !ok {
 				return
 			}
 			writeJSONRPCError(w, body, "ledgerline: tool arguments contain a brokered credential")
@@ -326,12 +327,25 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			claim = &idemClaim{key: key, tool: tool, argsHash: idemArgsHash(args)}
 		}
-		decision, reason := px.policy.DecideCall(tool, args)
-		if !px.witness(session, "policy_decision", tool, nil, decision.String(), "", w, body) {
+		decision, reason, mode := px.policy.DecideCall(tool, args)
+		// Detect mode changes every restrictive action the same
+		// way. The call always proceeds on the allow path. The
+		// ledger records the would-be decision first, then the
+		// tool_call that ran anyway. Both carry one decision
+		// id. Hold in detect queues nothing and asks no human.
+		// Contain in detect freezes nothing. Propose in detect
+		// records a proposal marked detected and never queues
+		// it. A human must never apply a call that already ran.
+		detect := mode == policy.ModeDetect && decision != policy.Allow
+		decisionID, ok := px.witnessPolicyDecision(session, tool, decision.String(), mode.String(), w, body)
+		if !ok {
 			return
 		}
 		switch decision {
 		case policy.Deny:
+			if detect {
+				break
+			}
 			msg := "ledgerline: tool call denied by policy"
 			if reason != "" {
 				msg += ": " + reason
@@ -339,9 +353,15 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSONRPCError(w, body, msg)
 			return
 		case policy.Hold:
+			if detect {
+				break
+			}
 			px.hold(w, r, session, body, tool, args, claim)
 			return
 		case policy.Contain:
+			if detect {
+				break
+			}
 			msg := "ledgerline: session contained by policy"
 			if reason != "" {
 				msg += ": " + reason
@@ -350,6 +370,16 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSONRPCError(w, body, msg)
 			return
 		case policy.Propose:
+			if detect {
+				// Record the proposal, marked detected. Do not
+				// queue it. The call forwards below.
+				if _, err := px.ledger.AppendDetailed(session, "proposal", tool, args, "propose", "", ledger.EventDetail{Mode: mode.String(), DecisionID: decisionID}); err != nil {
+					log.Printf("ledger write failed on proposal: %v", err)
+					writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+					return
+				}
+				break
+			}
 			px.propose(w, session, body, tool, args)
 			return
 		}
@@ -373,7 +403,16 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if !px.witness(session, "tool_call", tool, args, policy.Allow.String(), "", w, body) {
+		// In detect mode the tool_call reuses the
+		// policy_decision id. The pair links the would-be
+		// decision to the call that ran anyway.
+		toolCallOK := false
+		if detect {
+			toolCallOK = px.witnessDetailed(session, "tool_call", tool, args, policy.Allow.String(), "", ledger.EventDetail{Mode: mode.String(), DecisionID: decisionID}, w, body)
+		} else {
+			toolCallOK = px.witness(session, "tool_call", tool, args, policy.Allow.String(), "", w, body)
+		}
+		if !toolCallOK {
 			if claim != nil {
 				// The call never ran. Its journal entry must
 				// not block retries as "started".
@@ -387,7 +426,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The gateway cannot classify the calls inside it. Batches
 	// are refused at the boundary. The refusal is witnessed.
 	if r.Method == http.MethodPost && isBatch(body) {
-		if !px.witness(session, "policy_decision", "(batch)", nil, policy.Deny.String(), "", w, body) {
+		if _, ok := px.witnessPolicyDecision(session, "(batch)", policy.Deny.String(), policy.ModePrevent.String(), w, body); !ok {
 			return
 		}
 		writeJSONRPCError(w, body, "ledgerline: batch requests are not accepted at this boundary")
@@ -455,6 +494,54 @@ func (px *Proxy) witness(session, kind, tool string, args json.RawMessage, decis
 		return false
 	}
 	return true
+}
+
+// witnessDetailed appends one event with extra fields, failing
+// closed. It mirrors witness.
+func (px *Proxy) witnessDetailed(session, kind, tool string, args json.RawMessage, decision, actor string, detail ledger.EventDetail, w http.ResponseWriter, body []byte) bool {
+	if _, err := px.ledger.AppendDetailed(session, kind, tool, args, decision, actor, detail); err != nil {
+		log.Printf("ledger write failed: %v", err)
+		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+		return false
+	}
+	return true
+}
+
+// witnessPolicyDecision records one policy_decision event with
+// its mode, a fresh decision id, and the policy hash. It
+// returns the decision id. A follow-up tool_call in detect mode
+// reuses the id, so the dashboard can link the pair. It fails
+// closed like witness.
+func (px *Proxy) witnessPolicyDecision(session, tool, decision, mode string, w http.ResponseWriter, body []byte) (string, bool) {
+	id, err := newID()
+	if err != nil {
+		log.Printf("ledger write failed: cannot allocate decision id: %v", err)
+		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+		return "", false
+	}
+	detail := ledger.EventDetail{Mode: mode, DecisionID: id, PolicyHash: px.policyHash}
+	if _, err := px.ledger.AppendDetailed(session, "policy_decision", tool, nil, decision, "", detail); err != nil {
+		log.Printf("ledger write failed: %v", err)
+		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+		return "", false
+	}
+	return id, true
+}
+
+// appendPolicyDecision records one policy_decision event with
+// its mode, a fresh decision id, and the policy hash. It is the
+// hook endpoint form of witnessPolicyDecision. It returns the
+// decision id. The caller answers the HTTP failure itself.
+func (px *Proxy) appendPolicyDecision(session, tool, decision string, mode policy.Mode) (string, error) {
+	id, err := newID()
+	if err != nil {
+		return "", err
+	}
+	detail := ledger.EventDetail{Mode: mode.String(), DecisionID: id, PolicyHash: px.policyHash}
+	if _, err := px.ledger.AppendDetailed(session, "policy_decision", tool, nil, decision, "", detail); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // sessionOf reads the ledger session from the request. It defaults

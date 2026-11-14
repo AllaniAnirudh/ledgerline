@@ -48,7 +48,7 @@ func TestYAMLPolicy(t *testing.T) {
 		{"read_file", nil, Allow, ""},
 	}
 	for _, c := range cases {
-		got, reason := p.DecideCall(c.tool, c.args)
+		got, reason, _ := p.DecideCall(c.tool, c.args)
 		if got != c.want {
 			t.Errorf("DecideCall(%q, %s) = %v, want %v", c.tool, c.args, got, c.want)
 		}

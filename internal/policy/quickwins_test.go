@@ -38,13 +38,13 @@ rules:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d, _ := p.DecideCall("rm", nil); d != Contain {
+	if d, _, _ := p.DecideCall("rm", nil); d != Contain {
 		t.Fatalf("rm should contain, got %v", d)
 	}
-	if d, _ := p.DecideCall("deploy", nil); d != Propose {
+	if d, _, _ := p.DecideCall("deploy", nil); d != Propose {
 		t.Fatalf("deploy should propose, got %v", d)
 	}
-	if d, _ := p.DecideCall("read_file", nil); d != Allow {
+	if d, _, _ := p.DecideCall("read_file", nil); d != Allow {
 		t.Fatalf("read_file should allow, got %v", d)
 	}
 }
@@ -70,10 +70,10 @@ rules:
 	}
 	// Unparseable arguments: conditions cannot be evaluated.
 	broken := json.RawMessage(`{"path": `)
-	if d, _ := p.DecideCall("write_file", broken); d != Contain {
+	if d, _, _ := p.DecideCall("write_file", broken); d != Contain {
 		t.Fatalf("unparseable args should contain, got %v", d)
 	}
-	if d, _ := p.DecideCall("deploy", broken); d != Propose {
+	if d, _, _ := p.DecideCall("deploy", broken); d != Propose {
 		t.Fatalf("unparseable args should propose, got %v", d)
 	}
 }

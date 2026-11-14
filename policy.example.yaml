@@ -26,6 +26,14 @@
 #   args_contains optional text. It matches when the call
 #                 arguments contain this text. The match is
 #                 case-insensitive.
+#   mode          optional. detect or prevent. Prevent enforces
+#                 the action. Detect only records what would
+#                 have happened. The call still runs. A rule
+#                 with no mode means prevent. Existing policies
+#                 keep their behavior at upgrade. New rules
+#                 start in detect mode. A new rule graduates to
+#                 prevent only after a review window with zero
+#                 false positives.
 #
 # A rule with argument conditions that do not hold does not match.
 # Evaluation continues to the next rule.
@@ -55,9 +63,13 @@ rules:
       path: "/home/**"
     reason: "home path write"
 
-  # Mail that looks confidential needs a human.
+  # Mail that looks confidential needs a human. This rule runs
+  # in detect mode. It records what would have happened. The
+  # call still runs. Review the detected holds first. Flip the
+  # rule to prevent only when it stops flagging good mail.
   - tool: send_email
     action: hold
+    mode: detect
     args_contains: "confidential"
 
   # A destructive tool freezes the session that called it.

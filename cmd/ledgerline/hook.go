@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -165,16 +167,42 @@ func resolveHoldTimeout(harness string, d time.Duration) (time.Duration, error) 
 // not executed. With a broker, a brokered secret in the
 // arguments is denied before any witness records those
 // arguments. Without a broker, arguments are recorded as sent.
+// In detect mode a restrictive rule only records what would
+// have happened. The call is allowed. Hold in detect waits for
+// no human. Contain in detect freezes nothing. Propose in
+// detect records a proposal marked detected and allows the
+// call. The proposal is never queued here. The bridge has no
+// queue. A human must never apply a call that already ran.
 func decideHookStandalone(store ledger.Store, pol *policy.Policy, broker *gateway.Broker, session, tool string, args json.RawMessage) hookOutcome {
+	decide := func(tool, decision string, mode policy.Mode) (string, hookOutcome) {
+		id, err := newDecisionID()
+		if err != nil {
+			return "", hookOutcome{reason: "ledgerline: ledger unavailable, boundary closed"}
+		}
+		detail := ledger.EventDetail{Mode: mode.String(), DecisionID: id, PolicyHash: pol.Hash()}
+		if _, err := store.AppendDetailed(session, "policy_decision", tool, nil, decision, "", detail); err != nil {
+			return "", hookOutcome{reason: "ledgerline: ledger unavailable, boundary closed"}
+		}
+		return id, hookOutcome{}
+	}
 	if broker != nil && broker.ContainsSecret(args) {
-		if _, err := store.Append(session, "policy_decision", tool, nil, "deny", ""); err != nil {
-			return hookOutcome{reason: "ledgerline: ledger unavailable, boundary closed"}
+		if _, out := decide(tool, "deny", policy.ModePrevent); out.reason != "" {
+			return out
 		}
 		return hookOutcome{reason: "ledgerline: tool arguments contain a brokered credential"}
 	}
-	decision, reason := pol.DecideCall(tool, args)
-	if _, err := store.Append(session, "policy_decision", tool, nil, decision.String(), ""); err != nil {
-		return hookOutcome{reason: "ledgerline: ledger unavailable, boundary closed"}
+	decision, reason, mode := pol.DecideCall(tool, args)
+	detect := mode == policy.ModeDetect && decision != policy.Allow
+	decisionID, out := decide(tool, decision.String(), mode)
+	if out.reason != "" {
+		return out
+	}
+	detectDetail := ledger.EventDetail{Mode: mode.String(), DecisionID: decisionID}
+	allowDetected := func() hookOutcome {
+		if _, err := store.AppendDetailed(session, "tool_call", tool, args, "allow", "", detectDetail); err != nil {
+			return hookOutcome{reason: "ledgerline: ledger unavailable, boundary closed"}
+		}
+		return hookOutcome{allow: true}
 	}
 	switch decision {
 	case policy.Allow:
@@ -183,23 +211,41 @@ func decideHookStandalone(store ledger.Store, pol *policy.Policy, broker *gatewa
 		}
 		return hookOutcome{allow: true}
 	case policy.Deny:
+		if detect {
+			return allowDetected()
+		}
 		msg := "ledgerline: tool call denied by policy"
 		if reason != "" {
 			msg += ": " + reason
 		}
 		return hookOutcome{reason: msg}
 	case policy.Contain:
+		if detect {
+			return allowDetected()
+		}
 		msg := "ledgerline: session contained by policy"
 		if reason != "" {
 			msg += ": " + reason
 		}
 		return hookOutcome{reason: msg}
 	case policy.Propose:
+		if detect {
+			// Record the proposal, marked detected. The call
+			// still runs. The record says what would have
+			// happened, not what a human must apply.
+			if _, err := store.AppendDetailed(session, "proposal", tool, args, "propose", "", detectDetail); err != nil {
+				return hookOutcome{reason: "ledgerline: ledger unavailable, boundary closed"}
+			}
+			return allowDetected()
+		}
 		if _, err := store.Append(session, "proposal", tool, args, "propose", ""); err != nil {
 			return hookOutcome{reason: "ledgerline: ledger unavailable, boundary closed"}
 		}
 		return hookOutcome{reason: "ledgerline: action NOT executed; recorded in the ledger for human application out of band"}
 	case policy.Hold:
+		if detect {
+			return allowDetected()
+		}
 		if _, err := store.Append(session, "approval", tool, args, "hold", ""); err != nil {
 			return hookOutcome{reason: "ledgerline: ledger unavailable, boundary closed"}
 		}
@@ -207,6 +253,16 @@ func decideHookStandalone(store ledger.Store, pol *policy.Policy, broker *gatewa
 	default:
 		return hookOutcome{reason: "ledgerline: unknown policy decision"}
 	}
+}
+
+// newDecisionID mints one decision id. It is 16 crypto random
+// bytes, hex encoded. It matches the approvals id shape.
+func newDecisionID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // hookHTTPClient bounds one gateway call. The timeout is the

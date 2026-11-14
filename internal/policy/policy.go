@@ -1,7 +1,9 @@
 // Package policy decides what happens to a tool call at the boundary.
 // It allows the call through, denies it, holds it for human
 // approval, contains the session it came from, or records it as a
-// proposal for a human to apply out of band.
+// proposal for a human to apply out of band. Each rule also
+// carries a mode: prevent enforces the action, detect only
+// records what would have happened and lets the call run.
 //
 // Policies come from a YAML file (see LoadFile and
 // policy.example.yaml) or from static allow/deny/hold lists (New,
@@ -20,6 +22,8 @@ package policy
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -81,6 +85,36 @@ func ParseDecision(s string) (Decision, error) {
 	return Allow, fmt.Errorf("invalid action %q (want allow, deny, hold, contain, or propose)", s)
 }
 
+// Mode decides whether a restrictive rule enforces or only
+// observes. Prevent is current behavior: the action happens.
+// Detect only records what would have happened. The call runs.
+type Mode string
+
+const (
+	// ModePrevent enforces the rule action. It is the default.
+	ModePrevent Mode = "prevent"
+	// ModeDetect records the would-be action and lets the call run.
+	ModeDetect Mode = "detect"
+)
+
+func (m Mode) String() string {
+	if m == ModeDetect {
+		return "detect"
+	}
+	return "prevent"
+}
+
+// ParseMode converts "detect" or "prevent" to a Mode.
+func ParseMode(s string) (Mode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "detect":
+		return ModeDetect, nil
+	case "prevent":
+		return ModePrevent, nil
+	}
+	return ModePrevent, fmt.Errorf("invalid mode %q (want detect or prevent)", s)
+}
+
 // Rule is one ordered policy rule. Tool is a glob matched
 // case-insensitively against the tool name ("*" and "?" work as in
 // path.Match). The optional argument conditions narrow the match:
@@ -95,6 +129,10 @@ func ParseDecision(s string) (Decision, error) {
 //     escapes are decoded first. The escaped form of a word
 //     matches the plain needle too.
 //
+// Mode decides whether a matched restrictive rule enforces or
+// only observes. A rule with no mode in the file means prevent.
+// Existing policies keep their behavior at upgrade.
+//
 // A rule whose argument conditions do not hold does not match.
 // Evaluation continues to the next rule. Conditions that cannot be
 // evaluated fail closed (see the package doc).
@@ -104,31 +142,50 @@ type Rule struct {
 	Reason       string
 	ArgsMatch    map[string]string
 	ArgsContains string
+	Mode         Mode
 }
 
 // Policy is an ordered rule list plus a default decision.
 type Policy struct {
 	rules []Rule
 	def   Decision
+	hash  string // SHA-256 hex of the policy file bytes, or of the static lists
 }
 
 // New builds a policy from static tool name lists. Deny is checked
 // before hold. Empty lists mean "allow everything". List entries
-// are tool globs, same as in a policy file.
+// are tool globs, same as in a policy file. Static rules are
+// prevent. They enforce.
 func New(denyList, holdList []string) *Policy {
 	p := &Policy{def: Allow}
 	for _, t := range denyList {
 		if t = strings.TrimSpace(t); t != "" {
-			p.rules = append(p.rules, Rule{Tool: t, Action: Deny})
+			p.rules = append(p.rules, Rule{Tool: t, Action: Deny, Mode: ModePrevent})
 		}
 	}
 	for _, t := range holdList {
 		if t = strings.TrimSpace(t); t != "" {
-			p.rules = append(p.rules, Rule{Tool: t, Action: Hold})
+			p.rules = append(p.rules, Rule{Tool: t, Action: Hold, Mode: ModePrevent})
 		}
 	}
+	// The hash covers the lists that built the policy. A rule
+	// joins its action and tool. The join keeps a deny list
+	// distinct from a hold list with the same tool names.
+	var parts []string
+	for _, r := range p.rules {
+		parts = append(parts, r.Action.String()+":"+r.Tool)
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
+	p.hash = hex.EncodeToString(sum[:])
 	return p
 }
+
+// Hash returns the policy hash. For a file policy it is the
+// SHA-256 hex of the file bytes. For a static policy it is the
+// hash of the lists that built it. The ledger records it on
+// every policy_decision event. A later reader can tell which
+// policy version made a past decision.
+func (p *Policy) Hash() string { return p.hash }
 
 // fileRule mirrors the YAML schema.
 type fileRule struct {
@@ -137,6 +194,7 @@ type fileRule struct {
 	Reason       string            `yaml:"reason"`
 	ArgsMatch    map[string]string `yaml:"args_match"`
 	ArgsContains string            `yaml:"args_contains"`
+	Mode         string            `yaml:"mode"`
 }
 
 type filePolicy struct {
@@ -146,7 +204,7 @@ type filePolicy struct {
 }
 
 // LoadFile reads a YAML policy file. Unknown fields, an unsupported
-// version, a bad action, a bad glob, a rule without a tool, or a
+// version, a bad action, a bad mode, a bad glob, a rule without a tool, or a
 // multi-document file are hard errors. A policy that does not
 // parse must never silently allow traffic.
 func LoadFile(path string) (*Policy, error) {
@@ -157,7 +215,8 @@ func LoadFile(path string) (*Policy, error) {
 	return Parse(b)
 }
 
-// Parse builds a policy from YAML bytes.
+// Parse builds a policy from YAML bytes. The policy hash is the
+// SHA-256 hex of the bytes.
 func Parse(b []byte) (*Policy, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
@@ -192,6 +251,16 @@ func Parse(b []byte) (*Policy, error) {
 		if err != nil {
 			return nil, fmt.Errorf("policy: rule %d (tool %q): %w", i+1, fr.Tool, err)
 		}
+		// A rule with no mode means prevent. Existing policies
+		// keep their behavior at upgrade. An unknown mode is a
+		// hard error. A typo must never silently weaken a rule.
+		mode := ModePrevent
+		if strings.TrimSpace(fr.Mode) != "" {
+			mode, err = ParseMode(fr.Mode)
+			if err != nil {
+				return nil, fmt.Errorf("policy: rule %d (tool %q): %w", i+1, fr.Tool, err)
+			}
+		}
 		if _, err := path.Match(strings.ToLower(fr.Tool), ""); err != nil {
 			return nil, fmt.Errorf("policy: rule %d (tool %q): bad glob: %w", i+1, fr.Tool, err)
 		}
@@ -206,8 +275,11 @@ func Parse(b []byte) (*Policy, error) {
 			Reason:       fr.Reason,
 			ArgsMatch:    fr.ArgsMatch,
 			ArgsContains: fr.ArgsContains,
+			Mode:         mode,
 		})
 	}
+	sum := sha256.Sum256(b)
+	p.hash = hex.EncodeToString(sum[:])
 	return p, nil
 }
 
@@ -223,28 +295,30 @@ func (p *Policy) Default() Decision { return p.def }
 
 // Decide returns the decision for a tool call with no argument context.
 func (p *Policy) Decide(tool string) Decision {
-	d, _ := p.DecideCall(tool, nil)
+	d, _, _ := p.DecideCall(tool, nil)
 	return d
 }
 
-// DecideCall returns the decision for one tool call and the
-// matching rule's reason. The reason is empty when the default
-// applied or the rule has none.
-func (p *Policy) DecideCall(tool string, args json.RawMessage) (Decision, string) {
+// DecideCall returns the decision for one tool call, the matching
+// rule's reason, and the matched rule's mode. The reason is empty
+// when the default applied or the rule has none. The mode is
+// prevent when the default applied. The default has no rule, so
+// it has no mode of its own.
+func (p *Policy) DecideCall(tool string, args json.RawMessage) (Decision, string, Mode) {
 	var ev *argsEval // decoded lazily, only if a rule needs it
 	for _, r := range p.rules {
 		if !globTool(r.Tool, tool) {
 			continue
 		}
 		if r.ArgsContains == "" && len(r.ArgsMatch) == 0 {
-			return r.Action, r.Reason
+			return r.Action, r.Reason, r.Mode
 		}
 		if ev == nil {
 			ev = evaluateArgs(args)
 		}
 		switch evalRule(r, ev) {
 		case matchYes:
-			return r.Action, r.Reason
+			return r.Action, r.Reason, r.Mode
 		case matchUnknown:
 			// Fail closed: a restrictive rule whose conditions
 			// cannot be evaluated counts as matched. An allow
@@ -255,11 +329,11 @@ func (p *Policy) DecideCall(tool string, args json.RawMessage) (Decision, string
 				if reason == "" {
 					reason = "arguments could not be fully evaluated"
 				}
-				return r.Action, reason
+				return r.Action, reason, r.Mode
 			}
 		}
 	}
-	return p.def, ""
+	return p.def, "", ModePrevent
 }
 
 // --- tool glob (case-insensitive) ---

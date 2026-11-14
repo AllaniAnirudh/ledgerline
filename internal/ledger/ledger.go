@@ -22,16 +22,31 @@ import (
 
 // Event is a single witnessed action at the boundary.
 type Event struct {
-	Seq       uint64          `json:"seq"`
-	Timestamp time.Time       `json:"timestamp"`
-	SessionID string          `json:"session_id"`
-	Kind      string          `json:"kind"` // tool_call, policy_decision, approval
-	Tool      string          `json:"tool,omitempty"`
-	Args      json.RawMessage `json:"args,omitempty"`
-	Decision  string          `json:"decision,omitempty"`
-	Actor     string          `json:"actor,omitempty"`
-	PrevHash  string          `json:"prev_hash"`
-	Hash      string          `json:"hash"`
+	Seq        uint64          `json:"seq"`
+	Timestamp  time.Time       `json:"timestamp"`
+	SessionID  string          `json:"session_id"`
+	Kind       string          `json:"kind"` // tool_call, policy_decision, approval
+	Tool       string          `json:"tool,omitempty"`
+	Args       json.RawMessage `json:"args,omitempty"`
+	Decision   string          `json:"decision,omitempty"`
+	Actor      string          `json:"actor,omitempty"`
+	Mode       string          `json:"mode,omitempty"`
+	DecisionID string          `json:"decision_id,omitempty"`
+	PolicyHash string          `json:"policy_hash,omitempty"`
+	AgentID    string          `json:"agent_id,omitempty"`
+	PrevHash   string          `json:"prev_hash"`
+	Hash       string          `json:"hash"`
+}
+
+// EventDetail carries the extra fields a detailed append writes.
+// Empty fields stay empty. Old events read back with empty
+// detail. The hash covers the fields, so a stored event keeps
+// the hash its writer computed.
+type EventDetail struct {
+	Mode       string
+	DecisionID string
+	PolicyHash string
+	AgentID    string
 }
 
 // Ledger is a concurrency-safe, in-memory event chain.
@@ -46,6 +61,12 @@ func New() *Ledger { return &Ledger{} }
 
 // Append records one event and returns it with its chain position and hash.
 func (l *Ledger) Append(sessionID, kind, tool string, args json.RawMessage, decision, actor string) (Event, error) {
+	return l.AppendDetailed(sessionID, kind, tool, args, decision, actor, EventDetail{})
+}
+
+// AppendDetailed records one event with extra fields and returns
+// it with its chain position and hash.
+func (l *Ledger) AppendDetailed(sessionID, kind, tool string, args json.RawMessage, decision, actor string, detail EventDetail) (Event, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -54,15 +75,19 @@ func (l *Ledger) Append(sessionID, kind, tool string, args json.RawMessage, deci
 		prev = l.events[n-1].Hash
 	}
 	e := Event{
-		Seq:       uint64(len(l.events)),
-		Timestamp: time.Now().UTC(),
-		SessionID: sessionID,
-		Kind:      kind,
-		Tool:      tool,
-		Args:      args,
-		Decision:  decision,
-		Actor:     actor,
-		PrevHash:  prev,
+		Seq:        uint64(len(l.events)),
+		Timestamp:  time.Now().UTC(),
+		SessionID:  sessionID,
+		Kind:       kind,
+		Tool:       tool,
+		Args:       args,
+		Decision:   decision,
+		Actor:      actor,
+		Mode:       detail.Mode,
+		DecisionID: detail.DecisionID,
+		PolicyHash: detail.PolicyHash,
+		AgentID:    detail.AgentID,
+		PrevHash:   prev,
 	}
 	e.Hash = hashEvent(e)
 	l.events = append(l.events, e)
@@ -116,10 +141,28 @@ func VerifyEvents(events []Event) error {
 	return nil
 }
 
-// hashEvent is the current hash construction (v2). Every field
+// hashEvent is the current hash construction (v3). Every field
 // is length-prefixed. Two different field splits can never
-// produce the same preimage.
+// produce the same preimage. v3 appends mode, decision id,
+// policy hash, and agent id to the v2 field list.
 func hashEvent(e Event) string {
+	h := sha256.New()
+	fields := []string{
+		fmt.Sprint(e.Seq),
+		e.Timestamp.UTC().Format(time.RFC3339Nano),
+		e.SessionID, e.Kind, e.Tool, canonicalArgs(e.Args),
+		e.Decision, e.Actor, e.PrevHash,
+		e.Mode, e.DecisionID, e.PolicyHash, e.AgentID,
+	}
+	for _, f := range fields {
+		fmt.Fprintf(h, "%d:%s", len(f), f)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// hashEventV2 is the previous length-prefixed construction. It
+// covers the same fields as v3 minus the four new ones.
+func hashEventV2(e Event) string {
 	h := sha256.New()
 	fields := []string{
 		fmt.Sprint(e.Seq),
@@ -133,13 +176,14 @@ func hashEvent(e Event) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// hashMatches accepts the current construction and both v1 forms.
-// Chains written before the v2 change still verify. This includes
-// chains written before the canonical args fix. They verify
-// instead of reporting themselves tampered. New events are only
-// ever written with the current construction.
+// hashMatches accepts the current construction and the v2 and v1
+// forms. Chains written before the v3 change still verify. This
+// includes chains written before the canonical args fix. They
+// verify instead of reporting themselves tampered. New events
+// are only ever written with the current construction.
 func hashMatches(e Event) bool {
 	return e.Hash == hashEvent(e) ||
+		e.Hash == hashEventV2(e) ||
 		e.Hash == hashEventV1(e, true) ||
 		e.Hash == hashEventV1(e, false)
 }
