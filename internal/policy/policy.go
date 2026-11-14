@@ -146,10 +146,13 @@ type Rule struct {
 }
 
 // Policy is an ordered rule list plus a default decision.
+// defMode is the mode of the default decision. It is prevent
+// unless the file sets default_mode.
 type Policy struct {
-	rules []Rule
-	def   Decision
-	hash  string // SHA-256 hex of the policy file bytes, or of the static lists
+	rules   []Rule
+	def     Decision
+	defMode Mode
+	hash    string // SHA-256 hex of the policy file bytes, or of the static lists
 }
 
 // New builds a policy from static tool name lists. Deny is checked
@@ -157,7 +160,7 @@ type Policy struct {
 // are tool globs, same as in a policy file. Static rules are
 // prevent. They enforce.
 func New(denyList, holdList []string) *Policy {
-	p := &Policy{def: Allow}
+	p := &Policy{def: Allow, defMode: ModePrevent}
 	for _, t := range denyList {
 		if t = strings.TrimSpace(t); t != "" {
 			p.rules = append(p.rules, Rule{Tool: t, Action: Deny, Mode: ModePrevent})
@@ -198,9 +201,10 @@ type fileRule struct {
 }
 
 type filePolicy struct {
-	Version int        `yaml:"version"`
-	Default string     `yaml:"default"`
-	Rules   []fileRule `yaml:"rules"`
+	Version     int        `yaml:"version"`
+	Default     string     `yaml:"default"`
+	DefaultMode string     `yaml:"default_mode"`
+	Rules       []fileRule `yaml:"rules"`
 }
 
 // LoadFile reads a YAML policy file. Unknown fields, an unsupported
@@ -235,13 +239,25 @@ func Parse(b []byte) (*Policy, error) {
 	if fp.Version != 0 && fp.Version != 1 {
 		return nil, fmt.Errorf("policy: unsupported version %d (this build understands version 1)", fp.Version)
 	}
-	p := &Policy{def: Allow}
+	p := &Policy{def: Allow, defMode: ModePrevent}
 	if fp.Default != "" {
 		d, err := ParseDecision(fp.Default)
 		if err != nil {
 			return nil, fmt.Errorf("policy: default: %w", err)
 		}
 		p.def = d
+	}
+	// A default with no mode means prevent. Existing policies
+	// keep their behavior at upgrade. An unknown default mode
+	// is a hard error. A typo must never silently weaken the
+	// default. A default_mode of detect lets a detect-first
+	// rollout cover unmatched calls too.
+	if strings.TrimSpace(fp.DefaultMode) != "" {
+		m, err := ParseMode(fp.DefaultMode)
+		if err != nil {
+			return nil, fmt.Errorf("policy: default_mode: %w", err)
+		}
+		p.defMode = m
 	}
 	for i, fr := range fp.Rules {
 		if strings.TrimSpace(fr.Tool) == "" {
@@ -293,6 +309,10 @@ func (p *Policy) Rules() []Rule {
 // Default returns the decision applied when no rule matches.
 func (p *Policy) Default() Decision { return p.def }
 
+// DefaultMode returns the mode of the default decision. It is
+// prevent unless the file sets default_mode.
+func (p *Policy) DefaultMode() Mode { return p.defMode }
+
 // Decide returns the decision for a tool call with no argument context.
 func (p *Policy) Decide(tool string) Decision {
 	d, _, _ := p.DecideCall(tool, nil)
@@ -301,9 +321,10 @@ func (p *Policy) Decide(tool string) Decision {
 
 // DecideCall returns the decision for one tool call, the matching
 // rule's reason, and the matched rule's mode. The reason is empty
-// when the default applied or the rule has none. The mode is
-// prevent when the default applied. The default has no rule, so
-// it has no mode of its own.
+// when the default applied or the rule has none. The mode is the
+// policy default mode when the default applied. The default has
+// no rule, so it has no mode of its own. Its mode comes from the
+// default_mode field of the file, or prevent when absent.
 func (p *Policy) DecideCall(tool string, args json.RawMessage) (Decision, string, Mode) {
 	var ev *argsEval // decoded lazily, only if a rule needs it
 	for _, r := range p.rules {
@@ -333,7 +354,7 @@ func (p *Policy) DecideCall(tool string, args json.RawMessage) (Decision, string
 			}
 		}
 	}
-	return p.def, "", ModePrevent
+	return p.def, "", p.defMode
 }
 
 // --- tool glob (case-insensitive) ---
