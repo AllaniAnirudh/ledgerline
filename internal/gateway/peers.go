@@ -1,19 +1,24 @@
 // Peer gateways feed the dashboard pull. Each peer keeps its
-// own SQLite chain. This gateway asks each peer for its chain
-// verify result and its event count, and merges event timelines
-// on demand. A peer that does not answer shows as down. It is
-// never silent. The merged timeline sorts by timestamp. It
-// never claims one global chain order.
+// own SQLite chain. This gateway pulls the full peer chain and
+// verifies it here, with ledger.VerifyEvents. It never trusts
+// the peer own /v1/verify answer. A peer that does not answer
+// shows as down. It is never silent. The merged timeline sorts
+// by timestamp. It never claims one global chain order.
 package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,8 +31,31 @@ const peerTimeout = 5 * time.Second
 
 // peerEventCap bounds one peer pull in a merged timeline. A
 // peer with more filtered events than this contributes its
-// newest rows first. The cap keeps one merge bounded.
+// newest rows first. The merge names capped peers in the
+// truncated list. The cap keeps one merge bounded.
 const peerEventCap = 500
+
+// peerVerifyMaxEvents bounds local chain verification. A peer
+// with more events than this is marked unverified, never
+// chain-ok. The pull pages 500 events at a time, so this is
+// at most 10 peer requests.
+const peerVerifyMaxEvents = 5000
+
+// maxPeerResponseBytes bounds one peer response body. A peer
+// that answers with more is refused. The cap stops a bad peer
+// from growing gateway memory without bound.
+const maxPeerResponseBytes = 8 << 20
+
+// peerVisitedHeader carries the peer urls already pulled in
+// this pull chain. A gateway refuses to pull a peer whose url
+// is already listed. Mutual peers cannot recurse.
+const peerVisitedHeader = "X-Ledgerline-Visited"
+
+// errPeerChainInvalid marks a peer chain failure. The peer
+// answered, but its chain did not verify here, or it is too
+// large to pull. Callers treat this as reachable but not
+// chain-ok. Other errors mean the peer did not answer.
+var errPeerChainInvalid = errors.New("peer chain did not verify locally")
 
 // PeerConfig is one entry in the peer gateways file. The file
 // holds tokens. Keep it readable only by the operator.
@@ -40,7 +68,9 @@ type PeerConfig struct {
 // LoadPeersFile reads the peer gateways file. The file must not
 // be readable by group or others. A file with loose permission
 // bits is refused. Names must be set, unique, and not "local".
-// URLs must parse and use http or https.
+// URLs must parse and use http or https. Plain http is refused
+// except for loopback hosts. A control-plane token must never
+// cross a plain http link to a remote host.
 func LoadPeersFile(path string) ([]PeerConfig, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -76,11 +106,28 @@ func LoadPeersFile(path string) ([]PeerConfig, error) {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return nil, fmt.Errorf("peer gateways file: peer %q has a bad url %q", p.Name, p.URL)
 		}
+		if u.Scheme == "http" && !isLoopbackPeerURL(u) {
+			return nil, fmt.Errorf("peer gateways file: peer %q url %q uses plain http to a non-loopback host; peer urls must use https except loopback hosts", p.Name, p.URL)
+		}
 	}
 	if peers == nil {
 		peers = []PeerConfig{}
 	}
 	return peers, nil
+}
+
+// isLoopbackPeerURL reports whether a peer url points at this
+// host. Localhost names and loopback IPs count. All other
+// hosts need https.
+func isLoopbackPeerURL(u *url.URL) bool {
+	host := u.Hostname()
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // peerStatus is one row of GET /v1/peers. LastSync is set only
@@ -98,45 +145,44 @@ type peerStatus struct {
 	Error      string `json:"error,omitempty"`
 }
 
-// peerVerify is the shape of a peer's GET /v1/verify answer.
-type peerVerify struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error"`
+// visitedHeaderValue builds the visited header value. It lists
+// the urls already pulled, plus the url about to be pulled.
+// The list is sorted, so the header is stable.
+func visitedHeaderValue(visited map[string]bool, add string) string {
+	names := make([]string, 0, len(visited)+1)
+	for v := range visited {
+		names = append(names, v)
+	}
+	if add != "" {
+		names = append(names, add)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
 }
 
-// fetchPeerVerify asks one peer to verify its chain.
-func (px *Proxy) fetchPeerVerify(p PeerConfig) (bool, string, error) {
-	req, err := http.NewRequest(http.MethodGet, p.URL+"/v1/verify", nil)
-	if err != nil {
-		return false, "", err
+// parseVisitedHeader reads the visited header off an incoming
+// peer pull request. A missing header means an empty set.
+func parseVisitedHeader(r *http.Request) map[string]bool {
+	out := map[string]bool{}
+	for _, v := range strings.Split(r.Header.Get(peerVisitedHeader), ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out[v] = true
+		}
 	}
-	if p.Token != "" {
-		req.Header.Set("X-Ledgerline-Token", p.Token)
-	}
-	resp, err := px.peerClient.Do(req)
-	if err != nil {
-		return false, "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false, "", fmt.Errorf("verify answered HTTP %d", resp.StatusCode)
-	}
-	var v peerVerify
-	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
-		return false, "", fmt.Errorf("verify answer did not parse: %w", err)
-	}
-	return v.OK, v.Error, nil
+	return out
 }
 
 // fetchPeerEvents asks one peer for filtered events. Query
 // params carry the caller filters. The answer is the peer
-// events plus the peer total before paging.
-func (px *Proxy) fetchPeerEvents(p PeerConfig, q url.Values) ([]ledger.Event, int, error) {
+// events plus the peer total before paging. The response body
+// is capped. A peer that answers with more is refused.
+func (px *Proxy) fetchPeerEvents(p PeerConfig, q url.Values, visited map[string]bool) ([]ledger.Event, int, error) {
 	u := p.URL + "/v1/events?" + q.Encode()
 	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
 		return nil, 0, err
 	}
+	req.Header.Set(peerVisitedHeader, visitedHeaderValue(visited, p.URL))
 	if p.Token != "" {
 		req.Header.Set("X-Ledgerline-Token", p.Token)
 	}
@@ -148,34 +194,85 @@ func (px *Proxy) fetchPeerEvents(p PeerConfig, q url.Values) ([]ledger.Event, in
 	if resp.StatusCode != http.StatusOK {
 		return nil, 0, fmt.Errorf("events answered HTTP %d", resp.StatusCode)
 	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPeerResponseBytes+1))
+	if err != nil {
+		return nil, 0, fmt.Errorf("events answer did not read: %w", err)
+	}
+	if len(body) > maxPeerResponseBytes {
+		return nil, 0, fmt.Errorf("events answer over the %d byte peer response limit", maxPeerResponseBytes)
+	}
 	var r eventsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+	if err := json.Unmarshal(body, &r); err != nil {
 		return nil, 0, fmt.Errorf("events answer did not parse: %w", err)
 	}
 	return r.Events, r.Total, nil
 }
 
-// peerStatusFor builds one peer row. Verify and the event count
-// run in order. A verify failure still reports the peer as
-// reachable. Only a failed request reports it as down.
+// fetchVerifiedPeerChain pulls one peer full chain and verifies
+// it here. The pull asks for the peer own events only, pages
+// through /v1/events, and runs ledger.VerifyEvents on the
+// whole chain. It never reads the peer /v1/verify answer. A
+// chain over the verify limit is refused without paging. A
+// chain that fails the local check is refused with
+// errPeerChainInvalid. A peer that does not answer returns a
+// plain fetch error.
+func (px *Proxy) fetchVerifiedPeerChain(p PeerConfig, visited map[string]bool) ([]ledger.Event, int, error) {
+	probe := url.Values{}
+	probe.Set("gateway", "local")
+	probe.Set("limit", "1")
+	probe.Set("offset", "0")
+	_, total, err := px.fetchPeerEvents(p, probe, visited)
+	if err != nil {
+		return nil, 0, err
+	}
+	if total > peerVerifyMaxEvents {
+		return nil, total, fmt.Errorf("peer chain has %d events, over the %d-event local verify limit: %w", total, peerVerifyMaxEvents, errPeerChainInvalid)
+	}
+	chain := make([]ledger.Event, 0, total)
+	for offset := 0; offset < total; offset += peerEventCap {
+		q := url.Values{}
+		q.Set("gateway", "local")
+		q.Set("limit", strconv.Itoa(peerEventCap))
+		q.Set("offset", strconv.Itoa(offset))
+		page, pageTotal, err := px.fetchPeerEvents(p, q, visited)
+		if err != nil {
+			return nil, total, err
+		}
+		if pageTotal != total {
+			return nil, total, fmt.Errorf("peer event total changed mid-pull (%d, was %d): %w", pageTotal, total, errPeerChainInvalid)
+		}
+		chain = append(chain, page...)
+	}
+	if len(chain) != total {
+		return nil, total, fmt.Errorf("peer chain pull short: got %d events, total %d: %w", len(chain), total, errPeerChainInvalid)
+	}
+	if err := ledger.VerifyEvents(chain); err != nil {
+		return nil, total, fmt.Errorf("peer chain failed local verify (%v): %w", err, errPeerChainInvalid)
+	}
+	return chain, total, nil
+}
+
+// peerStatusFor builds one peer row. The chain is verified
+// here, never by the peer. A verify failure still reports the
+// peer as reachable, with ChainOK false. Only a failed request
+// reports it as down.
 func (px *Proxy) peerStatusFor(p PeerConfig) peerStatus {
 	st := peerStatus{Name: p.Name, URL: p.URL}
-	ok, verr, err := px.fetchPeerVerify(p)
+	_, total, err := px.fetchVerifiedPeerChain(p, map[string]bool{})
 	if err != nil {
+		if errors.Is(err, errPeerChainInvalid) {
+			st.Reachable = true
+			st.LastSync = time.Now().UTC().Format(time.RFC3339Nano)
+			st.ChainError = err.Error()
+			st.EventCount = total
+			return st
+		}
 		st.Error = err.Error()
 		return st
 	}
 	st.Reachable = true
 	st.LastSync = time.Now().UTC().Format(time.RFC3339Nano)
-	st.ChainOK = ok
-	st.ChainError = verr
-	q := url.Values{}
-	q.Set("limit", "1")
-	_, total, err := px.fetchPeerEvents(p, q)
-	if err != nil {
-		st.Error = err.Error()
-		return st
-	}
+	st.ChainOK = true
 	st.EventCount = total
 	return st
 }
@@ -230,6 +327,9 @@ type gatewayEvent struct {
 // answer. MergedBy is set only when the timeline merges more
 // than one source. Unreachable names peers that did not answer
 // during the merge. Their events are absent, not silent.
+// Truncated names peers whose filtered events passed the per
+// peer cap, so only their newest rows are present. PeerTotals
+// holds each pulled peer filtered total before the cap.
 type mergedEventsResponse struct {
 	Events      []gatewayEvent `json:"events"`
 	Total       int            `json:"total"`
@@ -237,14 +337,46 @@ type mergedEventsResponse struct {
 	Offset      int            `json:"offset"`
 	MergedBy    string         `json:"merged_by,omitempty"`
 	Unreachable []string       `json:"unreachable,omitempty"`
+	Truncated   []string       `json:"truncated,omitempty"`
+	PeerTotals  map[string]int `json:"peer_totals,omitempty"`
+}
+
+// peerMergeInfo carries the per peer cap detail of a merge.
+type peerMergeInfo struct {
+	truncated []string
+	totals    map[string]int
+}
+
+// filterFromQuery parses the caller event filters out of a
+// peer query. Bad from/to values are ignored here. The caller
+// endpoint already rejected them.
+func filterFromQuery(q url.Values) eventFilter {
+	f := eventFilter{
+		session:  q.Get("session"),
+		tool:     q.Get("tool"),
+		kind:     q.Get("kind"),
+		decision: q.Get("decision"),
+		mode:     q.Get("mode"),
+	}
+	if v := q.Get("from"); v != "" {
+		f.from, _ = time.Parse(time.RFC3339, v)
+	}
+	if v := q.Get("to"); v != "" {
+		f.to, _ = time.Parse(time.RFC3339, v)
+	}
+	return f
 }
 
 // mergePeerEvents pulls filtered events from every peer and
-// merges them with the local events. Rows sort by timestamp.
-// Ties sort by gateway name, then by chain sequence. The
-// result is stable. A down peer contributes nothing and is
-// named in the returned list.
-func (px *Proxy) mergePeerEvents(q url.Values, local []ledger.Event) ([]gatewayEvent, []string) {
+// merges them with the local events. Each peer chain is
+// verified here before its events are trusted. A peer whose
+// chain fails verification contributes nothing. Rows sort by
+// timestamp. Ties sort by gateway name, then by chain
+// sequence. The result is stable. A down peer contributes
+// nothing and is named in the returned list. A peer already
+// in the visited set is skipped, never pulled. That stops
+// mutual peers from recursing.
+func (px *Proxy) mergePeerEvents(q url.Values, local []ledger.Event, visited map[string]bool) ([]gatewayEvent, []string, peerMergeInfo) {
 	px.peersMu.RLock()
 	peers := px.peers
 	px.peersMu.RUnlock()
@@ -252,10 +384,14 @@ func (px *Proxy) mergePeerEvents(q url.Values, local []ledger.Event) ([]gatewayE
 	for _, e := range local {
 		merged = append(merged, gatewayEvent{Event: e, Gateway: "local"})
 	}
+	f := filterFromQuery(q)
 	type result struct {
-		i      int
-		events []ledger.Event
-		err    error
+		i         int
+		events    []ledger.Event
+		total     int
+		truncated bool
+		err       error
+		skipped   bool
 	}
 	results := make([]result, len(peers))
 	var wg sync.WaitGroup
@@ -263,16 +399,41 @@ func (px *Proxy) mergePeerEvents(q url.Values, local []ledger.Event) ([]gatewayE
 		wg.Add(1)
 		go func(i int, p PeerConfig) {
 			defer wg.Done()
-			events, _, err := px.fetchPeerEvents(p, q)
-			results[i] = result{i: i, events: events, err: err}
+			if visited[p.URL] {
+				log.Printf("ledgerline: peer pull cycle: peer %q already visited, skipped", p.Name)
+				results[i] = result{i: i, skipped: true}
+				return
+			}
+			chain, _, err := px.fetchVerifiedPeerChain(p, visited)
+			if err != nil {
+				results[i] = result{i: i, err: err}
+				return
+			}
+			filtered := filterEvents(chain, f)
+			total := len(filtered)
+			truncated := false
+			if total > peerEventCap {
+				filtered = filtered[total-peerEventCap:]
+				truncated = true
+			}
+			results[i] = result{i: i, events: filtered, total: total, truncated: truncated}
 		}(i, p)
 	}
 	wg.Wait()
 	var down []string
+	info := peerMergeInfo{totals: map[string]int{}}
 	for i, p := range peers {
 		if results[i].err != nil {
 			down = append(down, p.Name)
 			continue
+		}
+		if results[i].skipped {
+			down = append(down, p.Name)
+			continue
+		}
+		info.totals[p.Name] = results[i].total
+		if results[i].truncated {
+			info.truncated = append(info.truncated, p.Name)
 		}
 		for _, e := range results[i].events {
 			merged = append(merged, gatewayEvent{Event: e, Gateway: p.Name})
@@ -287,12 +448,15 @@ func (px *Proxy) mergePeerEvents(q url.Values, local []ledger.Event) ([]gatewayE
 		}
 		return merged[a].Seq < merged[b].Seq
 	})
-	return merged, down
+	return merged, down, info
 }
 
 // peerFilterQuery copies the caller event filters for a peer
-// pull. Paging is capped per peer. The merge pages the merged
-// list itself.
+// pull. It asks the peer for its own events only. Without
+// this, a peer merges its own peers and returns foreign events
+// under this peer name. It also lets mutual peers recurse.
+// Paging happens here, after the chain is verified. The peer
+// query carries no limit or offset.
 func peerFilterQuery(q url.Values) url.Values {
 	out := url.Values{}
 	for _, k := range []string{"session", "tool", "kind", "decision", "mode", "from", "to"} {
@@ -300,7 +464,6 @@ func peerFilterQuery(q url.Values) url.Values {
 			out.Set(k, v)
 		}
 	}
-	out.Set("limit", strconv.Itoa(peerEventCap))
-	out.Set("offset", "0")
+	out.Set("gateway", "local")
 	return out
 }

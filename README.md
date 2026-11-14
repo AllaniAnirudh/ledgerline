@@ -313,15 +313,29 @@ go build -o ledgerline ./cmd/ledgerline
 
 # Peer gateways and the dashboard. One gateway serves one
 # upstream server. A team runs many gateways. The dashboard
-# pulls from each peer on demand. It verifies each chain
-# separately. It merges the timelines by timestamp. It never
+# pulls from each peer on demand. This gateway verifies each
+# peer chain itself. It pulls the full peer chain and runs the
+# local chain check on it. It never trusts the peer own
+# /v1/verify answer. A peer chain over 5000 events is too
+# large to pull and verify, so it shows chain_ok false. A peer
+# whose chain fails the local check shows chain_ok false too.
+# The dashboard merges the timelines by timestamp. It never
 # claims one global chain order. Clocks must agree, or the
-# merged timeline lies. Each peer pull caps at 500 events.
-# A peer that does not answer shows as down. It is never
-# silent. Each peer pull has a 5 second timeout.
+# merged timeline lies. Each peer pull in a merged timeline
+# caps at 500 events. A peer with more filtered events
+# contributes its newest 500 rows. The merged answer names
+# capped peers in truncated and gives each peer filtered total
+# in peer_totals. A peer that does not answer shows as down.
+# It is never silent. Each peer pull has a 5 second timeout.
+# Each peer pull asks for that peer own events only, so one
+# peer never returns another peer events, and mutual peers
+# cannot recurse. Peer response bodies cap at 8 MB.
 # List peers in a JSON file. Each entry holds a name, a url,
 # and that peer control-plane token:
-#   [{"name":"peer-a","url":"http://10.0.0.2:8080","token":"..."}]
+#   [{"name":"peer-a","url":"https://10.0.0.2:8080","token":"..."}]
+# Peer urls must use https, except loopback hosts (localhost,
+# 127.0.0.1, ::1), which may use http. A plain http url to any
+# other host is refused when the file loads.
 # The file holds tokens. Keep it readable only by the
 # operator. The gateway refuses to start when the file is
 # group- or world-readable. The local gateway is always peer
@@ -335,7 +349,8 @@ go build -o ledgerline ./cmd/ledgerline
 # events merge across local and all peers. The answer carries
 # merged_by timestamp. Each event carries its gateway name.
 # A peer that does not answer during a merge is named in
-# unreachable. With gateway=local only local events return.
+# unreachable. Capped peers are named in truncated, with peer
+# totals in peer_totals. With gateway=local only local events return.
 # With gateway=<peer name> only that peer returns.
 #   curl 'http://localhost:8080/v1/events?gateway=peer-a'
 # The dashboard page lives at /dashboard. It is dependency-free

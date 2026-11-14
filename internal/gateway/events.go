@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sort"
 	"strconv"
@@ -87,6 +88,7 @@ func (px *Proxy) serveEvents(w http.ResponseWriter, r *http.Request) {
 		to:       to,
 	}
 	gateway := q.Get("gateway")
+	visited := parseVisitedHeader(r)
 	switch {
 	case gateway == "" || gateway == "local":
 		events, err := px.ledger.Events()
@@ -100,11 +102,11 @@ func (px *Proxy) serveEvents(w http.ResponseWriter, r *http.Request) {
 			for _, e := range local {
 				rows = append(rows, gatewayEvent{Event: e, Gateway: "local"})
 			}
-			writeJSON(w, pageGatewayEvents(rows, limit, offset, "", nil))
+			writeJSON(w, pageGatewayEvents(rows, limit, offset, "", nil, nil, nil))
 			return
 		}
-		merged, down := px.mergePeerEvents(peerFilterQuery(q), local)
-		writeJSON(w, pageGatewayEvents(merged, limit, offset, "timestamp", down))
+		merged, down, info := px.mergePeerEvents(peerFilterQuery(q), local, visited)
+		writeJSON(w, pageGatewayEvents(merged, limit, offset, "timestamp", down, info.truncated, info.totals))
 		return
 	default:
 		px.peersMu.RLock()
@@ -122,21 +124,29 @@ func (px *Proxy) serveEvents(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unknown gateway "+gateway, http.StatusNotFound)
 			return
 		}
-		peerQ := peerFilterQuery(q)
-		peerQ.Set("limit", strconv.Itoa(limit))
-		peerQ.Set("offset", strconv.Itoa(offset))
-		events, total, err := px.fetchPeerEvents(peer, peerQ)
+		// A peer already visited in this pull chain means a
+		// cycle. Refuse it instead of pulling again.
+		if visited[peer.URL] {
+			http.Error(w, "peer pull cycle: peer "+gateway+" already visited", http.StatusLoopDetected)
+			return
+		}
+		// The peer chain is verified here before its events
+		// are trusted. Paging happens here, after the check.
+		chain, _, err := px.fetchVerifiedPeerChain(peer, visited)
 		if err != nil {
+			if errors.Is(err, errPeerChainInvalid) {
+				http.Error(w, "peer "+gateway+" chain did not verify: "+err.Error(), http.StatusBadGateway)
+				return
+			}
 			http.Error(w, "peer "+gateway+" unreachable: "+err.Error(), http.StatusBadGateway)
 			return
 		}
+		events := filterEvents(chain, f)
 		rows := make([]gatewayEvent, 0, len(events))
 		for _, e := range events {
 			rows = append(rows, gatewayEvent{Event: e, Gateway: gateway})
 		}
-		// The peer already paged. The total is the peer
-		// filtered total. The rows are the page.
-		writeJSON(w, mergedEventsResponse{Events: rows, Total: total, Limit: limit, Offset: offset})
+		writeJSON(w, pageGatewayEvents(rows, limit, offset, "", nil, nil, nil))
 		return
 	}
 }
@@ -183,8 +193,9 @@ func filterEvents(events []ledger.Event, f eventFilter) []ledger.Event {
 }
 
 // pageGatewayEvents pages a gateway-labelled list. MergedBy
-// and down are set only on a merged answer.
-func pageGatewayEvents(rows []gatewayEvent, limit, offset int, mergedBy string, down []string) mergedEventsResponse {
+// and down are set only on a merged answer. Truncated and
+// totals carry the per peer cap detail of a merged answer.
+func pageGatewayEvents(rows []gatewayEvent, limit, offset int, mergedBy string, down []string, truncated []string, totals map[string]int) mergedEventsResponse {
 	total := len(rows)
 	if offset > total {
 		offset = total
@@ -197,7 +208,7 @@ func pageGatewayEvents(rows []gatewayEvent, limit, offset int, mergedBy string, 
 	if page == nil {
 		page = []gatewayEvent{}
 	}
-	return mergedEventsResponse{Events: page, Total: total, Limit: limit, Offset: offset, MergedBy: mergedBy, Unreachable: down}
+	return mergedEventsResponse{Events: page, Total: total, Limit: limit, Offset: offset, MergedBy: mergedBy, Unreachable: down, Truncated: truncated, PeerTotals: totals}
 }
 
 // sessionRow is one row of GET /v1/sessions. The group key is
