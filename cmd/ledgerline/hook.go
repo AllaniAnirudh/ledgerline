@@ -42,7 +42,7 @@ const maxHookPayload = 10 << 20
 // hookNameMaps translate harness tool names to canonical names.
 // One policy file then reads the same across harnesses. A name
 // with no entry passes through unchanged, so the ledger
-// records the name of the tool that ran.
+// records the name of the tool in the hook payload.
 var hookNameMaps = map[string]map[string]string{
 	"claude-code": {
 		"Bash": "bash", "Read": "read", "Edit": "edit", "Write": "write",
@@ -76,7 +76,7 @@ func mapHookName(harness, name string) string {
 		}
 	}
 	// Unknown names pass through unchanged. The ledger then
-	// records the name of the tool that ran. Policy globs
+	// records the name of the tool in the hook payload. Policy globs
 	// match case-insensitively, so enforcement does not
 	// depend on the case of the recorded name.
 	return name
