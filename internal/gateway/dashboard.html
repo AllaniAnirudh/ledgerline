@@ -301,7 +301,7 @@ async function loadPolicy() {
 
 async function flipMode(btn) {
   const actor = actorEl.value.trim();
-  if (!actor) { document.getElementById('err').textContent = 'Set your actor name first. The flip is recorded in the ledger under that name.'; actorEl.focus(); return; }
+  if (!actor) { document.getElementById('err').textContent = 'Set your actor name first. Without a per-approver token the flip is recorded as unattributed.'; actorEl.focus(); return; }
   const index = parseInt(btn.dataset.index, 10);
   const mode = btn.dataset.mode;
   if (!confirm('Flip rule ' + index + ' to ' + mode + '? The flip is witnessed in the ledger.')) return;

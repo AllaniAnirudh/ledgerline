@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/AllaniAnirudh/ledgerline/internal/ledger"
+	"github.com/AllaniAnirudh/ledgerline/internal/policy"
 	"github.com/AllaniAnirudh/ledgerline/internal/replay"
 )
 
@@ -244,10 +245,13 @@ func (px *Proxy) release(w http.ResponseWriter, r *http.Request, session string,
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
 		return
 	}
-	if _, err := px.ledger.AppendDetailed(session, "tool_call", tool, args, "allow", res.actor, ledger.EventDetail{AgentID: agentID}); err != nil {
-		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
-		return
-	}
+	// The tool_call allow is witnessed in forward, after the
+	// last gates. The witness rides the request, with the
+	// approver as its actor. A drift or containment denial
+	// at forward time must never follow an allow. A held call
+	// is always a prevent-mode hold: detect mode never queues
+	// one. The witness carries detect false.
+	r = withToolCallWitness(r, toolCallWitness{tool: tool, args: args, mode: policy.ModePrevent.String(), agentID: agentID, actor: res.actor})
 	px.forward(w, r, body, claim)
 }
 
@@ -371,7 +375,7 @@ type decisionRequest struct {
 func (px *Proxy) decideApproval(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/approvals/"), "/decision")
 	var req decisionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxControlBodyBytes)).Decode(&req); err != nil {
 		http.Error(w, "bad decision body", http.StatusBadRequest)
 		return
 	}

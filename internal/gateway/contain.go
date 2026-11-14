@@ -109,7 +109,7 @@ func (px *Proxy) containSessionAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	var req containRequest
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, maxControlBodyBytes)).Decode(&req)
 	}
 	actor := req.Actor
 	if name, bound := px.approverActor(r); bound {

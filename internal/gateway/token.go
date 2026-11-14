@@ -69,6 +69,17 @@ func (px *Proxy) SetTokenKey(key []byte, revokeFile string) error {
 // When on, every proxy-path request must carry a valid token.
 func (px *Proxy) SetRequireAgentToken(on bool) { px.requireAgentToken = on }
 
+// SetTokenAudience overrides the audience this gateway expects
+// on agent tokens. Empty means the upstream URL. An explicit
+// audience names this gateway even when two gateways front one
+// upstream and share one key.
+func (px *Proxy) SetTokenAudience(aud string) { px.tokenAudienceOverride = aud }
+
+// SetStrictTokenAudience refuses legacy tokens with no audience.
+// Off by default: legacy tokens pass until they expire. Turn it
+// on only after every client holds an audience-bound token.
+func (px *Proxy) SetStrictTokenAudience(on bool) { px.tokenStrictAudience = on }
+
 // RequireAgentToken reports whether proxy-path checks are on.
 func (px *Proxy) RequireAgentToken() bool { return px.requireAgentToken }
 
@@ -92,6 +103,9 @@ func (px *Proxy) validateAgentToken(r *http.Request) (*token.Claims, error) {
 	if err != nil {
 		return nil, err
 	}
+	if px.tokenStrictAudience && strings.TrimSpace(claims.Audience) == "" {
+		return nil, errors.New("token has no audience")
+	}
 	if px.revoked != nil && px.revoked[claims.ID] {
 		return nil, errors.New("token is revoked")
 	}
@@ -99,13 +113,18 @@ func (px *Proxy) validateAgentToken(r *http.Request) (*token.Claims, error) {
 }
 
 // tokenAudience is the audience this gateway expects on agent
-// tokens. It is the upstream URL. Each gateway fronts one
-// upstream, so the URL names the gateway. A token minted for
-// another upstream is refused. A token with no audience is a
-// legacy token. It passes on any gateway until it expires. Two
-// gateways that front the same upstream and share one key still
-// accept each other's tokens. Separate keys give full isolation.
+// tokens. An explicit --token-audience wins. Otherwise it is
+// the upstream URL. Each gateway fronts one upstream, so the URL
+// names the gateway. A token minted for another upstream is
+// refused. A token with no audience is a legacy token. It passes
+// on any gateway until it expires, unless strict audience mode
+// is on. Two gateways that front the same upstream and share one
+// key still accept each other's tokens. Separate keys, or an
+// explicit audience per gateway, give full isolation.
 func (px *Proxy) tokenAudience() string {
+	if px.tokenAudienceOverride != "" {
+		return px.tokenAudienceOverride
+	}
 	if px.upstream == nil {
 		return ""
 	}

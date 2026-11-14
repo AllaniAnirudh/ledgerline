@@ -190,7 +190,7 @@ func (px *Proxy) reconcileModesLocked(path string, base *policy.Policy, fileMode
 // source of truth.
 func (px *Proxy) servePolicyMode(w http.ResponseWriter, r *http.Request) {
 	var req modeFlipRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxControlBodyBytes)).Decode(&req); err != nil {
 		http.Error(w, "bad mode flip body", http.StatusBadRequest)
 		return
 	}

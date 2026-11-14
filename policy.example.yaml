@@ -40,6 +40,11 @@
 
 version: 1
 default: allow
+# default_mode  optional. detect or prevent. It sets the mode of
+#               the default action for unmatched calls. It
+#               defaults to prevent. A default deny in detect
+#               mode only records what would have happened.
+default_mode: prevent
 
 rules:
   # Shell and delete tools never pass.

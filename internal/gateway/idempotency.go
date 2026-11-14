@@ -323,7 +323,7 @@ type resolveRequest struct {
 // rewrite a known outcome.
 func (px *Proxy) serveIdempotencyResolve(w http.ResponseWriter, r *http.Request) {
 	var req resolveRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxControlBodyBytes)).Decode(&req); err != nil {
 		http.Error(w, "bad resolve body", http.StatusBadRequest)
 		return
 	}

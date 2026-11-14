@@ -502,7 +502,7 @@ func (px *Proxy) serveToolsAccept(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Actor string `json:"actor"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxControlBodyBytes)).Decode(&req); err != nil && err != io.EOF {
 		http.Error(w, "bad accept body", http.StatusBadRequest)
 		return
 	}

@@ -35,6 +35,12 @@ import (
 // buffer an unbounded request into memory.
 const maxBodyBytes = 10 << 20
 
+// maxControlBodyBytes caps one control-plane JSON body. Control
+// bodies are small: a decision, a flip, a revocation. The cap
+// exists so a client cannot make a handler buffer an unbounded
+// body into memory.
+const maxControlBodyBytes = 1 << 20
+
 // maxListBytes caps one captured tools/list response. Tool lists
 // are rarely near 1 MiB. Each in-flight list pins its capture
 // buffer. The list cap is deliberately far below the request
@@ -85,11 +91,13 @@ type Proxy struct {
 	// every proxy-path request must carry a valid token. The
 	// key signs and checks tokens. Revoked token ids live in
 	// memory and in the revocation file. See token.go.
-	requireAgentToken bool
-	tokenKey          []byte
-	revokedMu         sync.Mutex
-	revoked           map[string]bool
-	revokeFile        string
+	requireAgentToken     bool
+	tokenKey              []byte
+	tokenAudienceOverride string
+	tokenStrictAudience   bool
+	revokedMu             sync.Mutex
+	revoked               map[string]bool
+	revokeFile            string
 
 	inflightMu sync.Mutex
 	inflight   map[string]map[*inflightReq]struct{}
@@ -526,8 +534,9 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// call. In detect mode the tool_call reuses the
 		// policy_decision id. The pair links the would-be
 		// decision to the call that ran anyway. A held call
-		// carries no witness here. Its release path
-		// witnesses the allow itself.
+		// carries its witness from its release path. The
+		// same rule applies there: no allow before the
+		// gates pass.
 		r = withToolCallWitness(r, toolCallWitness{tool: tool, args: args, decisionID: decisionID, mode: mode.String(), agentID: agentID, detect: detect, driftDetected: driftDetected})
 	}
 
@@ -675,16 +684,17 @@ func sessionOf(r *http.Request) (string, error) {
 	return "default", nil
 }
 
-// toolCallWitness is the tool_call allow a fresh call still owes
-// the ledger. ServeHTTP builds it. forward writes it after the
-// last gates pass. A held call carries none. Its release path
-// witnesses the allow itself.
+// toolCallWitness is the tool_call allow a call still owes the
+// ledger. ServeHTTP builds it for a fresh call. release builds
+// it for a held call. forward writes it after the last gates
+// pass. A denial at forward time must never follow an allow.
 type toolCallWitness struct {
 	tool          string
 	args          json.RawMessage
 	decisionID    string
 	mode          string
 	agentID       string
+	actor         string // approver name for a held call, empty otherwise
 	detect        bool
 	driftDetected bool // arrival already recorded this drift
 }
@@ -745,11 +755,8 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	// can tell it apart from a denial. The allow the witness
 	// below records is then true: the call ran. In prevent
 	// mode the call is denied. No allow was witnessed yet
-	// for a fresh call, so the ledger holds no false allow.
-	// A held call is the exception. Its release path already
-	// witnessed the allow before this check. That path lives
-	// in approvals.go. It still needs the same move before
-	// the ledger is exact for held calls too.
+	// for a fresh call or a held call, so the ledger holds
+	// no false allow. Both paths carry their witness here.
 	if r.Method == http.MethodPost && isToolCall(body) {
 		if tool, _ := toolCallDetails(body); tool != "" {
 			if msg, denied := px.toolsGate(tool); denied {
@@ -783,17 +790,16 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	}
 
 	// Witness the tool_call now, after the last gates. A fresh
-	// call carries its witness in the request. A held call
-	// carries none. Its release path witnessed the allow
-	// itself. A witness failure closes the boundary. The call
+	// call and a held call both carry their witness in the
+	// request. A witness failure closes the boundary. The call
 	// never ran. Its journal entry must not block retries
 	// as "started".
 	if tw, hasWitness := toolCallWitnessOf(r); hasWitness {
 		witnessed := false
 		if tw.detect {
-			witnessed = px.witnessDetailed(session, "tool_call", tw.tool, tw.args, policy.Allow.String(), "", ledger.EventDetail{Mode: tw.mode, DecisionID: tw.decisionID, AgentID: tw.agentID}, w, body)
+			witnessed = px.witnessDetailed(session, "tool_call", tw.tool, tw.args, policy.Allow.String(), tw.actor, ledger.EventDetail{Mode: tw.mode, DecisionID: tw.decisionID, AgentID: tw.agentID}, w, body)
 		} else {
-			witnessed = px.witness(session, "tool_call", tw.tool, tw.args, policy.Allow.String(), "", tw.agentID, w, body)
+			witnessed = px.witness(session, "tool_call", tw.tool, tw.args, policy.Allow.String(), tw.actor, tw.agentID, w, body)
 		}
 		if !witnessed {
 			if claim != nil {

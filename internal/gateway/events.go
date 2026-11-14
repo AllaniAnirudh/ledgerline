@@ -380,7 +380,7 @@ type revokeRequest struct {
 // stands until a restart. The caller must know that.
 func (px *Proxy) serveTokensRevoke(w http.ResponseWriter, r *http.Request) {
 	var req revokeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxControlBodyBytes)).Decode(&req); err != nil {
 		http.Error(w, "bad revoke body", http.StatusBadRequest)
 		return
 	}

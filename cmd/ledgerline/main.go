@@ -144,6 +144,8 @@ func runGateway(args []string) error {
 	tokenKeyFile := fs.String("token-key-file", "", "path to the agent token key file (hex or base64 key; or env LEDGERLINE_TOKEN_KEY)")
 	tokenRevokeFile := fs.String("token-revoke-file", "", "path to the revoked token id file (default: ledgerline-revoked-tokens.json next to --db, else in the working directory)")
 	requireAgentToken := fs.Bool("require-agent-token", false, "require a valid agent token on every proxy-path request (needs a token key)")
+	tokenAudience := fs.String("token-audience", "", "audience this gateway expects on agent tokens (default: the upstream URL)")
+	tokenStrictAudience := fs.Bool("token-strict-audience", false, "refuse agent tokens with no audience; turn on only after every client holds an audience-bound token")
 	reapprove := fs.Bool("reapprove-upstream", false, "accept a changed upstream and overwrite the pin (witnessed in the ledger)")
 	reapproveActor := fs.String("reapprove-actor", defaultActor(), "who is re-approving the upstream")
 	reapproveTools := fs.Bool("reapprove-tools", false, "accept the next observed tool surface as the new baseline (witnessed in the ledger)")
@@ -202,6 +204,13 @@ func runGateway(args []string) error {
 	}
 	if *policyFile != "" {
 		px.SetPolicySource(*policyFile, policyBytes, modesPath, modes)
+		// LoadPolicyModes reconciles the modes file against
+		// the ledger. A flip witnessed before a crash that
+		// lost the file write must apply on restart. The
+		// parse above cannot see it.
+		if err := px.LoadPolicyModes(modesPath); err != nil {
+			return err
+		}
 	}
 	if *peerGatewaysFile != "" {
 		peers, err := gateway.LoadPeersFile(*peerGatewaysFile)
@@ -302,6 +311,10 @@ func runGateway(args []string) error {
 			return err
 		}
 		px.SetRequireAgentToken(*requireAgentToken)
+		if *tokenAudience != "" {
+			px.SetTokenAudience(*tokenAudience)
+		}
+		px.SetStrictTokenAudience(*tokenStrictAudience)
 		if *requireAgentToken {
 			log.Printf("ledgerline: proxy path requires agent tokens (revocations: %s)", revokeFile)
 		}
@@ -995,12 +1008,13 @@ func loadTokenKey(keyFile string) ([]byte, error) {
 // max is 7 days. A longer ttl is refused.
 func runToken(args []string) error {
 	if len(args) < 1 || args[0] != "issue" {
-		return fmt.Errorf("usage: ledgerline token issue --agent <id> --owner <name> [--ttl 8h] [--key-file path]")
+		return fmt.Errorf("usage: ledgerline token issue --agent <id> --owner <name> [--ttl 8h] [--aud audience] [--key-file path]")
 	}
 	fs := flag.NewFlagSet("token issue", flag.ExitOnError)
 	agentID := fs.String("agent", "", "agent id the token names (required)")
 	owner := fs.String("owner", "", "human or job that started the session (required)")
 	ttl := fs.Duration("ttl", token.DefaultTTL, "token life (default 8h, max 7d)")
+	aud := fs.String("aud", "", "audience to bind the token to (empty = legacy token with no audience)")
 	keyFile := fs.String("key-file", "", "path to the token key file (or env LEDGERLINE_TOKEN_KEY)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -1018,7 +1032,13 @@ func runToken(args []string) error {
 	if key == nil {
 		return fmt.Errorf("no token key: pass --key-file or set LEDGERLINE_TOKEN_KEY")
 	}
-	tok, claims, err := token.Issue(key, *agentID, *owner, *ttl)
+	var tok string
+	var claims *token.Claims
+	if *aud != "" {
+		tok, claims, err = token.IssueWithAudience(key, *agentID, *owner, *ttl, *aud)
+	} else {
+		tok, claims, err = token.Issue(key, *agentID, *owner, *ttl)
+	}
 	if err != nil {
 		return err
 	}

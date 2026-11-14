@@ -183,7 +183,7 @@ type proposalDecisionRequest struct {
 func (px *Proxy) decideProposal(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/proposals/"), "/decision")
 	var req proposalDecisionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxControlBodyBytes)).Decode(&req); err != nil {
 		http.Error(w, "bad decision body", http.StatusBadRequest)
 		return
 	}
