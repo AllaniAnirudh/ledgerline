@@ -62,6 +62,24 @@ type Proxy struct {
 	pinConfigured bool
 	policyHash    string // SHA-256 hex of the policy file, captured at startup
 
+	// Peer gateways for the dashboard pull. Set at startup
+	// from the peers file. The list never changes while the
+	// gateway runs. peersMu guards reads against SetPeers.
+	peersMu    sync.RWMutex
+	peers      []PeerConfig
+	peerClient *http.Client // one client, 5 second timeout per peer
+
+	// Mode flip state. policyMu guards the policy pointer,
+	// the policy hash, the overrides map, and the file
+	// paths. Readers take the read lock. A flip takes the
+	// write lock. The policy value itself is never mutated
+	// in place. A flip swaps in a fresh parsed policy.
+	policyMu        sync.RWMutex
+	policyFileBytes []byte // nil when the policy came from static lists
+	policyFilePath  string
+	policyModesPath string
+	policyModes     policy.ModeOverrides
+
 	// Agent token auth (opt-in). When requireAgentToken is set,
 	// every proxy-path request must carry a valid token. The
 	// key signs and checks tokens. Revoked token ids live in
@@ -168,7 +186,7 @@ func New(upstream string, l ledger.Store, p *policy.Policy) (*Proxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	px := &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, probeClient: &http.Client{Timeout: 30 * time.Second}, approvals: NewApprovals(), proposals: NewProposals(), policyHash: p.Hash()}
+	px := &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, probeClient: &http.Client{Timeout: 30 * time.Second}, peerClient: &http.Client{Timeout: peerTimeout}, approvals: NewApprovals(), proposals: NewProposals(), policyHash: p.Hash(), policyModes: policy.ModeOverrides{}}
 	if err := px.recoverIdempotency(); err != nil {
 		return nil, err
 	}
@@ -198,6 +216,46 @@ func (px *Proxy) SetUpstreamPin(pin string) {
 	px.pinConfigured = true
 }
 
+// SetPeers installs the peer gateway list for the dashboard
+// pull. Call it at startup, before serving.
+func (px *Proxy) SetPeers(peers []PeerConfig) {
+	px.peersMu.Lock()
+	defer px.peersMu.Unlock()
+	px.peers = peers
+}
+
+// policyNow returns the current policy. The flip swaps the
+// pointer under the write lock. A call in flight keeps the old
+// policy. The old value is immutable, so that is safe.
+func (px *Proxy) policyNow() *policy.Policy {
+	px.policyMu.RLock()
+	defer px.policyMu.RUnlock()
+	return px.policy
+}
+
+// policyHashNow returns the current effective policy hash.
+func (px *Proxy) policyHashNow() string {
+	px.policyMu.RLock()
+	defer px.policyMu.RUnlock()
+	return px.policyHash
+}
+
+// SetPolicySource records where the policy came from. A flip
+// needs the file bytes to re-parse and the modes path to
+// persist. A static policy has no bytes and no path. Flips
+// then refuse with a 400.
+func (px *Proxy) SetPolicySource(filePath string, fileBytes []byte, modesPath string, modes policy.ModeOverrides) {
+	px.policyMu.Lock()
+	defer px.policyMu.Unlock()
+	px.policyFilePath = filePath
+	px.policyFileBytes = fileBytes
+	px.policyModesPath = modesPath
+	if modes == nil {
+		modes = policy.ModeOverrides{}
+	}
+	px.policyModes = modes
+}
+
 // Ledger exposes the underlying store for export and the replay API.
 func (px *Proxy) Ledger() ledger.Store { return px.ledger }
 
@@ -215,7 +273,7 @@ type toolParams struct {
 
 func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Approval and replay API live on the same port, outside the proxy path.
-	if strings.HasPrefix(r.URL.Path, "/v1/") || r.URL.Path == "/replay" || r.URL.Path == "/approvals" {
+	if strings.HasPrefix(r.URL.Path, "/v1/") || r.URL.Path == "/replay" || r.URL.Path == "/approvals" || r.URL.Path == "/dashboard" {
 		px.serveAPI(w, r)
 		return
 	}
@@ -353,7 +411,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			claim = &idemClaim{key: key, tool: tool, argsHash: idemArgsHash(args)}
 		}
-		decision, reason, mode := px.policy.DecideCall(tool, args)
+		decision, reason, mode := px.policyNow().DecideCall(tool, args)
 		// Detect mode changes every restrictive action the same
 		// way. The call always proceeds on the allow path. The
 		// ledger records the would-be decision first, then the
@@ -546,7 +604,7 @@ func (px *Proxy) witnessPolicyDecision(session, tool, decision, mode, agentID st
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
 		return "", false
 	}
-	detail := ledger.EventDetail{Mode: mode, DecisionID: id, PolicyHash: px.policyHash, AgentID: agentID}
+	detail := ledger.EventDetail{Mode: mode, DecisionID: id, PolicyHash: px.policyHashNow(), AgentID: agentID}
 	if _, err := px.ledger.AppendDetailed(session, "policy_decision", tool, nil, decision, "", detail); err != nil {
 		log.Printf("ledger write failed: %v", err)
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
@@ -564,7 +622,7 @@ func (px *Proxy) appendPolicyDecision(session, tool, decision string, mode polic
 	if err != nil {
 		return "", err
 	}
-	detail := ledger.EventDetail{Mode: mode.String(), DecisionID: id, PolicyHash: px.policyHash}
+	detail := ledger.EventDetail{Mode: mode.String(), DecisionID: id, PolicyHash: px.policyHashNow()}
 	if _, err := px.ledger.AppendDetailed(session, "policy_decision", tool, nil, decision, "", detail); err != nil {
 		return "", err
 	}

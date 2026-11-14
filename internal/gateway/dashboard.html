@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ledgerline Dashboard</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.2rem; }
+  h2 { font-size: 1rem; margin-top: 2rem; border-top: 1px solid #8886; padding-top: 1rem; }
+  .bar { display: flex; gap: .5rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
+  .bar label { font-size: .8rem; color: #888; }
+  input, select { font: inherit; padding: .35rem .55rem; }
+  #actor { width: 12rem; } #token { width: 14rem; }
+  .banner { border: 1px solid #8886; border-radius: 8px; padding: .8rem 1rem; margin-bottom: 1rem; }
+  .banner .down { color: #b3261e; font-weight: bold; }
+  .banner .ok { color: #137333; }
+  .banner table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  .banner td, .banner th { text-align: left; padding: .2rem .5rem .2rem 0; }
+  .card { border: 1px solid #8886; border-radius: 8px; padding: .8rem 1rem; margin-bottom: 1rem; }
+  .head { display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; }
+  .tool { font-weight: bold; font-size: 1.05rem; }
+  .meta { color: #888; font-size: .8rem; }
+  .count { color: #b06000; font-size: .8rem; }
+  .count.late { color: #b3261e; font-weight: bold; }
+  pre { background: #8881; padding: .6rem; border-radius: 4px; overflow-x: auto; font-size: .8rem; }
+  .actions { display: flex; gap: .5rem; margin-top: .6rem; flex-wrap: wrap; }
+  button { font: inherit; padding: .45rem 1rem; cursor: pointer; border-radius: 6px; border: 1px solid #8886; background: transparent; }
+  button.approve { background: #137333; color: #fff; border-color: #137333; }
+  button.deny { background: #b3261e; color: #fff; border-color: #b3261e; }
+  button:disabled { opacity: .5; cursor: wait; }
+  .empty { color: #888; }
+  #err { color: #b3261e; }
+  table.rows { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  table.rows td, table.rows th { text-align: left; padding: .3rem .5rem .3rem 0; border-bottom: 1px solid #8883; vertical-align: top; }
+  .filters { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: .8rem; }
+  .filters input { width: 9rem; }
+  .note { color: #888; font-size: .8rem; }
+  .warn { color: #b06000; font-size: .85rem; }
+</style>
+</head>
+<body>
+<h1>Ledgerline dashboard</h1>
+<div class="bar">
+  <label>actor <input id="actor" placeholder="your name"></label>
+  <label>API token <input id="token" type="password" placeholder="only if gateway sets one"></label>
+  <button id="refresh">Refresh</button>
+  <span class="meta" id="status"></span>
+</div>
+<p id="err"></p>
+
+<div class="banner" id="coverage">
+  <strong>Gateway coverage</strong>
+  <p class="empty">Loading…</p>
+</div>
+
+<h2>Approvals queue</h2>
+<p class="note">Live holds, oldest first. History below comes from the ledger.</p>
+<div id="queue"><p class="empty">Loading…</p></div>
+<h3>Approval history</h3>
+<div id="approvalHistory"><p class="empty">Loading…</p></div>
+
+<h2>Agent roster</h2>
+<p class="note">One row per session. A row is a session, never an agent. Agent ids show only when the session carried a verified agent token.</p>
+<div id="roster"><p class="empty">Loading…</p></div>
+
+<h2>Violations timeline</h2>
+<p class="note">Every policy decision that was not allow, in time order. The merged timeline sorts by timestamp across gateways. It claims no single global order.</p>
+<div class="filters">
+  <input id="fSession" placeholder="filter session">
+  <input id="fTool" placeholder="filter tool">
+  <input id="fAction" placeholder="filter action">
+  <input id="fMode" placeholder="filter mode">
+</div>
+<div id="violations"><p class="empty">Loading…</p></div>
+
+<h2>Drift events</h2>
+<p class="note">Tools that appeared outside the baseline. Baseline rows are unverified by the chain. The baseline lives outside the hash chain.</p>
+<div id="drift"><p class="empty">Loading…</p></div>
+
+<h2>Policy rules</h2>
+<p class="note">Rules run in order. The first match wins. A flip changes only the mode, never the action. Every flip goes into the ledger as a policy_change event.</p>
+<div id="policy"><p class="empty">Loading…</p></div>
+
+<script>
+const actorEl = document.getElementById('actor');
+const tokenEl = document.getElementById('token');
+actorEl.value = localStorage.getItem('ll_actor') || '';
+tokenEl.value = sessionStorage.getItem('ll_token') || '';
+actorEl.addEventListener('change', () => localStorage.setItem('ll_actor', actorEl.value.trim()));
+tokenEl.addEventListener('change', () => { sessionStorage.setItem('ll_token', tokenEl.value.trim()); load(); });
+document.getElementById('refresh').addEventListener('click', load);
+for (const id of ['fSession', 'fTool', 'fAction', 'fMode']) {
+  document.getElementById(id).addEventListener('input', loadViolations);
+}
+
+function headers() {
+  const h = { 'Content-Type': 'application/json' };
+  const t = tokenEl.value.trim();
+  if (t) h['X-Ledgerline-Token'] = t;
+  return h;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtTime(s) {
+  if (!s) return '-';
+  const d = new Date(s);
+  return isNaN(d) ? esc(s) : d.toLocaleString();
+}
+
+async function api(path) {
+  const res = await fetch(path, { headers: headers() });
+  if (res.status === 401) throw new Error('Gateway rejected the API token. Set the token above. (HTTP 401)');
+  if (!res.ok) throw new Error('HTTP ' + res.status + ' on ' + path + ': ' + (await res.text()).trim());
+  return res.json();
+}
+
+async function load() {
+  const err = document.getElementById('err');
+  try {
+    err.textContent = '';
+    await Promise.all([loadCoverage(), loadQueue(), loadHistory(), loadRoster(), loadViolations(), loadDrift(), loadPolicy()]);
+    document.getElementById('status').textContent = 'updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    err.textContent = 'Cannot reach the gateway API: ' + e;
+  }
+}
+
+async function loadCoverage() {
+  const box = document.getElementById('coverage');
+  const peers = await api('/v1/peers');
+  let html = '<strong>Gateway coverage</strong><table><tr><th>Gateway</th><th>Status</th><th>Last sync</th><th>Chain</th><th>Events</th></tr>';
+  for (const p of peers) {
+    const status = p.reachable
+      ? '<span class="ok">up</span>'
+      : '<span class="down">DOWN</span>' + (p.error ? ' ' + esc(p.error) : '');
+    const chain = p.chain_ok ? '<span class="ok">verified</span>' : '<span class="down">failed</span>' + (p.chain_error ? ' ' + esc(p.chain_error) : '');
+    html += '<tr><td>' + esc(p.name) + '</td><td>' + status + '</td><td>' + esc(p.last_sync || '-') + '</td><td>' + chain + '</td><td>' + p.event_count + '</td></tr>';
+  }
+  box.innerHTML = html + '</table>';
+}
+
+function queueCard(p) {
+  const d = document.createElement('div');
+  d.className = 'card';
+  const heldS = Math.max(0, Math.round((Date.now() - new Date(p.created_at)) / 1000));
+  const leftS = Math.max(0, Math.round((new Date(p.expires_at) - Date.now()) / 1000));
+  let args = '';
+  if (p.args) { try { args = '<pre>' + esc(JSON.stringify(p.args, null, 2)) + '</pre>'; } catch (e) {} }
+  d.innerHTML =
+    '<div class="head"><span class="tool">' + esc(p.tool) + '</span>' +
+    '<span class="meta">session ' + esc(p.session_id) + ' · id ' + esc(p.id) + ' · held ' + heldS + 's</span>' +
+    (p.agent_id ? '<span class="meta">agent ' + esc(p.agent_id) + '</span>' : '') +
+    '<span class="count' + (leftS < 30 ? ' late' : '') + '">times out in ' + leftS + 's</span></div>' +
+    args +
+    '<div class="actions">' +
+    '<button class="approve">Approve</button><button class="deny">Deny</button>' +
+    '<button class="contain">Contain session</button></div>';
+  d.querySelector('.approve').addEventListener('click', () => decide(p.id, 'approve', d));
+  d.querySelector('.deny').addEventListener('click', () => decide(p.id, 'deny', d));
+  d.querySelector('.contain').addEventListener('click', () => contain(p.session_id, d));
+  return d;
+}
+
+async function loadQueue() {
+  const box = document.getElementById('queue');
+  const items = await api('/v1/approvals');
+  if (!items.length) { box.innerHTML = '<p class="empty">No calls are held. Held tool calls appear here and wait for a decision.</p>'; return; }
+  box.innerHTML = '';
+  const sorted = items.slice().sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+  for (const p of sorted) box.appendChild(queueCard(p));
+}
+
+async function decide(id, decision, card) {
+  const actor = actorEl.value.trim();
+  if (!actor) { document.getElementById('err').textContent = 'Set your actor name first. The decision is recorded in the ledger under that name.'; actorEl.focus(); return; }
+  card.querySelectorAll('button').forEach(b => b.disabled = true);
+  try {
+    await apiPost('/v1/approvals/' + encodeURIComponent(id) + '/decision', { decision: decision, actor: actor });
+    load();
+  } catch (e) {
+    document.getElementById('err').textContent = 'Decision failed: ' + e;
+    card.querySelectorAll('button').forEach(b => b.disabled = false);
+  }
+}
+
+async function contain(sessionId, card) {
+  const actor = actorEl.value.trim();
+  if (!actor) { document.getElementById('err').textContent = 'Set your actor name first. The containment is recorded in the ledger under that name.'; actorEl.focus(); return; }
+  if (!confirm('Contain session ' + sessionId + '? It freezes the session until a gateway restart.')) return;
+  card.querySelectorAll('button').forEach(b => b.disabled = true);
+  try {
+    await apiPost('/v1/sessions/' + encodeURIComponent(sessionId) + '/contain', { actor: actor, reason: 'contained from dashboard' });
+    load();
+  } catch (e) {
+    document.getElementById('err').textContent = 'Contain failed: ' + e;
+    card.querySelectorAll('button').forEach(b => b.disabled = false);
+  }
+}
+
+async function apiPost(path, body) {
+  const res = await fetch(path, { method: 'POST', headers: headers(), body: JSON.stringify(body) });
+  if (res.status === 401) throw new Error('Gateway rejected the API token. Set the token above. (HTTP 401)');
+  if (!res.ok) throw new Error((await res.text()).trim() || ('HTTP ' + res.status));
+  return res.json();
+}
+
+function eventRows(events) {
+  let html = '<table class="rows"><tr><th>Time</th><th>Gateway</th><th>Session</th><th>Tool</th><th>Kind</th><th>Decision</th><th>Mode</th><th>Actor</th></tr>';
+  for (const e of events) {
+    html += '<tr><td>' + fmtTime(e.timestamp) + '</td><td>' + esc(e.gateway || 'local') + '</td><td>' + esc(e.session_id) + '</td><td>' + esc(e.tool || '-') + '</td><td>' + esc(e.kind) + '</td><td>' + esc(e.decision || '-') + '</td><td>' + esc(e.mode || '-') + '</td><td>' + esc(e.actor || '-') + '</td></tr>';
+  }
+  return html + '</table>';
+}
+
+async function loadHistory() {
+  const box = document.getElementById('approvalHistory');
+  const r = await api('/v1/events?kind=approval&limit=100');
+  if (!r.events.length) { box.innerHTML = '<p class="empty">No approval history in the ledger yet.</p>'; return; }
+  box.innerHTML = eventRows(r.events);
+}
+
+async function loadRoster() {
+  const box = document.getElementById('roster');
+  const rows = await api('/v1/sessions');
+  if (!rows.length) { box.innerHTML = '<p class="empty">No sessions in the ledger yet.</p>'; return; }
+  let html = '<table class="rows"><tr><th>Session</th><th>Agent ids</th><th>Calls</th><th>Allowed</th><th>Denied</th><th>Detected</th><th>Holds</th><th>Proposals</th><th>Contained</th><th>Status</th><th>First seen</th><th>Last seen</th></tr>';
+  for (const s of rows) {
+    html += '<tr><td>' + esc(s.session_id) + '</td><td>' + (s.agent_ids && s.agent_ids.length ? s.agent_ids.map(esc).join(', ') : '-') + '</td><td>' + s.total_calls + '</td><td>' + s.allowed_calls + '</td><td>' + s.denied_calls + '</td><td>' + s.detected + '</td><td>' + s.holds + '</td><td>' + s.proposals + '</td><td>' + s.containment_count + '</td><td>' + esc(s.status) + '</td><td>' + fmtTime(s.first_seen) + '</td><td>' + fmtTime(s.last_seen) + '</td></tr>';
+  }
+  box.innerHTML = html + '</table>';
+}
+
+let violationCache = null;
+async function loadViolations() {
+  const box = document.getElementById('violations');
+  if (!violationCache) {
+    const r = await api('/v1/events?limit=500');
+    violationCache = r.events;
+  }
+  const fs = document.getElementById('fSession').value.trim().toLowerCase();
+  const ft = document.getElementById('fTool').value.trim().toLowerCase();
+  const fa = document.getElementById('fAction').value.trim().toLowerCase();
+  const fm = document.getElementById('fMode').value.trim().toLowerCase();
+  const rows = violationCache.filter(e => {
+    const nonAllow = (e.kind === 'policy_decision' && e.decision && e.decision !== 'allow')
+      || (e.kind === 'approval' && (e.decision === 'deny' || e.decision === 'timeout'))
+      || e.kind === 'containment' || e.kind === 'tools_drift';
+    if (!nonAllow) return false;
+    if (fs && !(e.session_id || '').toLowerCase().includes(fs)) return false;
+    if (ft && !(e.tool || '').toLowerCase().includes(ft)) return false;
+    if (fa && !(e.decision || '').toLowerCase().includes(fa)) return false;
+    if (fm && !(e.mode || '').toLowerCase().includes(fm)) return false;
+    return true;
+  });
+  if (!rows.length) { box.innerHTML = '<p class="empty">No violations match. A violation is a policy decision that was not allow.</p>'; return; }
+  box.innerHTML = eventRows(rows);
+}
+
+async function loadDrift() {
+  const box = document.getElementById('drift');
+  const tools = await api('/v1/tools');
+  const r = await api('/v1/events?kind=tools_drift&limit=100');
+  let html = '';
+  if (tools.baseline) {
+    html += '<p>Baseline tools (unverified by the chain): ' + tools.baseline.tools.map(esc).join(', ') + '</p>';
+  } else {
+    html += '<p class="empty">No baseline yet. The first tools/list sets it.</p>';
+  }
+  if (tools.latest && tools.drift) {
+    html += '<p class="warn">Drift: latest surface differs from the baseline.</p>';
+    if (tools.drift_detail) {
+      html += '<p>Added: ' + (tools.drift_detail.added || []).map(esc).join(', ') + ' · Removed: ' + (tools.drift_detail.removed || []).map(esc).join(', ') + ' · Changed: ' + (tools.drift_detail.changed || []).map(esc).join(', ') + '</p>';
+    }
+  }
+  if (!r.events.length) {
+    html += '<p class="empty">No drift events in the ledger.</p>';
+  } else {
+    html += eventRows(r.events);
+  }
+  box.innerHTML = html;
+}
+
+async function loadPolicy() {
+  const box = document.getElementById('policy');
+  const p = await api('/v1/policy');
+  let html = '<p class="meta">Policy hash: ' + esc(p.policy_hash) + '</p>';
+  if (!p.rules.length) { box.innerHTML = html + '<p class="empty">No rules.</p>'; return; }
+  html += '<table class="rows"><tr><th>#</th><th>Tool</th><th>Action</th><th>Mode</th><th>Reason</th><th></th></tr>';
+  for (const rule of p.rules) {
+    const next = rule.mode === 'detect' ? 'prevent' : 'detect';
+    html += '<tr><td>' + rule.index + '</td><td>' + esc(rule.tool) + '</td><td>' + esc(rule.action) + '</td><td>' + esc(rule.mode) + '</td><td>' + esc(rule.reason || '-') + '</td><td><button data-index="' + rule.index + '" data-mode="' + next + '">Flip to ' + next + '</button></td></tr>';
+  }
+  box.innerHTML = html + '</table>';
+  box.querySelectorAll('button[data-index]').forEach(b => b.addEventListener('click', () => flipMode(b)));
+}
+
+async function flipMode(btn) {
+  const actor = actorEl.value.trim();
+  if (!actor) { document.getElementById('err').textContent = 'Set your actor name first. The flip is recorded in the ledger under that name.'; actorEl.focus(); return; }
+  const index = parseInt(btn.dataset.index, 10);
+  const mode = btn.dataset.mode;
+  if (!confirm('Flip rule ' + index + ' to ' + mode + '? The flip is witnessed in the ledger.')) return;
+  btn.disabled = true;
+  try {
+    await apiPost('/v1/policy/mode', { rule_index: index, mode: mode, actor: actor });
+    violationCache = null;
+    load();
+  } catch (e) {
+    document.getElementById('err').textContent = 'Flip failed: ' + e;
+    btn.disabled = false;
+  }
+}
+
+load();
+setInterval(() => { violationCache = null; load(); }, 10000);
+</script>
+</body>
+</html>

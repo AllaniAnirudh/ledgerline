@@ -91,7 +91,7 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	decision, reason, mode := px.policy.DecideCall(tool, args)
+	decision, reason, mode := px.policyNow().DecideCall(tool, args)
 	// Detect mode changes every restrictive action the same way
 	// as the proxy path. The call is allowed. The ledger records
 	// the would-be decision first, then the tool_call that ran.

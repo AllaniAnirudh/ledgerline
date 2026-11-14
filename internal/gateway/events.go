@@ -27,6 +27,16 @@ type eventsResponse struct {
 // The whole chain is loaded for the query. Filtering happens
 // in memory. The chain is small in local mode. A large chain
 // pays the full load on every query.
+//
+// The gateway param selects the source. Without it, events
+// merge across the local gateway and all peers. The merged
+// timeline sorts by timestamp. The answer says so with
+// merged_by. Each event carries its gateway name. A peer that
+// does not answer during a merge is named in unreachable. Its
+// events are absent, not silent. With gateway=local only local
+// events return. With gateway=<peer name> only that peer
+// returns. An unknown name is a 404. A peer that does not
+// answer a direct pull is a 502.
 func (px *Proxy) serveEvents(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var from, to time.Time
@@ -67,42 +77,115 @@ func (px *Proxy) serveEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	events, err := px.ledger.Events()
-	if err != nil {
-		http.Error(w, "ledger read failed", http.StatusInternalServerError)
+	f := eventFilter{
+		session:  q.Get("session"),
+		tool:     q.Get("tool"),
+		kind:     q.Get("kind"),
+		decision: q.Get("decision"),
+		mode:     q.Get("mode"),
+		from:     from,
+		to:       to,
+	}
+	gateway := q.Get("gateway")
+	switch {
+	case gateway == "" || gateway == "local":
+		events, err := px.ledger.Events()
+		if err != nil {
+			http.Error(w, "ledger read failed", http.StatusInternalServerError)
+			return
+		}
+		local := filterEvents(events, f)
+		if gateway == "local" {
+			rows := make([]gatewayEvent, 0, len(local))
+			for _, e := range local {
+				rows = append(rows, gatewayEvent{Event: e, Gateway: "local"})
+			}
+			writeJSON(w, pageGatewayEvents(rows, limit, offset, "", nil))
+			return
+		}
+		merged, down := px.mergePeerEvents(peerFilterQuery(q), local)
+		writeJSON(w, pageGatewayEvents(merged, limit, offset, "timestamp", down))
+		return
+	default:
+		px.peersMu.RLock()
+		var peer PeerConfig
+		var found bool
+		for i := range px.peers {
+			if px.peers[i].Name == gateway {
+				peer = px.peers[i]
+				found = true
+				break
+			}
+		}
+		px.peersMu.RUnlock()
+		if !found {
+			http.Error(w, "unknown gateway "+gateway, http.StatusNotFound)
+			return
+		}
+		peerQ := peerFilterQuery(q)
+		peerQ.Set("limit", strconv.Itoa(limit))
+		peerQ.Set("offset", strconv.Itoa(offset))
+		events, total, err := px.fetchPeerEvents(peer, peerQ)
+		if err != nil {
+			http.Error(w, "peer "+gateway+" unreachable: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		rows := make([]gatewayEvent, 0, len(events))
+		for _, e := range events {
+			rows = append(rows, gatewayEvent{Event: e, Gateway: gateway})
+		}
+		// The peer already paged. The total is the peer
+		// filtered total. The rows are the page.
+		writeJSON(w, mergedEventsResponse{Events: rows, Total: total, Limit: limit, Offset: offset})
 		return
 	}
-	session := q.Get("session")
-	tool := q.Get("tool")
-	kind := q.Get("kind")
-	decision := q.Get("decision")
-	mode := q.Get("mode")
+}
+
+// eventFilter carries the parsed GET /v1/events filters.
+type eventFilter struct {
+	session  string
+	tool     string
+	kind     string
+	decision string
+	mode     string
+	from     time.Time
+	to       time.Time
+}
+
+// filterEvents applies the filters to one event list.
+func filterEvents(events []ledger.Event, f eventFilter) []ledger.Event {
 	filtered := make([]ledger.Event, 0, len(events))
 	for _, e := range events {
-		if session != "" && e.SessionID != session {
+		if f.session != "" && e.SessionID != f.session {
 			continue
 		}
-		if tool != "" && e.Tool != tool {
+		if f.tool != "" && e.Tool != f.tool {
 			continue
 		}
-		if kind != "" && e.Kind != kind {
+		if f.kind != "" && e.Kind != f.kind {
 			continue
 		}
-		if decision != "" && e.Decision != decision {
+		if f.decision != "" && e.Decision != f.decision {
 			continue
 		}
-		if mode != "" && e.Mode != mode {
+		if f.mode != "" && e.Mode != f.mode {
 			continue
 		}
-		if !from.IsZero() && e.Timestamp.Before(from) {
+		if !f.from.IsZero() && e.Timestamp.Before(f.from) {
 			continue
 		}
-		if !to.IsZero() && e.Timestamp.After(to) {
+		if !f.to.IsZero() && e.Timestamp.After(f.to) {
 			continue
 		}
 		filtered = append(filtered, e)
 	}
-	total := len(filtered)
+	return filtered
+}
+
+// pageGatewayEvents pages a gateway-labelled list. MergedBy
+// and down are set only on a merged answer.
+func pageGatewayEvents(rows []gatewayEvent, limit, offset int, mergedBy string, down []string) mergedEventsResponse {
+	total := len(rows)
 	if offset > total {
 		offset = total
 	}
@@ -110,7 +193,11 @@ func (px *Proxy) serveEvents(w http.ResponseWriter, r *http.Request) {
 	if end > total {
 		end = total
 	}
-	writeJSON(w, eventsResponse{Events: filtered[offset:end], Total: total, Limit: limit, Offset: offset})
+	page := rows[offset:end]
+	if page == nil {
+		page = []gatewayEvent{}
+	}
+	return mergedEventsResponse{Events: page, Total: total, Limit: limit, Offset: offset, MergedBy: mergedBy, Unreachable: down}
 }
 
 // sessionRow is one row of GET /v1/sessions. The group key is

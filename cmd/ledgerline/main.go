@@ -133,6 +133,8 @@ func runGateway(args []string) error {
 	deny := fs.String("deny", "", "comma-separated tool names to deny")
 	hold := fs.String("hold", "", "comma-separated tool names to hold for approval")
 	policyFile := fs.String("policy", "", "YAML policy file (replaces --deny/--hold)")
+	policyModes := fs.String("policy-modes", "", "JSON file holding dashboard mode flips (default: <policy file>.modes.json)")
+	peerGatewaysFile := fs.String("peer-gateways-file", "", "JSON file listing peer gateways for the dashboard pull (array of {name, url, token}); must not be group- or world-readable")
 	apiToken := fs.String("api-token", os.Getenv("LEDGERLINE_API_TOKEN"), "token guarding the /v1 control plane (or env LEDGERLINE_API_TOKEN)")
 	var approverTokens stringListFlag
 	fs.Var(&approverTokens, "approver-token", "per-approver token as name=token (repeatable); decisions made with it are recorded under that name")
@@ -163,8 +165,24 @@ func runGateway(args []string) error {
 
 	var p *policy.Policy
 	policyDesc := "static lists"
+	var policyBytes []byte
+	var modesPath string
+	var modes policy.ModeOverrides
 	if *policyFile != "" {
-		p, err = policy.LoadFile(*policyFile)
+		b, err := os.ReadFile(*policyFile)
+		if err != nil {
+			return err
+		}
+		policyBytes = b
+		modesPath = *policyModes
+		if modesPath == "" {
+			modesPath = *policyFile + ".modes.json"
+		}
+		modes, err = policy.LoadModeOverrides(modesPath)
+		if err != nil {
+			return err
+		}
+		p, err = policy.ParseWithOverrides(b, modes)
 		if err != nil {
 			return err
 		}
@@ -173,11 +191,25 @@ func runGateway(args []string) error {
 		}
 		policyDesc = fmt.Sprintf("%s (%d rules, default %s)", *policyFile, len(p.Rules()), p.Default())
 	} else {
+		if *policyModes != "" {
+			return fmt.Errorf("--policy-modes needs --policy; static deny and hold lists have no file to flip")
+		}
 		p = policy.New(split(*deny), split(*hold))
 	}
 	px, err := gateway.New(*upstream, store, p)
 	if err != nil {
 		return err
+	}
+	if *policyFile != "" {
+		px.SetPolicySource(*policyFile, policyBytes, modesPath, modes)
+	}
+	if *peerGatewaysFile != "" {
+		peers, err := gateway.LoadPeersFile(*peerGatewaysFile)
+		if err != nil {
+			return err
+		}
+		px.SetPeers(peers)
+		log.Printf("ledgerline: dashboard pull covers %d peer gateways plus local", len(peers))
 	}
 	px.Approvals().SetTimeout(*holdTimeout)
 	if *brokerFile != "" {
@@ -290,7 +322,7 @@ func runGateway(args []string) error {
 		log.Printf("ledgerline: WARNING: no API token set. The control plane is unauthenticated: anyone who can reach %s can read the ledger (arguments included), decide approvals, and accept a new tool surface (drift re-baseline). Set --api-token or --approver-token before exposing this port beyond loopback.", *listen)
 	}
 	log.Printf("ledgerline: boundary up on %s -> %s (ledger: %s, policy: %s)", *listen, gateway.RedactURL(*upstream), backend, policyDesc)
-	log.Printf("ledgerline: approvals page at http://localhost%s/approvals, replay at /replay", *listen)
+	log.Printf("ledgerline: approvals page at http://localhost%s/approvals, replay at /replay, dashboard at /dashboard", *listen)
 	srv := &http.Server{Addr: *listen, Handler: px, ReadHeaderTimeout: 10 * time.Second}
 	return srv.ListenAndServe()
 }

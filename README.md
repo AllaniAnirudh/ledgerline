@@ -311,6 +311,73 @@ go build -o ledgerline ./cmd/ledgerline
 # never an agent.
 #   curl http://localhost:8080/v1/sessions
 
+# Peer gateways and the dashboard. One gateway serves one
+# upstream server. A team runs many gateways. The dashboard
+# pulls from each peer on demand. It verifies each chain
+# separately. It merges the timelines by timestamp. It never
+# claims one global chain order. Clocks must agree, or the
+# merged timeline lies. Each peer pull caps at 500 events.
+# A peer that does not answer shows as down. It is never
+# silent. Each peer pull has a 5 second timeout.
+# List peers in a JSON file. Each entry holds a name, a url,
+# and that peer control-plane token:
+#   [{"name":"peer-a","url":"http://10.0.0.2:8080","token":"..."}]
+# The file holds tokens. Keep it readable only by the
+# operator. The gateway refuses to start when the file is
+# group- or world-readable. The local gateway is always peer
+# "local". Start with:
+#   ./ledgerline gateway ... --peer-gateways-file peers.json
+# GET /v1/peers lists one row per peer: name, url, reachable,
+# last sync time, chain verify result, event count, and error
+# text when the peer is down.
+#   curl http://localhost:8080/v1/peers
+# GET /v1/events takes an optional gateway filter. Without it,
+# events merge across local and all peers. The answer carries
+# merged_by timestamp. Each event carries its gateway name.
+# A peer that does not answer during a merge is named in
+# unreachable. With gateway=local only local events return.
+# With gateway=<peer name> only that peer returns.
+#   curl 'http://localhost:8080/v1/events?gateway=peer-a'
+# The dashboard page lives at /dashboard. It is dependency-free
+# HTML and JS. It talks to the gateway own /v1 API. It sits
+# behind the same control-plane token check. It shows, in
+# order: approvals queue with approve, deny, and contain
+# actions plus approval history, agent roster grouped by
+# session id (a row is a session, never an agent), violations
+# timeline with session, tool, action, and mode filters, drift
+# events with baseline rows labelled unverified by the chain,
+# and policy rules with a mode flip action. A per-gateway
+# coverage banner from /v1/peers sits at the top. There is no
+# cost view. Cost waits for the metering module.
+#   open http://localhost:8080/dashboard in a browser
+
+# Policy mode flips. GET /v1/policy lists the rules in order
+# with the effective policy hash. Each row shows index, tool,
+# action, mode, and reason.
+#   curl http://localhost:8080/v1/policy
+# POST /v1/policy/mode flips one rule mode. It changes only
+# the mode, never the action. The body is
+# {"rule_index":0,"mode":"detect","actor":"alice"}. A flip
+# from prevent to detect opens the rule at once. A flip from
+# detect to prevent blocks work at once. The actor follows
+# the approval pattern. A per-approver token binds the name.
+# A body actor that disagrees is rejected. An invalid mode
+# or an out-of-range index is a 400. The flip is witnessed
+# in the ledger as a policy_change event. The args carry
+# rule_index, tool, action, old_mode, new_mode, and
+# policy_hash. The flip persists in a JSON modes file next
+# to the policy file. The default path is
+# <policy file>.modes.json. Pass --policy-modes to change
+# it. The gateway loads the file at startup. A flip survives
+# a restart. The effective policy hash covers the file bytes
+# plus the overrides. A flip changes the hash. Later
+# policy_decision events carry the new hash. A gateway that
+# runs on static --deny/--hold lists has no policy file. It
+# answers 400 to a flip.
+#   curl -X POST http://localhost:8080/v1/policy/mode \
+#     -H 'X-Ledgerline-Token: <approver-token>' \
+#     -d '{"rule_index":0,"mode":"detect","actor":"alice"}'
+
 # Bind approver names to credentials with per-approver tokens.
 # A decision made with one goes into the ledger under the bound
 # name. The request cannot override it.
@@ -332,7 +399,7 @@ go build -o ledgerline ./cmd/ledgerline
 ## Layout
 
 - `cmd/ledgerline` holds the CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `idempotency`, `resolve`, `tools`, `accept-tools`, `export`, `verify`, `run`, `hook`, `token`
-- `internal/gateway` is the boundary proxy. It intercepts `tools/call`. It consults policy. It holds calls for approval. It contains sessions. It records proposals. It brokers upstream credentials. It forwards the rest. It serves the `/v1/*` API, the `/approvals` page, and `/replay`. It checks agent tokens on the proxy path when `--require-agent-token` is set. It serves the dashboard read API (`/v1/events`, `/v1/sessions`) and token revocation (`POST /v1/tokens/revoke`)
+- `internal/gateway` is the boundary proxy. It intercepts `tools/call`. It consults policy. It holds calls for approval. It contains sessions. It records proposals. It brokers upstream credentials. It forwards the rest. It serves the `/v1/*` API, the `/approvals` page, and `/replay`. It checks agent tokens on the proxy path when `--require-agent-token` is set. It serves the dashboard read API (`/v1/events`, `/v1/sessions`) and token revocation (`POST /v1/tokens/revoke`). It serves the admin dashboard at `/dashboard` with the peer pull (`/v1/peers`, merged `/v1/events`), the policy listing (`GET /v1/policy`), and the mode flip (`POST /v1/policy/mode`)
 - `internal/ledger` holds the `Store` interface, the in-memory chain, the SQLite backend, and chain verification
 - `internal/policy` makes allow/deny/hold/contain/propose decisions from a YAML policy file or static lists. The YAML file uses ordered rules, glob tool names, and decoded-JSON argument matching that fails closed. It has a configurable default. Static list entries are tool globs. Each rule carries a mode: prevent enforces the action, detect only records what would have happened and lets the call run. A rule with no mode means prevent
 - `internal/pty` is PTY co-capture. It runs a command. It witnesses terminal output into the same ledger
@@ -355,7 +422,7 @@ Honest limits of the current build (also in `SECURITY.md`):
 - Proposal "apply" records claim a human applied the action out of band. With no control-plane token, anyone who can reach the port can create that record. Treat no-token local use as single-user only.
 - Idempotency is per key, per session, for 24 hours, up to 1000 journal records. A replay bypasses current policy by design. The same key means the same call. A replay never bypasses containment. A resolved-executed key never re-forwards, even if the resolution was wrong. The human owns that call, not the gateway. Journal rows are durable, not hash-chained. Only the unknown and resolved transitions go into the chain.
 - Tools-drift enforcement denies unknown tool names only. It acts only once a baseline exists. The first sighting is trusted (TOFU). A server already compromised before the first gateway start baselines its malicious tools. A tools/list response the gateway cannot parse changes nothing. In-memory mode loses the baseline on restart. The stored baseline row is not covered by chain verification. A process that can write the ledger DB can rewrite it while verify stays green. This is the same conceded DB-write power as the chain itself. Session bundles exclude gateway-wide baseline and drift events. The full chain holds them.
-- Ledger events carry mode, decision id, policy hash, and agent id (schema v3). Old v1 and v2 chains still verify. A database from an older build migrates on open. Detection mode doubles the events per matched call: one policy_decision plus one tool_call. The agent id is set when `--require-agent-token` is on. It stays empty without it.
+- Ledger events carry mode, decision id, policy hash, and agent id (schema v3). Old v1 and v2 chains still verify. A database from an older build migrates on open. Detection mode doubles the events per matched call: one policy_decision plus one tool_call. The agent id is set when `--require-agent-token` is on. It stays empty without it. The policy hash covers the policy file bytes plus any dashboard mode overrides. A flip changes the hash.
 
 ## Dogfood note
 

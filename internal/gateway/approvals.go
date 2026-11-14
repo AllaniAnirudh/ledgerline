@@ -264,6 +264,18 @@ func (px *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/approvals" && r.Method == http.MethodGet:
 		writePage(w, ApprovalsHTML())
 
+	case r.URL.Path == "/dashboard" && r.Method == http.MethodGet:
+		writePage(w, DashboardHTML())
+
+	case r.URL.Path == "/v1/peers" && r.Method == http.MethodGet:
+		px.servePeers(w, r)
+
+	case r.URL.Path == "/v1/policy" && r.Method == http.MethodGet:
+		px.servePolicy(w, r)
+
+	case r.URL.Path == "/v1/policy/mode" && r.Method == http.MethodPost:
+		px.servePolicyMode(w, r)
+
 	case strings.HasPrefix(r.URL.Path, "/v1/approvals/") && strings.HasSuffix(r.URL.Path, "/decision") && r.Method == http.MethodPost:
 		px.decideApproval(w, r)
 
