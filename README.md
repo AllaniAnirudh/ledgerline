@@ -269,8 +269,14 @@ go build -o ledgerline ./cmd/ledgerline
 #   ./ledgerline token issue --agent agent-1 --owner buppy --key-file token.key
 #   ./ledgerline token issue --agent agent-1 --owner buppy --ttl 24h --key-file token.key
 # The key can also come from env LEDGERLINE_TOKEN_KEY.
-# Send the token on every proxy-path request:
+# Send the token on every proxy-path request. The standard
+# form is Authorization: Bearer. The custom header still works:
+#   curl ... -H 'Authorization: Bearer <token>' ...
 #   curl ... -H 'X-Ledgerline-Agent-Token: <token>' ...
+# A token may carry an aud claim. The audience is the gateway
+# upstream URL. A token with an audience works only on a
+# gateway that fronts that upstream. A token with no audience
+# is a legacy token. It works on any gateway until it expires.
 # Turn checks on at the gateway. The flag without a key refuses
 # to start:
 #   ./ledgerline gateway ... --token-key-file token.key --require-agent-token
@@ -282,6 +288,12 @@ go build -o ledgerline ./cmd/ledgerline
 # A revoked token stays rejected:
 #   curl -X POST http://localhost:8080/v1/tokens/revoke \
 #     -H 'X-Ledgerline-Token: <api-token>' -d '{"jti":"<jti>"}'
+# Revocation marks the token in memory first, then witnesses
+# the event, then writes the file. A file failure leaves the
+# revocation standing in memory. The response stays 200 and
+# reports persisted false with the persist error. A restart
+# then loses it. A ledger failure also leaves the revocation
+# standing. The response is 500 and says the witness failed.
 # The gateway never forwards the agent token upstream. It also
 # strips Authorization and X-Ledgerline-Token from upstream
 # requests. Agent identity stays at the gateway.
