@@ -173,6 +173,9 @@ func resolveHoldTimeout(harness string, d time.Duration) (time.Duration, error) 
 // detect records a proposal marked detected and allows the
 // call. The proposal is never queued here. The bridge has no
 // queue. A human must never apply a call that already ran.
+// Standalone calls are unattributed. No token key exists here
+// to validate an agent token against, so no agent id is ever
+// recorded. The bridge never invents one.
 func decideHookStandalone(store ledger.Store, pol *policy.Policy, broker *gateway.Broker, session, tool string, args json.RawMessage) hookOutcome {
 	decide := func(tool, decision string, mode policy.Mode) (string, hookOutcome) {
 		id, err := newDecisionID()
@@ -186,6 +189,10 @@ func decideHookStandalone(store ledger.Store, pol *policy.Policy, broker *gatewa
 		return id, hookOutcome{}
 	}
 	if broker != nil && broker.ContainsSecret(args) {
+		// This refusal is a boundary rule. Detect mode does
+		// not change it. The detect promise covers policy
+		// rules only. A brokered secret must never be
+		// witnessed.
 		if _, out := decide(tool, "deny", policy.ModePrevent); out.reason != "" {
 			return out
 		}
@@ -280,6 +287,15 @@ func hookHTTPClient(timeout time.Duration) *http.Client {
 // policy, records the call, and waits out a hold. A transport
 // error or a bad answer is a bridge error, not a policy denial.
 func decideHookGateway(gwURL, token string, timeout time.Duration, session, tool string, args json.RawMessage) (hookOutcome, error) {
+	return decideHookGatewayWithAgent(gwURL, token, "", timeout, session, tool, args)
+}
+
+// decideHookGatewayWithAgent is decideHookGateway with an agent
+// token. The token travels as X-Ledgerline-Agent-Token. The
+// gateway validates it and records the agent id on the call.
+// An empty token sends no header. The call is then
+// unattributed on the gateway side.
+func decideHookGatewayWithAgent(gwURL, token, agentToken string, timeout time.Duration, session, tool string, args json.RawMessage) (hookOutcome, error) {
 	body, _ := json.Marshal(map[string]any{"tool": tool, "arguments": args, "session": session})
 	req, err := http.NewRequest(http.MethodPost, strings.TrimSuffix(gwURL, "/")+"/v1/hook", bytes.NewReader(body))
 	if err != nil {
@@ -288,6 +304,9 @@ func decideHookGateway(gwURL, token string, timeout time.Duration, session, tool
 	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("X-Ledgerline-Token", token)
+	}
+	if agentToken != "" {
+		req.Header.Set("X-Ledgerline-Agent-Token", agentToken)
 	}
 	client := hookHTTPClient(timeout)
 	resp, err := client.Do(req)
@@ -328,6 +347,7 @@ func runHook(args []string) error {
 	dbPath := fs.String("db", "", "SQLite ledger path (empty = in-memory)")
 	gatewayURL := fs.String("gateway", "", "running gateway base URL (when set, decisions come from the gateway; --db is ignored)")
 	token := fs.String("token", os.Getenv("LEDGERLINE_API_TOKEN"), "gateway API token (or env LEDGERLINE_API_TOKEN)")
+	agentToken := fs.String("agent-token", os.Getenv("LEDGERLINE_AGENT_TOKEN"), "gateway agent token, sent as X-Ledgerline-Agent-Token in gateway mode (or env LEDGERLINE_AGENT_TOKEN); standalone mode has no key to validate it against, so it stays unattributed")
 	sessionFlag := fs.String("session", "", "ledger session (default: the harness session id)")
 	holdTimeout := fs.Duration("hold-timeout", 0, "how long to wait for a gateway approval before denying (0 = auto: 120s, or 25s for gemini; the bridge waits this plus 30s of client grace)")
 	brokerFile := fs.String("broker", "", "broker config file for standalone secret scans (empty = no scan; values come from the environment, never the file)")
@@ -364,10 +384,16 @@ func runHook(args []string) error {
 	if session == "" {
 		session = "default"
 	}
+	// "gateway" is reserved for the gateway's own rows. A
+	// hook session with that name would hide among system
+	// rows. The call is blocked instead of renamed.
+	if strings.EqualFold(session, "gateway") {
+		return block(`ledgerline hook: session name "gateway" is reserved`)
+	}
 
 	var outcome hookOutcome
 	if *gatewayURL != "" {
-		outcome, err = decideHookGateway(*gatewayURL, *token, timeout, session, payload.Tool, payload.Args)
+		outcome, err = decideHookGatewayWithAgent(*gatewayURL, *token, *agentToken, timeout, session, payload.Tool, payload.Args)
 		if err != nil {
 			if *failOpen {
 				fmt.Fprintf(os.Stderr, "ledgerline hook: fail-open: %v\n", err)

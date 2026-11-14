@@ -235,6 +235,17 @@ type sessionRow struct {
 // Contained sessions report contained regardless of age.
 const activeWindow = 5 * time.Minute
 
+// systemEventKinds are the kinds the gateway writes itself,
+// never for an agent session. They mark system rows in the
+// roster. A kind the gateway never writes for an agent must
+// join this set when it is added.
+var systemEventKinds = map[string]bool{
+	"tools_baseline": true,
+	"token_revoked":  true,
+	"policy_change":  true,
+	"upstream":       true,
+}
+
 // serveSessions answers GET /v1/sessions. It groups the chain
 // by session_id and counts calls per session. Counts come from
 // the ledger only. Containment status also reads the live list.
@@ -252,6 +263,14 @@ func (px *Proxy) serveSessions(w http.ResponseWriter, r *http.Request) {
 	rows := map[string]*sessionRow{}
 	agents := map[string]map[string]bool{}
 	for _, e := range events {
+		// System rows are filtered by kind, not by session
+		// name. A session named "gateway" is rejected at
+		// intake, so no agent row hides here. An empty
+		// session is not a session at all. It carries
+		// baseline and drift observations only.
+		if systemEventKinds[e.Kind] || e.SessionID == "" {
+			continue
+		}
 		row := rows[e.SessionID]
 		if row == nil {
 			row = &sessionRow{SessionID: e.SessionID}
@@ -290,6 +309,18 @@ func (px *Proxy) serveSessions(w http.ResponseWriter, r *http.Request) {
 			if e.Decision == "propose" {
 				row.Proposals++
 			}
+		case "tools_drift":
+			// A drift denial counts as denied. In detect
+			// mode the drift was observed and the call ran,
+			// so it counts as detected instead. A drift
+			// observation with no denial changes no count.
+			if e.Decision == "deny" {
+				if e.Mode == "detect" {
+					row.Detected++
+				} else {
+					row.Denied++
+				}
+			}
 		case "containment":
 			row.Contained++
 		}
@@ -297,14 +328,6 @@ func (px *Proxy) serveSessions(w http.ResponseWriter, r *http.Request) {
 	out := make([]sessionRow, 0, len(rows))
 	now := time.Now().UTC()
 	for _, row := range rows {
-		// System events carry no agent session. The tools
-		// baseline and drift writers use an empty session.
-		// Token revokes, policy changes, and upstream
-		// re-approvals write under "gateway". Neither is an
-		// agent session. The roster shows agent sessions only.
-		if row.SessionID == "" || row.SessionID == "gateway" {
-			continue
-		}
 		ids := make([]string, 0, len(agents[row.SessionID]))
 		for id := range agents[row.SessionID] {
 			ids = append(ids, id)
