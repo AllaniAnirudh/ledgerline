@@ -34,6 +34,7 @@ type Event struct {
 	DecisionID string          `json:"decision_id,omitempty"`
 	PolicyHash string          `json:"policy_hash,omitempty"`
 	AgentID    string          `json:"agent_id,omitempty"`
+	Preempted  string          `json:"preempted_by,omitempty"`
 	PrevHash   string          `json:"prev_hash"`
 	Hash       string          `json:"hash"`
 }
@@ -41,12 +42,15 @@ type Event struct {
 // EventDetail carries the extra fields a detailed append writes.
 // Empty fields stay empty. Old events read back with empty
 // detail. The hash covers the fields, so a stored event keeps
-// the hash its writer computed.
+// the hash its writer computed. Preempted names the gate that
+// denied the call before the recorded decision took effect.
+// It is empty unless the decision never ran.
 type EventDetail struct {
 	Mode       string
 	DecisionID string
 	PolicyHash string
 	AgentID    string
+	Preempted  string
 }
 
 // Ledger is a concurrency-safe, in-memory event chain.
@@ -87,6 +91,7 @@ func (l *Ledger) AppendDetailed(sessionID, kind, tool string, args json.RawMessa
 		DecisionID: detail.DecisionID,
 		PolicyHash: detail.PolicyHash,
 		AgentID:    detail.AgentID,
+		Preempted:  detail.Preempted,
 		PrevHash:   prev,
 	}
 	e.Hash = hashEvent(e)
@@ -141,11 +146,29 @@ func VerifyEvents(events []Event) error {
 	return nil
 }
 
-// hashEvent is the current hash construction (v3). Every field
+// hashEvent is the current hash construction (v4). Every field
 // is length-prefixed. Two different field splits can never
-// produce the same preimage. v3 appends mode, decision id,
-// policy hash, and agent id to the v2 field list.
+// produce the same preimage. v4 appends the preempted-by
+// marker to the v3 field list.
 func hashEvent(e Event) string {
+	h := sha256.New()
+	fields := []string{
+		fmt.Sprint(e.Seq),
+		e.Timestamp.UTC().Format(time.RFC3339Nano),
+		e.SessionID, e.Kind, e.Tool, canonicalArgs(e.Args),
+		e.Decision, e.Actor, e.PrevHash,
+		e.Mode, e.DecisionID, e.PolicyHash, e.AgentID,
+		e.Preempted,
+	}
+	for _, f := range fields {
+		fmt.Fprintf(h, "%d:%s", len(f), f)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// hashEventV3 is the previous length-prefixed construction. It
+// covers the same fields as v4 minus the preempted marker.
+func hashEventV3(e Event) string {
 	h := sha256.New()
 	fields := []string{
 		fmt.Sprint(e.Seq),
@@ -176,13 +199,15 @@ func hashEventV2(e Event) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// hashMatches accepts the current construction and the v2 and v1
-// forms. Chains written before the v3 change still verify. This
-// includes chains written before the canonical args fix. They
-// verify instead of reporting themselves tampered. New events
-// are only ever written with the current construction.
+// hashMatches accepts the current construction and the v3, v2,
+// and v1 forms. Chains written before the v4 change still
+// verify. This includes chains written before the canonical
+// args fix. They verify instead of reporting themselves
+// tampered. New events are only ever written with the current
+// construction.
 func hashMatches(e Event) bool {
 	return e.Hash == hashEvent(e) ||
+		e.Hash == hashEventV3(e) ||
 		e.Hash == hashEventV2(e) ||
 		e.Hash == hashEventV1(e, true) ||
 		e.Hash == hashEventV1(e, false)

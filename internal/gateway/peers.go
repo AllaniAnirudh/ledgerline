@@ -80,18 +80,26 @@ type peerChainCache struct {
 	byURL map[string]*cachedPeerChain
 }
 
-// peerChainCaches holds one cache per gateway. The Proxy type
-// lives in proxy.go, outside this lane, so the cache cannot
-// sit on the struct. The map is keyed by gateway pointer.
-// Each gateway gets its own cache. Entries are small. The
-// gateway count in one process stays low.
-var peerChainCaches sync.Map // *Proxy -> *peerChainCache
-
 // peerCache returns the verified-chain cache for this
-// gateway. It creates the cache on first use.
+// gateway. It creates the cache on first use, so a Proxy
+// built without the constructor still works.
 func (px *Proxy) peerCache() *peerChainCache {
-	c, _ := peerChainCaches.LoadOrStore(px, &peerChainCache{byURL: map[string]*cachedPeerChain{}})
-	return c.(*peerChainCache)
+	px.peerChainsMu.Lock()
+	defer px.peerChainsMu.Unlock()
+	if px.peerChains == nil {
+		px.peerChains = &peerChainCache{byURL: map[string]*cachedPeerChain{}}
+	}
+	return px.peerChains
+}
+
+// clearPeerChains drops every cached chain for this gateway.
+// SetPeers calls it on reload. A removed peer's chain never
+// survives a peer reload.
+func (px *Proxy) clearPeerChains() {
+	c := px.peerCache()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.byURL = map[string]*cachedPeerChain{}
 }
 
 // cachedPeerChainFor returns the cached chain for one peer

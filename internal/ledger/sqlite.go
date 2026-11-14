@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS events (
 	decision_id TEXT NOT NULL DEFAULT '',
 	policy_hash TEXT NOT NULL DEFAULT '',
 	agent_id   TEXT NOT NULL DEFAULT '',
+	preempted_by TEXT NOT NULL DEFAULT '',
 	prev_hash  TEXT NOT NULL,
 	hash       TEXT NOT NULL
 );
@@ -62,10 +63,10 @@ CREATE TABLE IF NOT EXISTS idempotency (
 `
 
 // OpenSQLite opens the ledger database at path. It creates the
-// database if needed. It migrates a pre-v3 database to the v3
-// event schema. The migration adds the new columns and stamps
-// PRAGMA user_version = 3. It runs once. A later open sees
-// version 3 and skips it.
+// database if needed. It migrates a pre-v4 database to the v4
+// event schema. The migration adds the new column and stamps
+// PRAGMA user_version = 4. It runs once. A later open sees
+// version 4 and skips it.
 func OpenSQLite(path string) (*SQLiteStore, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -75,7 +76,7 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 		db.Close()
 		return nil, err
 	}
-	if err := migrateToV3(db); err != nil {
+	if err := migrateToV4(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -89,12 +90,12 @@ func OpenSQLite(path string) (*SQLiteStore, error) {
 	return &SQLiteStore{db: db}, nil
 }
 
-// migrateToV3 adds the v3 event columns to a database created by
-// an older build. It checks each column first, so a partial past
-// run cannot fail it. It stamps user_version = 3 when done.
-// Fresh databases already carry the columns from the schema.
+// migrateToV4 adds the v4 event column to a database created by
+// an older build. It checks the column first, so a partial past
+// run cannot fail it. It stamps user_version = 4 when done.
+// Fresh databases already carry the column from the schema.
 // They only get the stamp.
-func migrateToV3(db *sql.DB) error {
+func migrateToV4(db *sql.DB) error {
 	rows, err := db.Query(`PRAGMA table_info(events)`)
 	if err != nil {
 		return err
@@ -117,16 +118,16 @@ func migrateToV3(db *sql.DB) error {
 		return err
 	}
 	rows.Close()
-	for _, col := range []string{"mode", "decision_id", "policy_hash", "agent_id"} {
+	for _, col := range []string{"mode", "decision_id", "policy_hash", "agent_id", "preempted_by"} {
 		if have[col] {
 			continue
 		}
 		if _, err := db.Exec(`ALTER TABLE events ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
-			return fmt.Errorf("migrate events to v3: %w", err)
+			return fmt.Errorf("migrate events to v4: %w", err)
 		}
 	}
-	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
-		return fmt.Errorf("migrate events to v3: %w", err)
+	if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
+		return fmt.Errorf("migrate events to v4: %w", err)
 	}
 	return nil
 }
@@ -171,6 +172,7 @@ func (s *SQLiteStore) AppendDetailed(sessionID, kind, tool string, args json.Raw
 		DecisionID: detail.DecisionID,
 		PolicyHash: detail.PolicyHash,
 		AgentID:    detail.AgentID,
+		Preempted:  detail.Preempted,
 		PrevHash:   prevHash,
 	}
 	e.Hash = hashEvent(e)
@@ -181,10 +183,10 @@ func (s *SQLiteStore) AppendDetailed(sessionID, kind, tool string, args json.Raw
 		argsStr = &a
 	}
 	_, err = tx.Exec(
-		`INSERT INTO events(seq, timestamp, session_id, kind, tool, args, decision, actor, mode, decision_id, policy_hash, agent_id, prev_hash, hash)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO events(seq, timestamp, session_id, kind, tool, args, decision, actor, mode, decision_id, policy_hash, agent_id, preempted_by, prev_hash, hash)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		e.Seq, e.Timestamp.Format(time.RFC3339Nano), e.SessionID, e.Kind,
-		e.Tool, argsStr, e.Decision, e.Actor, e.Mode, e.DecisionID, e.PolicyHash, e.AgentID, e.PrevHash, e.Hash)
+		e.Tool, argsStr, e.Decision, e.Actor, e.Mode, e.DecisionID, e.PolicyHash, e.AgentID, e.Preempted, e.PrevHash, e.Hash)
 	if err != nil {
 		return Event{}, err
 	}
@@ -196,12 +198,12 @@ func (s *SQLiteStore) AppendDetailed(sessionID, kind, tool string, args json.Raw
 
 // Events returns the whole chain in order.
 func (s *SQLiteStore) Events() ([]Event, error) {
-	return s.query(`SELECT seq, timestamp, session_id, kind, tool, args, decision, actor, mode, decision_id, policy_hash, agent_id, prev_hash, hash FROM events ORDER BY seq`)
+	return s.query(`SELECT seq, timestamp, session_id, kind, tool, args, decision, actor, mode, decision_id, policy_hash, agent_id, preempted_by, prev_hash, hash FROM events ORDER BY seq`)
 }
 
 // EventsBySession returns one session's events in order.
 func (s *SQLiteStore) EventsBySession(sessionID string) ([]Event, error) {
-	return s.query(`SELECT seq, timestamp, session_id, kind, tool, args, decision, actor, mode, decision_id, policy_hash, agent_id, prev_hash, hash FROM events WHERE session_id = ? ORDER BY seq`, sessionID)
+	return s.query(`SELECT seq, timestamp, session_id, kind, tool, args, decision, actor, mode, decision_id, policy_hash, agent_id, preempted_by, prev_hash, hash FROM events WHERE session_id = ? ORDER BY seq`, sessionID)
 }
 
 func (s *SQLiteStore) query(q string, args ...any) ([]Event, error) {
@@ -216,7 +218,7 @@ func (s *SQLiteStore) query(q string, args ...any) ([]Event, error) {
 		var e Event
 		var ts, argsStr sql.NullString
 		var tool, decision, actor sql.NullString
-		if err := rows.Scan(&e.Seq, &ts, &e.SessionID, &e.Kind, &tool, &argsStr, &decision, &actor, &e.Mode, &e.DecisionID, &e.PolicyHash, &e.AgentID, &e.PrevHash, &e.Hash); err != nil {
+		if err := rows.Scan(&e.Seq, &ts, &e.SessionID, &e.Kind, &tool, &argsStr, &decision, &actor, &e.Mode, &e.DecisionID, &e.PolicyHash, &e.AgentID, &e.Preempted, &e.PrevHash, &e.Hash); err != nil {
 			return nil, err
 		}
 		e.Timestamp, err = time.Parse(time.RFC3339Nano, ts.String)

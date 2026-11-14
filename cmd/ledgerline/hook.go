@@ -314,15 +314,14 @@ func decideHookGatewayWithAgent(gwURL, token, agentToken string, timeout time.Du
 		return hookOutcome{}, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return hookOutcome{}, fmt.Errorf("gateway: %s", strings.TrimSpace(string(raw)))
+		return hookOutcome{}, fmt.Errorf("gateway: %s", strings.TrimSpace(string(readErrorBody(resp))))
 	}
 	var dec struct {
 		Decision string `json:"decision"`
 		Reason   string `json:"reason"`
 	}
-	if err := json.Unmarshal(raw, &dec); err != nil {
+	if err := decodeGatewayResponse(resp.Body, &dec); err != nil {
 		return hookOutcome{}, fmt.Errorf("bad gateway answer: %w", err)
 	}
 	if dec.Decision == "allow" {

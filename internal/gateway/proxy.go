@@ -76,6 +76,15 @@ type Proxy struct {
 	peers      []PeerConfig
 	peerClient *http.Client // one client, 5 second timeout per peer
 
+	// Verified peer chains, scoped to this gateway. The cache
+	// lives on the struct, so a discarded gateway takes its
+	// cache with it. SetPeers clears it on reload, so a removed
+	// peer's chain never survives a peer reload. peerChainsMu
+	// guards lazy creation only. The cache itself has its own
+	// mutex.
+	peerChainsMu sync.Mutex
+	peerChains   *peerChainCache
+
 	// Mode flip state. policyMu guards the policy pointer,
 	// the policy hash, the overrides map, and the file
 	// paths. Readers take the read lock. A flip takes the
@@ -195,7 +204,7 @@ func New(upstream string, l ledger.Store, p *policy.Policy) (*Proxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	px := &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, probeClient: &http.Client{Timeout: 30 * time.Second}, peerClient: &http.Client{Timeout: peerTimeout}, approvals: NewApprovals(), proposals: NewProposals(), policyHash: p.Hash(), policyModes: policy.ModeOverrides{}}
+	px := &Proxy{upstream: u, ledger: l, policy: p, client: &http.Client{}, probeClient: &http.Client{Timeout: 30 * time.Second}, peerClient: &http.Client{Timeout: peerTimeout}, approvals: NewApprovals(), proposals: NewProposals(), policyHash: p.Hash(), policyModes: policy.ModeOverrides{}, peerChains: &peerChainCache{byURL: map[string]*cachedPeerChain{}}}
 	if err := px.recoverIdempotency(); err != nil {
 		return nil, err
 	}
@@ -226,11 +235,14 @@ func (px *Proxy) SetUpstreamPin(pin string) {
 }
 
 // SetPeers installs the peer gateway list for the dashboard
-// pull. Call it at startup, before serving.
+// pull. Call it at startup, before serving. It clears the
+// verified-chain cache, so a removed peer's chain never
+// survives a peer reload.
 func (px *Proxy) SetPeers(peers []PeerConfig) {
 	px.peersMu.Lock()
-	defer px.peersMu.Unlock()
 	px.peers = peers
+	px.peersMu.Unlock()
+	px.clearPeerChains()
 }
 
 // policyNow returns the current policy. The flip swaps the
@@ -360,7 +372,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodPost {
 				if isToolCall(body) {
 					tool, _ := toolCallDetails(body)
-					if _, ok := px.witnessPolicyDecision(session, tool, "deny", policy.ModePrevent.String(), agentID, w, body); !ok {
+					if _, ok := px.witnessPolicyDecision(session, tool, "deny", policy.ModePrevent.String(), agentID, "", w, body); !ok {
 						return
 					}
 				}
@@ -383,7 +395,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// rule. Detect mode does not change it. The detect
 		// promise covers policy rules only.
 		if px.broker != nil && px.broker.ContainsSecret(args) {
-			if _, ok := px.witnessPolicyDecision(session, tool, "deny", policy.ModePrevent.String(), agentID, w, body); !ok {
+			if _, ok := px.witnessPolicyDecision(session, tool, "deny", policy.ModePrevent.String(), agentID, "", w, body); !ok {
 				return
 			}
 			writeJSONRPCError(w, body, "ledgerline: tool arguments contain a brokered credential")
@@ -410,7 +422,13 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// drift denial. Both share one decision id. The
 		// policy_decision carries the rule action and the
 		// rule mode, so per-rule attribution survives the
-		// drift denial. The tool_call below reuses the id.
+		// drift denial. In prevent mode the drift gate denies
+		// before the rule action runs, so the recorded
+		// decision is marked preempted by drift. A hold that
+		// never gated anything and a session that never froze
+		// must not read as if they did. In detect mode the
+		// decision is a would-be decision, so it carries no
+		// preemption mark. The tool_call below reuses the id.
 		// A drifted tool is untrusted, but detect mode is
 		// the posture the human chose for this tool. The
 		// ledger shows both events, so the observation is
@@ -421,7 +439,11 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var decisionID string
 		var ok bool
 		if msg, denied := px.toolsGate(tool); denied {
-			decisionID, ok = px.witnessPolicyDecision(session, tool, decision.String(), mode.String(), agentID, w, body)
+			preempted := ""
+			if mode != policy.ModeDetect {
+				preempted = "tools_drift"
+			}
+			decisionID, ok = px.witnessPolicyDecision(session, tool, decision.String(), mode.String(), agentID, preempted, w, body)
 			if !ok {
 				return
 			}
@@ -465,7 +487,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			claim = &idemClaim{key: key, tool: tool, argsHash: idemArgsHash(args)}
 		}
 		if !driftDetected {
-			decisionID, ok = px.witnessPolicyDecision(session, tool, decision.String(), mode.String(), agentID, w, body)
+			decisionID, ok = px.witnessPolicyDecision(session, tool, decision.String(), mode.String(), agentID, "", w, body)
 			if !ok {
 				return
 			}
@@ -554,7 +576,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A batch cannot be observed call by call, so it cannot run
 	// under detect mode either.
 	if r.Method == http.MethodPost && isBatch(body) {
-		if _, ok := px.witnessPolicyDecision(session, "(batch)", policy.Deny.String(), policy.ModePrevent.String(), agentID, w, body); !ok {
+		if _, ok := px.witnessPolicyDecision(session, "(batch)", policy.Deny.String(), policy.ModePrevent.String(), agentID, "", w, body); !ok {
 			return
 		}
 		writeJSONRPCError(w, body, "ledgerline: batch requests are not accepted at this boundary")
@@ -638,17 +660,19 @@ func (px *Proxy) witnessDetailed(session, kind, tool string, args json.RawMessag
 
 // witnessPolicyDecision records one policy_decision event with
 // its mode, a fresh decision id, and the policy hash. It also
-// records the agent id. It returns the decision id. A follow-up
-// tool_call in detect mode reuses the id, so the dashboard can
-// link the pair. It fails closed like witness.
-func (px *Proxy) witnessPolicyDecision(session, tool, decision, mode, agentID string, w http.ResponseWriter, body []byte) (string, bool) {
+// records the agent id. Preempted names the gate that denied
+// the call before the recorded decision took effect. It is
+// empty unless the decision never ran. It returns the decision
+// id. A follow-up tool_call in detect mode reuses the id, so
+// the dashboard can link the pair. It fails closed like witness.
+func (px *Proxy) witnessPolicyDecision(session, tool, decision, mode, agentID, preempted string, w http.ResponseWriter, body []byte) (string, bool) {
 	id, err := newID()
 	if err != nil {
 		log.Printf("ledger write failed: cannot allocate decision id: %v", err)
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
 		return "", false
 	}
-	detail := ledger.EventDetail{Mode: mode, DecisionID: id, PolicyHash: px.policyHashNow(), AgentID: agentID}
+	detail := ledger.EventDetail{Mode: mode, DecisionID: id, PolicyHash: px.policyHashNow(), AgentID: agentID, Preempted: preempted}
 	if _, err := px.ledger.AppendDetailed(session, "policy_decision", tool, nil, decision, "", detail); err != nil {
 		log.Printf("ledger write failed: %v", err)
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")

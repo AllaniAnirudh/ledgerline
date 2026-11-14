@@ -212,7 +212,7 @@ async function apiPost(path, body) {
 function eventRows(events) {
   let html = '<table class="rows"><tr><th>Time</th><th>Gateway</th><th>Session</th><th>Tool</th><th>Kind</th><th>Decision</th><th>Mode</th><th>Actor</th></tr>';
   for (const e of events) {
-    html += '<tr><td>' + fmtTime(e.timestamp) + '</td><td>' + esc(e.gateway || 'local') + '</td><td>' + esc(e.session_id) + '</td><td>' + esc(e.tool || '-') + '</td><td>' + esc(e.kind) + '</td><td>' + esc(e.decision || '-') + '</td><td>' + esc(e.mode || '-') + '</td><td>' + esc(e.actor || '-') + '</td></tr>';
+    html += '<tr><td>' + fmtTime(e.timestamp) + '</td><td>' + esc(e.gateway || 'local') + '</td><td>' + esc(e.session_id) + '</td><td>' + esc(e.tool || '-') + '</td><td>' + esc(e.kind) + '</td><td>' + esc(e.decision || '-') + (e.preempted_by ? ' (preempted by ' + esc(e.preempted_by) + ')' : '') + '</td><td>' + esc(e.mode || '-') + '</td><td>' + esc(e.actor || '-') + '</td></tr>';
   }
   return html + '</table>';
 }
@@ -265,7 +265,7 @@ async function loadDrift() {
   const box = document.getElementById('drift');
   const tools = await api('/v1/tools');
   const r = await api('/v1/events?kind=tools_drift&limit=100');
-  let html = '<p class="meta">Drift is a boundary gate, not a policy rule. In detect mode a drifted tool runs. The ledger records the denial as a policy decision. In prevent mode the call is denied.</p>';
+  let html = '<p class="meta">Drift is a boundary gate, not a policy rule. In detect mode a drifted tool runs. The ledger records the denial as a policy decision. In prevent mode the call is denied. A rule decision the drift gate preempts in prevent mode is marked preempted, so the timeline never shows a hold that never gated anything.</p>';
   if (tools.baseline) {
     html += '<p>Baseline tools (unverified by the chain): ' + tools.baseline.tools.map(esc).join(', ') + '</p>';
   } else {

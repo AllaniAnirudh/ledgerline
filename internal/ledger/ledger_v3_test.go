@@ -166,7 +166,7 @@ CREATE TABLE events (
 	}
 	defer s.Close()
 
-	// The migration added the columns and stamped version 3.
+	// The migration added the columns and stamped version 4.
 	rows, err := s.db.Query(`PRAGMA table_info(events)`)
 	if err != nil {
 		t.Fatal(err)
@@ -184,7 +184,7 @@ CREATE TABLE events (
 		cols[name] = true
 	}
 	rows.Close()
-	for _, col := range []string{"mode", "decision_id", "policy_hash", "agent_id"} {
+	for _, col := range []string{"mode", "decision_id", "policy_hash", "agent_id", "preempted_by"} {
 		if !cols[col] {
 			t.Errorf("migration missed column %q", col)
 		}
@@ -193,8 +193,8 @@ CREATE TABLE events (
 	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Errorf("user_version = %d, want 3", version)
+	if version != 4 {
+		t.Errorf("user_version = %d, want 4", version)
 	}
 
 	// The old event reads back with empty new fields and verifies.
@@ -205,14 +205,14 @@ CREATE TABLE events (
 	if len(events) != 1 {
 		t.Fatalf("want 1 event, got %d", len(events))
 	}
-	if events[0].Mode != "" || events[0].DecisionID != "" || events[0].PolicyHash != "" || events[0].AgentID != "" {
+	if events[0].Mode != "" || events[0].DecisionID != "" || events[0].PolicyHash != "" || events[0].AgentID != "" || events[0].Preempted != "" {
 		t.Fatalf("old row should read back with empty new fields: %+v", events[0])
 	}
 	if err := s.Verify(); err != nil {
 		t.Fatalf("migrated v2 chain failed verify: %v", err)
 	}
 
-	// New appends on the migrated database use v3 and verify.
+	// New appends on the migrated database use v4 and verify.
 	if _, err := s.AppendDetailed("s1", "tool_call", "exec", nil, "allow", "", EventDetail{Mode: "detect", DecisionID: "id-2"}); err != nil {
 		t.Fatal(err)
 	}
