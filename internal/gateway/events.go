@@ -364,8 +364,8 @@ func (px *Proxy) serveSessions(w http.ResponseWriter, r *http.Request) {
 			}
 		case "tools_drift":
 			// A drift denial counts as denied. In detect
-			// mode the drift was observed and the call ran,
-			// so it counts as detected instead. A drift
+			// mode the drift was observed and the call was sent
+			// to run, so it counts as detected instead. A drift
 			// observation with no denial changes no count.
 			// A drift event that shares its decision id
 			// with the call's policy_decision is the same

@@ -113,7 +113,7 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 	decision, reason, mode := px.policyNow().DecideCall(tool, args)
 	// Detect mode changes every restrictive action the same way
 	// as the proxy path. The call is allowed. The ledger records
-	// the would-be decision first, then the tool_call that ran.
+	// the would-be decision first, then the tool_call sent to run.
 	// Both carry one decision id. Hold in detect queues nothing.
 	// Contain in detect freezes nothing. Propose in detect
 	// records a proposal marked detected and never queues it.
@@ -163,7 +163,7 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 		if detect {
 			// Record the proposal, marked detected. Do not
 			// queue it. A human must never apply a call that
-			// already ran.
+			// was already sent to run.
 			if _, err := px.ledger.AppendDetailed(session, "proposal", tool, args, "propose", "", detectDetail); err != nil {
 				http.Error(w, "ledgerline: ledger unavailable, boundary closed", http.StatusServiceUnavailable)
 				return

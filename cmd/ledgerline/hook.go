@@ -172,7 +172,7 @@ func resolveHoldTimeout(harness string, d time.Duration) (time.Duration, error) 
 // no human. Contain in detect freezes nothing. Propose in
 // detect records a proposal marked detected and allows the
 // call. The proposal is never queued here. The bridge has no
-// queue. A human must never apply a call that already ran.
+// queue. A human must never apply a call that was already sent to run.
 // Standalone calls are unattributed. No token key exists here
 // to validate an agent token against, so no agent id is ever
 // recorded. The bridge never invents one.

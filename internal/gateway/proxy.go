@@ -407,11 +407,11 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Detect mode changes every restrictive action the same
 		// way. The call always proceeds on the allow path. The
 		// ledger records the would-be decision first, then the
-		// tool_call that ran anyway. Both carry one decision
+		// tool_call sent to run. Both carry one decision
 		// id. Hold in detect queues nothing and asks no human.
 		// Contain in detect freezes nothing. Propose in detect
 		// records a proposal marked detected and never queues
-		// it. A human must never apply a call that already ran.
+		// it. A human must never apply a call that was already sent to run.
 		detect := mode == policy.ModeDetect && decision != policy.Allow
 		// Tools-drift gate: once a baseline exists, a tool
 		// name outside it is denied until a human accepts
@@ -561,7 +561,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// after the gates pass and before the upstream
 		// call. In detect mode the tool_call reuses the
 		// policy_decision id. The pair links the would-be
-		// decision to the call that ran anyway. A held call
+		// decision to the tool_call sent to run. A held call
 		// carries its witness from its release path. The
 		// same rule applies there: no allow before the
 		// gates pass.
@@ -785,8 +785,10 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	// the gate again) instead of replaying a denial. In
 	// detect mode the drift is observed and the call runs.
 	// The tools_drift event carries mode detect, so a reader
-	// can tell it apart from a denial. The allow the witness
-	// below records is then true: the call ran. In prevent
+	// can tell it apart from a denial. The tool_call the
+	// witness below records means the call passed the last
+	// gates and was sent to run. It does not prove the call
+	// executed upstream. In prevent
 	// mode the call is denied. No tool_call allow was
 	// witnessed yet for a fresh call or a held call, so
 	// the ledger holds no false tool_call. The arrival
