@@ -87,6 +87,9 @@ go build -o ledgerline ./cmd/ledgerline
 # and asks no human. A detected contain freezes nothing. A
 # detected propose records a proposal marked detected and never
 # queues it. A human must never apply a call that already ran.
+# The detect promise covers policy rules only. A batch, a
+# brokered secret, and a foreign brokered header still deny in
+# detect mode. Those are boundary refusals, not policy rules.
 # A rule with no mode means prevent. New rules start in detect
 # mode. Flip a rule to prevent only after a review window with
 # zero false positives. Every policy_decision event also carries
@@ -143,7 +146,11 @@ go build -o ledgerline ./cmd/ledgerline
 # probe. If the probe finds nothing, it takes the first
 # tools/list that passes through. It enforces the baseline from
 # then on. A tools/call for a name outside the baseline is
-# denied until a human accepts the new surface. The baseline
+# denied until a human accepts the new surface. In detect mode
+# the denial is observed instead. The ledger records a
+# policy_decision with deny and mode detect, then a tool_call
+# with decision allow. Both share one decision id. The call
+# runs. The baseline
 # survives restarts in the ledger store. A restart does not
 # grant the upstream amnesty. Removals and description/schema
 # changes go into the ledger as drift. They do not block calls

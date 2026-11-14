@@ -265,7 +265,7 @@ async function loadDrift() {
   const box = document.getElementById('drift');
   const tools = await api('/v1/tools');
   const r = await api('/v1/events?kind=tools_drift&limit=100');
-  let html = '';
+  let html = '<p class="meta">Drift is a boundary gate, not a policy rule. In detect mode a drifted tool runs. The ledger records the denial as a policy decision. In prevent mode the call is denied.</p>';
   if (tools.baseline) {
     html += '<p>Baseline tools (unverified by the chain): ' + tools.baseline.tools.map(esc).join(', ') + '</p>';
   } else {
@@ -317,7 +317,8 @@ async function flipMode(btn) {
 }
 
 load();
-setInterval(() => { violationCache = null; load(); }, 10000);
+setInterval(() => { if (!document.hidden) { violationCache = null; load(); } }, 60000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { violationCache = null; load(); } });
 </script>
 </body>
 </html>

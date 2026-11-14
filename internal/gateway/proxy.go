@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -289,7 +290,11 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session := sessionOf(r)
+	session, err := sessionOf(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	mcpID := r.Header.Get("Mcp-Session-Id")
 	px.observeMCP(session, mcpID)
 
@@ -337,7 +342,10 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The broker owns its headers. A request carrying a
 	// brokered header with a foreign value is denied before
 	// anything else. Tool calls witness the denial. Other
-	// traffic just fails.
+	// traffic just fails. This refusal is a boundary rule.
+	// Detect mode does not change it. The detect promise
+	// covers policy rules only. A foreign credential must
+	// never reach the ledger or the upstream.
 	if px.broker != nil {
 		if name := px.broker.ForeignHeader(r); name != "" {
 			msg := "ledgerline: foreign credential in header " + name
@@ -363,7 +371,9 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// A brokered secret in the arguments is denied before
 		// any witness that would record those arguments. The
 		// secret must never reach the ledger, the hold queue,
-		// or the proposal queue.
+		// or the proposal queue. This refusal is a boundary
+		// rule. Detect mode does not change it. The detect
+		// promise covers policy rules only.
 		if px.broker != nil && px.broker.ContainsSecret(args) {
 			if _, ok := px.witnessPolicyDecision(session, tool, "deny", policy.ModePrevent.String(), agentID, w, body); !ok {
 				return
@@ -371,22 +381,51 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSONRPCError(w, body, "ledgerline: tool arguments contain a brokered credential")
 			return
 		}
+		// Decide first. The drift gate needs the rule mode.
+		// DecideCall is pure. It writes nothing.
+		decision, reason, mode := px.policyNow().DecideCall(tool, args)
+		// Detect mode changes every restrictive action the same
+		// way. The call always proceeds on the allow path. The
+		// ledger records the would-be decision first, then the
+		// tool_call that ran anyway. Both carry one decision
+		// id. Hold in detect queues nothing and asks no human.
+		// Contain in detect freezes nothing. Propose in detect
+		// records a proposal marked detected and never queues
+		// it. A human must never apply a call that already ran.
+		detect := mode == policy.ModeDetect && decision != policy.Allow
 		// Tools-drift gate: once a baseline exists, a tool
 		// name outside it is denied until a human accepts
-		// the new surface. This runs before policy. A
-		// drifted tool would otherwise take the policy
-		// default.
+		// the new surface. Drift is a boundary gate, not a
+		// policy rule. In prevent mode it denies. In detect
+		// mode the denial is observed and the call runs.
+		// The policy_decision carries deny with mode detect.
+		// The tool_call below reuses its id. A drifted tool
+		// is untrusted, but detect mode is the posture the
+		// human chose for this tool. The ledger shows both
+		// events, so the observation is explicit.
+		driftDetected := false
+		var decisionID string
+		var ok bool
 		if msg, denied := px.toolsGate(tool); denied {
-			if !px.witness(session, "tools_drift", tool, nil, "deny", "", agentID, w, body) {
+			if mode == policy.ModeDetect {
+				decisionID, ok = px.witnessPolicyDecision(session, tool, policy.Deny.String(), policy.ModeDetect.String(), agentID, w, body)
+				if !ok {
+					return
+				}
+				driftDetected = true
+				detect = true
+			} else {
+				if !px.witness(session, "tools_drift", tool, nil, "deny", "", agentID, w, body) {
+					return
+				}
+				writeJSONRPCError(w, body, msg)
 				return
 			}
-			writeJSONRPCError(w, body, msg)
-			return
 		}
 		// Idempotency lookup: a retry with a key is answered
 		// from the journal when the journal says the call
-		// must not run again. The claim itself waits for
-		// the policy decision below. An allowed call claims
+		// must not run again. The claim itself waits until
+		// the policy decision above stands. An allowed call claims
 		// "started". A held call claims "held". Policy
 		// denials, containments, and proposals leave no
 		// record. A later retry re-evaluates current policy.
@@ -411,19 +450,11 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			claim = &idemClaim{key: key, tool: tool, argsHash: idemArgsHash(args)}
 		}
-		decision, reason, mode := px.policyNow().DecideCall(tool, args)
-		// Detect mode changes every restrictive action the same
-		// way. The call always proceeds on the allow path. The
-		// ledger records the would-be decision first, then the
-		// tool_call that ran anyway. Both carry one decision
-		// id. Hold in detect queues nothing and asks no human.
-		// Contain in detect freezes nothing. Propose in detect
-		// records a proposal marked detected and never queues
-		// it. A human must never apply a call that already ran.
-		detect := mode == policy.ModeDetect && decision != policy.Allow
-		decisionID, ok := px.witnessPolicyDecision(session, tool, decision.String(), mode.String(), agentID, w, body)
-		if !ok {
-			return
+		if !driftDetected {
+			decisionID, ok = px.witnessPolicyDecision(session, tool, decision.String(), mode.String(), agentID, w, body)
+			if !ok {
+				return
+			}
 		}
 		switch decision {
 		case policy.Deny:
@@ -487,28 +518,26 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// In detect mode the tool_call reuses the
+		// The tool_call is witnessed in forward, after the
+		// last gates. A containment or drift denial at
+		// forward time must never follow an allow. The
+		// witness rides the request. forward writes it
+		// after the gates pass and before the upstream
+		// call. In detect mode the tool_call reuses the
 		// policy_decision id. The pair links the would-be
-		// decision to the call that ran anyway.
-		toolCallOK := false
-		if detect {
-			toolCallOK = px.witnessDetailed(session, "tool_call", tool, args, policy.Allow.String(), "", ledger.EventDetail{Mode: mode.String(), DecisionID: decisionID, AgentID: agentID}, w, body)
-		} else {
-			toolCallOK = px.witness(session, "tool_call", tool, args, policy.Allow.String(), "", agentID, w, body)
-		}
-		if !toolCallOK {
-			if claim != nil {
-				// The call never ran. Its journal entry must
-				// not block retries as "started".
-				px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
-			}
-			return
-		}
+		// decision to the call that ran anyway. A held call
+		// carries no witness here. Its release path
+		// witnesses the allow itself.
+		r = withToolCallWitness(r, toolCallWitness{tool: tool, args: args, decisionID: decisionID, mode: mode.String(), agentID: agentID, detect: detect, driftDetected: driftDetected})
 	}
 
 	// A JSON-RPC batch could smuggle tool calls past the witness.
 	// The gateway cannot classify the calls inside it. Batches
 	// are refused at the boundary. The refusal is witnessed.
+	// This refusal is a boundary rule. Detect mode does not
+	// change it. The detect promise covers policy rules only.
+	// A batch cannot be observed call by call, so it cannot run
+	// under detect mode either.
 	if r.Method == http.MethodPost && isBatch(body) {
 		if _, ok := px.witnessPolicyDecision(session, "(batch)", policy.Deny.String(), policy.ModePrevent.String(), agentID, w, body); !ok {
 			return
@@ -614,15 +643,16 @@ func (px *Proxy) witnessPolicyDecision(session, tool, decision, mode, agentID st
 }
 
 // appendPolicyDecision records one policy_decision event with
-// its mode, a fresh decision id, and the policy hash. It is the
-// hook endpoint form of witnessPolicyDecision. It returns the
-// decision id. The caller answers the HTTP failure itself.
-func (px *Proxy) appendPolicyDecision(session, tool, decision string, mode policy.Mode) (string, error) {
+// its mode, a fresh decision id, and the policy hash. It also
+// records the agent id. It is the hook endpoint form of
+// witnessPolicyDecision. It returns the decision id. The caller
+// answers the HTTP failure itself.
+func (px *Proxy) appendPolicyDecision(session, tool, decision string, mode policy.Mode, agentID string) (string, error) {
 	id, err := newID()
 	if err != nil {
 		return "", err
 	}
-	detail := ledger.EventDetail{Mode: mode.String(), DecisionID: id, PolicyHash: px.policyHashNow()}
+	detail := ledger.EventDetail{Mode: mode.String(), DecisionID: id, PolicyHash: px.policyHashNow(), AgentID: agentID}
 	if _, err := px.ledger.AppendDetailed(session, "policy_decision", tool, nil, decision, "", detail); err != nil {
 		return "", err
 	}
@@ -631,11 +661,45 @@ func (px *Proxy) appendPolicyDecision(session, tool, decision string, mode polic
 
 // sessionOf reads the ledger session from the request. It defaults
 // to the shared "default" session when the header is absent.
-func sessionOf(r *http.Request) string {
+// "gateway" is reserved for the gateway's own rows. An agent
+// session with that name would hide among system rows. The
+// request is rejected instead of renamed. A rename would silently
+// merge two agents into one session.
+func sessionOf(r *http.Request) (string, error) {
 	if s := r.Header.Get("X-Ledgerline-Session"); s != "" {
-		return s
+		if strings.EqualFold(s, "gateway") {
+			return "", fmt.Errorf("ledgerline: session name %q is reserved", s)
+		}
+		return s, nil
 	}
-	return "default"
+	return "default", nil
+}
+
+// toolCallWitness is the tool_call allow a fresh call still owes
+// the ledger. ServeHTTP builds it. forward writes it after the
+// last gates pass. A held call carries none. Its release path
+// witnesses the allow itself.
+type toolCallWitness struct {
+	tool          string
+	args          json.RawMessage
+	decisionID    string
+	mode          string
+	agentID       string
+	detect        bool
+	driftDetected bool // arrival already recorded this drift
+}
+
+// toolCallWitnessKey is the request context key for the pending
+// tool_call witness. Only the fresh proxy path sets it.
+type toolCallWitnessKey struct{}
+
+func withToolCallWitness(r *http.Request, tw toolCallWitness) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), toolCallWitnessKey{}, tw))
+}
+
+func toolCallWitnessOf(r *http.Request) (toolCallWitness, bool) {
+	tw, ok := r.Context().Value(toolCallWitnessKey{}).(toolCallWitness)
+	return tw, ok
 }
 
 // forward passes the request upstream and streams the response back.
@@ -652,7 +716,11 @@ func sessionOf(r *http.Request) string {
 // A session contained after its hold was approved must still never
 // forward.
 func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, claim *idemClaim) {
-	session := sessionOf(r)
+	session, err := sessionOf(r)
+	if err != nil {
+		writeJSONRPCError(w, body, err.Error())
+		return
+	}
 	if px.IsContained(session, r.Header.Get("Mcp-Session-Id")) {
 		if _, err := px.ledger.AppendDetailed(session, "containment", "(session)", nil, "deny", "", ledger.EventDetail{AgentID: agentIDOf(r)}); err != nil {
 			log.Printf("ledger write failed on contained forward: %v", err)
@@ -671,19 +739,67 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	// list can move it even for a fresh call. The gate the
 	// call passed at arrival may no longer hold. A denied
 	// release never ran. A keyed retry runs fresh (and hits
-	// the gate again) instead of replaying a denial.
+	// the gate again) instead of replaying a denial. In
+	// detect mode the drift is observed and the call runs.
+	// The tools_drift event carries mode detect, so a reader
+	// can tell it apart from a denial. The allow the witness
+	// below records is then true: the call ran. In prevent
+	// mode the call is denied. No allow was witnessed yet
+	// for a fresh call, so the ledger holds no false allow.
+	// A held call is the exception. Its release path already
+	// witnessed the allow before this check. That path lives
+	// in approvals.go. It still needs the same move before
+	// the ledger is exact for held calls too.
 	if r.Method == http.MethodPost && isToolCall(body) {
 		if tool, _ := toolCallDetails(body); tool != "" {
 			if msg, denied := px.toolsGate(tool); denied {
-				if _, err := px.ledger.AppendDetailed(session, "tools_drift", tool, nil, "deny", "", ledger.EventDetail{AgentID: agentIDOf(r)}); err != nil {
-					log.Printf("ledger write failed on drift-denied forward: %v", err)
+				tw, hasWitness := toolCallWitnessOf(r)
+				if hasWitness && tw.driftDetected {
+					// The drift was already observed at
+					// arrival as a policy_decision. Do not
+					// record it twice. The call runs. The
+					// allow below reuses that id.
+				} else if hasWitness && tw.detect {
+					if _, err := px.ledger.AppendDetailed(session, "tools_drift", tool, nil, "deny", "", ledger.EventDetail{Mode: policy.ModeDetect.String(), AgentID: agentIDOf(r)}); err != nil {
+						log.Printf("ledger write failed on drift-denied forward: %v", err)
+						if claim != nil {
+							px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
+						}
+						writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
+						return
+					}
+				} else {
+					if _, err := px.ledger.AppendDetailed(session, "tools_drift", tool, nil, "deny", "", ledger.EventDetail{AgentID: agentIDOf(r)}); err != nil {
+						log.Printf("ledger write failed on drift-denied forward: %v", err)
+					}
+					if claim != nil {
+						px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
+					}
+					writeJSONRPCError(w, body, msg)
+					return
 				}
-				if claim != nil {
-					px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
-				}
-				writeJSONRPCError(w, body, msg)
-				return
 			}
+		}
+	}
+
+	// Witness the tool_call now, after the last gates. A fresh
+	// call carries its witness in the request. A held call
+	// carries none. Its release path witnessed the allow
+	// itself. A witness failure closes the boundary. The call
+	// never ran. Its journal entry must not block retries
+	// as "started".
+	if tw, hasWitness := toolCallWitnessOf(r); hasWitness {
+		witnessed := false
+		if tw.detect {
+			witnessed = px.witnessDetailed(session, "tool_call", tw.tool, tw.args, policy.Allow.String(), "", ledger.EventDetail{Mode: tw.mode, DecisionID: tw.decisionID, AgentID: tw.agentID}, w, body)
+		} else {
+			witnessed = px.witness(session, "tool_call", tw.tool, tw.args, policy.Allow.String(), "", tw.agentID, w, body)
+		}
+		if !witnessed {
+			if claim != nil {
+				px.idemTransition(session, claim.key, ledger.IdemDiscarded, nil)
+			}
+			return
 		}
 	}
 
