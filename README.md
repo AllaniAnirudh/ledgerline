@@ -150,7 +150,18 @@ go build -o ledgerline ./cmd/ledgerline
 # the denial is observed instead. The ledger records a
 # policy_decision with deny and mode detect, then a tool_call
 # with decision allow. Both share one decision id. The call
-# runs. The baseline
+# runs. The gateway checks the drift gate twice: once at
+# arrival, and again when it forwards. A baseline change
+# between the two checks denies the call in prevent mode
+# even when the arrival check allowed it. The ledger then
+# holds a policy_decision allow from arrival and a
+# tools_drift deny under one decision id, with no tool_call.
+# A policy_decision allow is the rule evaluation at
+# arrival. It is not proof the call ran. Only a tool_call
+# event proves the call ran. The allow carries no preempted
+# mark in that case. A held call is different. Its hold
+# genuinely parked the call, so a later drift denial does
+# not preempt its decision. The baseline
 # survives restarts in the ledger store. A restart does not
 # grant the upstream amnesty. Removals and description/schema
 # changes go into the ledger as drift. They do not block calls
@@ -463,7 +474,7 @@ Honest limits of the current build (also in `SECURITY.md`):
 - Upstream pinning covers the configured upstream URL only. It does not verify what the upstream server is. It does not cover MCP servers reached any other way. The pin proves the configured upstream string matches the pin file, nothing more. The pin file itself has no protection against a same-user process. The first run trusts whatever upstream was passed.
 - Proposal "apply" records claim a human applied the action out of band. With no control-plane token, anyone who can reach the port can create that record. Treat no-token local use as single-user only.
 - Idempotency is per key, per session, for 24 hours, up to 1000 journal records. A replay bypasses current policy by design. The same key means the same call. A replay never bypasses containment. A resolved-executed key never re-forwards, even if the resolution was wrong. The human owns that call, not the gateway. Journal rows are durable, not hash-chained. Only the unknown and resolved transitions go into the chain.
-- Tools-drift enforcement denies unknown tool names only. It acts only once a baseline exists. The first sighting is trusted (TOFU). A server already compromised before the first gateway start baselines its malicious tools. A tools/list response the gateway cannot parse changes nothing. In-memory mode loses the baseline on restart. The stored baseline row is not covered by chain verification. A process that can write the ledger DB can rewrite it while verify stays green. This is the same conceded DB-write power as the chain itself. Session bundles exclude gateway-wide baseline and drift events. The full chain holds them.
+- Tools-drift enforcement denies unknown tool names only. It acts only once a baseline exists. The first sighting is trusted (TOFU). A server already compromised before the first gateway start baselines its malicious tools. A tools/list response the gateway cannot parse changes nothing. In-memory mode loses the baseline on restart. The stored baseline row is not covered by chain verification. A process that can write the ledger DB can rewrite it while verify stays green. This is the same conceded DB-write power as the chain itself. Session bundles exclude gateway-wide baseline and drift events. The full chain holds them. A policy_decision allow is the rule evaluation at arrival. It is not proof the call ran. Only a tool_call event proves the call ran. A forward-time drift denial after an arrival allow leaves the allow with no preempted mark and no tool_call.
 - Ledger events carry mode, decision id, policy hash, and agent id (schema v3). Old v1 and v2 chains still verify. A database from an older build migrates on open. Detection mode doubles the events per matched call: one policy_decision plus one tool_call. The agent id is set when `--require-agent-token` is on. It stays empty without it. The policy hash covers the policy file bytes plus any dashboard mode overrides. A flip changes the hash.
 
 ## Dogfood note

@@ -662,7 +662,10 @@ func (px *Proxy) witnessDetailed(session, kind, tool string, args json.RawMessag
 // its mode, a fresh decision id, and the policy hash. It also
 // records the agent id. Preempted names the gate that denied
 // the call before the recorded decision took effect. It is
-// empty unless the decision never ran. It returns the decision
+// empty unless the decision never ran. One case breaks
+// that rule. A forward-time drift denial after an
+// arrival allow leaves preempted empty. The allow stays
+// unmarked, and no tool_call follows. It returns the decision
 // id. A follow-up tool_call in detect mode reuses the id, so
 // the dashboard can link the pair. It fails closed like witness.
 func (px *Proxy) witnessPolicyDecision(session, tool, decision, mode, agentID, preempted string, w http.ResponseWriter, body []byte) (string, bool) {
@@ -784,9 +787,13 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	// The tools_drift event carries mode detect, so a reader
 	// can tell it apart from a denial. The allow the witness
 	// below records is then true: the call ran. In prevent
-	// mode the call is denied. No allow was witnessed yet
-	// for a fresh call or a held call, so the ledger holds
-	// no false allow. Both paths carry their witness here.
+	// mode the call is denied. No tool_call allow was
+	// witnessed yet for a fresh call or a held call, so
+	// the ledger holds no false tool_call. The arrival
+	// policy_decision allow still stands. A forward-time
+	// drift denial after it leaves that allow unmarked,
+	// with no tool_call. Read the allow as the rule
+	// evaluation at arrival, not as proof the call ran.
 	// A forward-time drift reuses the arrival decision id
 	// when the witness carries one. The roster then counts
 	// the call once, not once per event.

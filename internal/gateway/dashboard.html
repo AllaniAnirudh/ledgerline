@@ -265,7 +265,7 @@ async function loadDrift() {
   const box = document.getElementById('drift');
   const tools = await api('/v1/tools');
   const r = await api('/v1/events?kind=tools_drift&limit=100');
-  let html = '<p class="meta">Drift is a boundary gate, not a policy rule. In detect mode a drifted tool runs. The ledger records the denial as a policy decision. In prevent mode the call is denied. A rule decision the drift gate preempts in prevent mode is marked preempted, so the timeline never shows a hold that never gated anything.</p>';
+  let html = '<p class="meta">Drift is a boundary gate, not a policy rule. In detect mode a drifted tool runs. The ledger records the denial as a policy decision. In prevent mode the call is denied. A rule decision the drift gate preempts in prevent mode is marked preempted, so the timeline never shows a hold that never gated anything. A policy_decision allow is the rule evaluation at arrival. It is not proof the call ran. Only a tool_call event proves the call ran. A forward-time drift denial after an arrival allow leaves the allow with no preempted mark and no tool_call.</p>';
   if (tools.baseline) {
     html += '<p>Baseline tools (unverified by the chain): ' + tools.baseline.tools.map(esc).join(', ') + '</p>';
   } else {
