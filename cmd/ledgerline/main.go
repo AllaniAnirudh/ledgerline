@@ -430,6 +430,13 @@ func decodeGatewayResponse(body io.Reader, v any) error {
 	return json.Unmarshal(raw, v)
 }
 
+// readErrorBody reads at most 1 MiB of an error response body.
+// A compromised gateway cannot OOM the CLI through an error body.
+func readErrorBody(resp *http.Response) []byte {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxGatewayResponseBytes))
+	return body
+}
+
 func fetchApprovals(gw, token string) ([]map[string]any, error) {
 	req, err := http.NewRequest(http.MethodGet, strings.TrimSuffix(gw, "/")+"/v1/approvals", nil)
 	if err != nil {
@@ -444,7 +451,7 @@ func fetchApprovals(gw, token string) ([]map[string]any, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		return nil, fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
 	}
 	var list []map[string]any
@@ -519,7 +526,7 @@ func runDecide(args []string, approve bool) error {
 		return err
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody := readErrorBody(resp)
 	if resp.StatusCode != http.StatusOK {
 		// A deny for an unknown approval may be a proposal.
 		// Deny falls through to the proposal queue before it
@@ -567,7 +574,7 @@ func denyProposal(gw, id, actor, token string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody := readErrorBody(resp)
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
 	}
 	return nil
@@ -631,7 +638,7 @@ func runContain(args []string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody := readErrorBody(resp)
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
 	}
 	fmt.Printf("contained %s by %s\n", id, *actor)
@@ -659,7 +666,7 @@ func runContained(args []string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
 	}
 	var list []map[string]any
@@ -699,7 +706,7 @@ func fetchProposals(gw, token string) ([]map[string]any, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		return nil, fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
 	}
 	var list []map[string]any
@@ -797,7 +804,7 @@ func runApply(args []string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody := readErrorBody(resp)
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
 	}
 	fmt.Printf("applied %s by %s\n", id, *actor)
@@ -831,7 +838,7 @@ func runIdempotency(args []string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
 	}
 	var list []map[string]any
@@ -907,7 +914,7 @@ func runResolve(args []string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody := readErrorBody(resp)
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
 	}
 	fmt.Printf("resolved %s/%s as %s\n", session, key, resolution)
@@ -936,7 +943,7 @@ func runTools(args []string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(body)))
 	}
 	var status struct {
@@ -999,7 +1006,7 @@ func runAcceptTools(args []string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody := readErrorBody(resp)
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
 	}
 	fmt.Println("re-approval pending: the next observed tool surface becomes the new baseline")
