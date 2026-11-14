@@ -526,6 +526,165 @@ func TestModeFlipPersistsAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestModeFlipUnattributedActor(t *testing.T) {
+	// No approver token is configured. Only the shared
+	// control token guards the call. The body actor is
+	// self-asserted. The ledger must not trust it.
+	px, _, _ := policyFileProxy(t, phaseCPolicyYAML)
+	code, raw := postAPI(t, px, "/v1/policy/mode", `{"rule_index":0,"mode":"detect","actor":"alice"}`, "s3cret")
+	if code != http.StatusOK {
+		t.Fatalf("flip: want 200, got %d (%s)", code, raw)
+	}
+	events, _ := px.Ledger().Events()
+	var saw bool
+	for _, e := range events {
+		if e.Kind != "policy_change" {
+			continue
+		}
+		saw = true
+		if e.Actor != "unattributed" {
+			t.Fatalf("policy_change actor = %q, want unattributed", e.Actor)
+		}
+	}
+	if !saw {
+		t.Fatal("no policy_change event in the ledger")
+	}
+}
+
+func TestModeFlipNeedsApproverToken(t *testing.T) {
+	px, _, _ := policyFileProxy(t, phaseCPolicyYAML)
+	px.SetApproverToken("alice", "alice-token")
+	// The shared control token alone cannot flip once
+	// approver tokens exist. The body name is unbound.
+	code, _ := postAPI(t, px, "/v1/policy/mode", `{"rule_index":0,"mode":"detect","actor":"alice"}`, "s3cret")
+	if code != http.StatusForbidden {
+		t.Fatalf("shared token flip: want 403, got %d", code)
+	}
+	// The bound token still flips.
+	code, raw := postAPI(t, px, "/v1/policy/mode", `{"rule_index":0,"mode":"detect","actor":"alice"}`, "alice-token")
+	if code != http.StatusOK {
+		t.Fatalf("approver token flip: want 200, got %d (%s)", code, raw)
+	}
+}
+
+func TestModeFlipCycleReturnsPristineHash(t *testing.T) {
+	px, _, modesPath := policyFileProxy(t, phaseCPolicyYAML)
+	px.SetApproverToken("alice", "alice-token")
+	before := px.policyHashNow()
+	flip := func(mode string) {
+		t.Helper()
+		code, raw := postAPI(t, px, "/v1/policy/mode", `{"rule_index":0,"mode":"`+mode+`","actor":"alice"}`, "alice-token")
+		if code != http.StatusOK {
+			t.Fatalf("flip to %s: want 200, got %d (%s)", mode, code, raw)
+		}
+	}
+	flip("detect")
+	if px.policyHashNow() == before {
+		t.Fatal("flip must change the hash")
+	}
+	flip("prevent")
+	if got := px.policyHashNow(); got != before {
+		t.Fatalf("flip-flip hash = %s, want pristine %s", got, before)
+	}
+	raw, err := os.ReadFile(modesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"overrides":[]}` {
+		t.Fatalf("modes file = %s, want empty overrides", raw)
+	}
+}
+
+// restartProxy builds a fresh proxy over the same policy file,
+// modes file, and ledger. It mirrors the restart path.
+func restartProxy(t *testing.T, policyPath, modesPath string, store ledger.Store) *Proxy {
+	t.Helper()
+	b, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`))
+	}))
+	t.Cleanup(upstream.Close)
+	modes, err := policy.LoadModeOverrides(modesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := policy.ParseWithOverrides(b, modes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	px, err := New(upstream.URL, store, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	px.SetPolicySource(policyPath, b, modesPath, modes)
+	return px
+}
+
+func TestModeFlipReconcilesFromLedger(t *testing.T) {
+	px, policyPath, modesPath := policyFileProxy(t, phaseCPolicyYAML)
+	px.SetApproverToken("alice", "alice-token")
+	code, _ := postAPI(t, px, "/v1/policy/mode", `{"rule_index":0,"mode":"detect","actor":"alice"}`, "alice-token")
+	if code != http.StatusOK {
+		t.Fatalf("flip: want 200, got %d", code)
+	}
+	flippedHash := px.policyHashNow()
+	// Simulate the crash window: the witness exists, but
+	// the modes file lost the flip.
+	if err := os.WriteFile(modesPath, []byte(`{"overrides":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	px2 := restartProxy(t, policyPath, modesPath, px.Ledger())
+	if err := px2.LoadPolicyModes(modesPath); err != nil {
+		t.Fatal(err)
+	}
+	if px2.policyHashNow() != flippedHash {
+		t.Fatalf("reconciled hash = %s, want %s", px2.policyHashNow(), flippedHash)
+	}
+	if px2.policyNow().Rules()[0].Mode != policy.ModeDetect {
+		t.Fatalf("reconciled rule 0 mode = %s, want detect", px2.policyNow().Rules()[0].Mode)
+	}
+	raw, err := os.ReadFile(modesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"mode":"detect"`) {
+		t.Fatalf("repaired modes file = %s", raw)
+	}
+}
+
+func TestModeFlipReconciliationPrefersLedger(t *testing.T) {
+	// The ledger holds one flip. The file claims one more
+	// that the ledger never saw. The ledger wins. The
+	// unwitnessed flip is dropped.
+	px, policyPath, modesPath := policyFileProxy(t, phaseCPolicyYAML)
+	px.SetApproverToken("alice", "alice-token")
+	code, _ := postAPI(t, px, "/v1/policy/mode", `{"rule_index":1,"mode":"prevent","actor":"alice"}`, "alice-token")
+	if code != http.StatusOK {
+		t.Fatalf("flip: want 200, got %d", code)
+	}
+	flippedHash := px.policyHashNow()
+	if err := os.WriteFile(modesPath, []byte(`{"overrides":[{"rule_index":0,"mode":"detect"},{"rule_index":1,"mode":"prevent"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	px2 := restartProxy(t, policyPath, modesPath, px.Ledger())
+	if err := px2.LoadPolicyModes(modesPath); err != nil {
+		t.Fatal(err)
+	}
+	if px2.policyHashNow() != flippedHash {
+		t.Fatalf("reconciled hash = %s, want %s", px2.policyHashNow(), flippedHash)
+	}
+	rules := px2.policyNow().Rules()
+	if rules[0].Mode != policy.ModePrevent {
+		t.Fatalf("unwitnessed flip survived: rule 0 = %s", rules[0].Mode)
+	}
+	if rules[1].Mode != policy.ModePrevent {
+		t.Fatalf("rule 1 mode = %s, want prevent", rules[1].Mode)
+	}
+}
+
 func TestDashboardHeaders(t *testing.T) {
 	px, _ := testProxy(t)
 	px.SetAPIToken("s3cret")

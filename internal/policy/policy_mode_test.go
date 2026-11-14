@@ -82,6 +82,65 @@ func TestStaticPoliciesArePrevent(t *testing.T) {
 	}
 }
 
+func TestDefaultModeFromYAML(t *testing.T) {
+	p, err := Parse([]byte("version: 1\ndefault: deny\ndefault_mode: detect\nrules:\n  - tool: exec\n    action: deny\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Default() != Deny {
+		t.Errorf("default = %v, want deny", p.Default())
+	}
+	if p.DefaultMode() != ModeDetect {
+		t.Errorf("default mode = %q, want detect", p.DefaultMode())
+	}
+	// An unmatched call takes the default decision and the
+	// default mode. A detect-first rollout now covers it.
+	if d, _, mode := p.DecideCall("other", nil); d != Deny || mode != ModeDetect {
+		t.Errorf("other = %v/%v, want deny/detect", d, mode)
+	}
+	// A matched rule still uses its own mode.
+	if d, _, mode := p.DecideCall("exec", nil); d != Deny || mode != ModePrevent {
+		t.Errorf("exec = %v/%v, want deny/prevent", d, mode)
+	}
+}
+
+func TestDefaultModeAbsentIsPrevent(t *testing.T) {
+	p, err := Parse([]byte("version: 1\ndefault: deny\nrules:\n  - tool: exec\n    action: deny\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.DefaultMode() != ModePrevent {
+		t.Errorf("default mode = %q, want prevent (absent default_mode)", p.DefaultMode())
+	}
+	if d, _, mode := p.DecideCall("other", nil); d != Deny || mode != ModePrevent {
+		t.Errorf("other = %v/%v, want deny/prevent", d, mode)
+	}
+}
+
+func TestDefaultModeRejectsUnknown(t *testing.T) {
+	if _, err := Parse([]byte("version: 1\ndefault: deny\ndefault_mode: observe\nrules:\n  - tool: exec\n    action: deny\n")); err == nil {
+		t.Error("unknown default_mode should fail")
+	}
+	// Mode matching is case-insensitive. A mixed-case mode parses.
+	p, err := Parse([]byte("version: 1\ndefault: deny\ndefault_mode: Detect\nrules:\n  - tool: exec\n    action: deny\n"))
+	if err != nil {
+		t.Fatalf("mixed-case default_mode should parse: %v", err)
+	}
+	if p.DefaultMode() != ModeDetect {
+		t.Errorf("default mode = %q, want detect", p.DefaultMode())
+	}
+}
+
+func TestStaticPolicyDefaultModeIsPrevent(t *testing.T) {
+	p := New(nil, nil)
+	if p.DefaultMode() != ModePrevent {
+		t.Errorf("default mode = %q, want prevent", p.DefaultMode())
+	}
+	if d, _, mode := p.DecideCall("other", nil); d != Allow || mode != ModePrevent {
+		t.Errorf("other = %v/%v, want allow/prevent", d, mode)
+	}
+}
+
 func TestPolicyHash(t *testing.T) {
 	yaml := []byte("version: 1\nrules:\n  - tool: exec\n    action: deny\n")
 	p, err := Parse(yaml)

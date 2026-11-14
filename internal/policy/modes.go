@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 )
 
@@ -65,9 +66,34 @@ func EffectiveHash(fileBytes []byte, o ModeOverrides) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// PruneModeOverrides drops entries that equal the base policy
+// rule mode. An override that changes nothing must not linger
+// in the file. A full flip-flip cycle then returns the policy
+// hash to the pristine file hash. An index outside the base
+// policy is kept. ParseWithOverrides rejects it honestly.
+func PruneModeOverrides(base *Policy, o ModeOverrides) ModeOverrides {
+	out := ModeOverrides{}
+	if base == nil {
+		for i, m := range o {
+			out[i] = m
+		}
+		return out
+	}
+	rules := base.Rules()
+	for i, m := range o {
+		if i >= 0 && i < len(rules) && rules[i].Mode == m {
+			continue
+		}
+		out[i] = m
+	}
+	return out
+}
+
 // LoadModeOverrides reads the overrides file. A missing file
 // means no overrides. An empty file means no overrides. A bad
-// mode or a negative index is a hard error.
+// mode, a negative index, or a duplicate rule index is a hard
+// error. A duplicate index used to let the last entry win in
+// silence. The file is corrupt input now, not a preference.
 func LoadModeOverrides(path string) (ModeOverrides, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -84,10 +110,15 @@ func LoadModeOverrides(path string) (ModeOverrides, error) {
 		return nil, fmt.Errorf("policy modes: %w", err)
 	}
 	out := ModeOverrides{}
+	seen := map[int]bool{}
 	for _, e := range f.Overrides {
 		if e.RuleIndex < 0 {
 			return nil, fmt.Errorf("policy modes: rule index %d is negative", e.RuleIndex)
 		}
+		if seen[e.RuleIndex] {
+			return nil, fmt.Errorf("policy modes: duplicate rule index %d", e.RuleIndex)
+		}
+		seen[e.RuleIndex] = true
 		m, err := ParseMode(e.Mode)
 		if err != nil {
 			return nil, fmt.Errorf("policy modes: rule %d: %w", e.RuleIndex, err)
@@ -97,10 +128,18 @@ func LoadModeOverrides(path string) (ModeOverrides, error) {
 	return out, nil
 }
 
-// SaveModeOverrides writes the overrides file. It writes a
-// temp file in the same directory and renames it. A reader
-// never sees a half-written file. The file mode is 0644.
-func SaveModeOverrides(path string, o ModeOverrides) error {
+// SaveModeOverrides writes the overrides file. It drops
+// entries that equal the base policy rule mode first, so a
+// flip back to the file mode leaves no trace. It writes a
+// fresh temp file in the same directory and renames it. A
+// reader never sees a half-written file. A fixed temp name
+// would let two gateway processes sharing one policy file
+// interleave their writes. os.CreateTemp gives each write
+// its own name. The file mode is 0600. The file is fsynced
+// before the rename, and the directory is fsynced after it,
+// so the rename itself is durable. A nil base skips pruning.
+func SaveModeOverrides(path string, base *Policy, o ModeOverrides) error {
+	o = PruneModeOverrides(base, o)
 	canon, err := canonicalOverrides(o)
 	if err != nil {
 		return err
@@ -114,13 +153,38 @@ func SaveModeOverrides(path string, o ModeOverrides) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err != nil {
+	dir := filepath.Dir(path)
+	tmpFile, err := os.CreateTemp(dir, ".modes-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := tmpFile.Name()
+	defer os.Remove(tmp)
+	if err := tmpFile.Chmod(0600); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if _, err := tmpFile.Write(b); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
 		return err
+	}
+	// Best effort: a directory fsync makes the rename
+	// durable. Some filesystems refuse it. The rename
+	// already happened. A failed directory sync does not
+	// undo the write.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return nil
 }
