@@ -5,9 +5,16 @@
 // with HMAC-SHA256. The gateway checks it on every proxy request.
 //
 // Form: base64url(payload) + "." + base64url(signature). The
-// payload is JSON with agent_id, owner, iat, exp, and jti. The
-// signature covers the payload part only. A token carries no
+// payload is JSON with agent_id, owner, aud, iat, exp, and jti.
+// The signature covers the payload part only. A token carries no
 // secret. Anyone can read it. Only the key holder can mint one.
+//
+// The aud claim binds a token to one gateway. The audience is
+// the gateway upstream URL. A token with an audience is valid
+// only on a gateway that fronts that upstream. A token with no
+// audience is a legacy token. It stays valid on every gateway
+// until it expires. Its life is at most 7 days. Mint new tokens
+// with an audience. A future release may refuse legacy tokens.
 package token
 
 import (
@@ -35,13 +42,19 @@ const (
 // key is too weak for HMAC use here.
 const MinKeyBytes = 16
 
+// MaxClockSkew is the largest future issue time a token may
+// carry. Clocks differ. A token issued more than this far in
+// the future is refused. See Validate.
+const MaxClockSkew = 60 * time.Second
+
 // Claims is the signed payload of one token.
 type Claims struct {
-	AgentID string `json:"agent_id"`
-	Owner   string `json:"owner"`
-	Issued  int64  `json:"iat"`
-	Expires int64  `json:"exp"`
-	ID      string `json:"jti"`
+	AgentID  string `json:"agent_id"`
+	Owner    string `json:"owner"`
+	Audience string `json:"aud,omitempty"`
+	Issued   int64  `json:"iat"`
+	Expires  int64  `json:"exp"`
+	ID       string `json:"jti"`
 }
 
 // ExpiresAt returns the expiry as a time.
@@ -50,7 +63,18 @@ func (c *Claims) ExpiresAt() time.Time { return time.Unix(c.Expires, 0).UTC() }
 // Issue mints one token for an agent id and an owner. The ttl
 // must be over zero and at most MaxTTL. Issue assigns a fresh
 // random jti. Minting is offline. It writes no ledger event.
+// The token carries no audience. It is a legacy token. Prefer
+// IssueWithAudience for new tokens.
 func Issue(key []byte, agentID, owner string, ttl time.Duration) (string, *Claims, error) {
+	return IssueWithAudience(key, agentID, owner, ttl, "")
+}
+
+// IssueWithAudience mints one token bound to one audience. The
+// audience is the gateway upstream URL. An empty audience mints
+// a legacy token with no binding. The ttl must be over zero and
+// at most MaxTTL. IssueWithAudience assigns a fresh random jti.
+// Minting is offline. It writes no ledger event.
+func IssueWithAudience(key []byte, agentID, owner string, ttl time.Duration, audience string) (string, *Claims, error) {
 	if len(key) < MinKeyBytes {
 		return "", nil, errors.New("token key is too short")
 	}
@@ -72,11 +96,12 @@ func Issue(key []byte, agentID, owner string, ttl time.Duration) (string, *Claim
 	}
 	now := time.Now().UTC()
 	claims := &Claims{
-		AgentID: agentID,
-		Owner:   owner,
-		Issued:  now.Unix(),
-		Expires: now.Add(ttl).Unix(),
-		ID:      hex.EncodeToString(raw[:]),
+		AgentID:  agentID,
+		Owner:    owner,
+		Audience: strings.TrimSpace(audience),
+		Issued:   now.Unix(),
+		Expires:  now.Add(ttl).Unix(),
+		ID:       hex.EncodeToString(raw[:]),
 	}
 	payload, err := json.Marshal(claims)
 	if err != nil {
@@ -89,8 +114,23 @@ func Issue(key []byte, agentID, owner string, ttl time.Duration) (string, *Claim
 
 // Validate checks a token against a key. It checks the shape,
 // the signature, the agent id, the jti, and the expiry. It
-// returns the claims when every check passes.
+// returns the claims when every check passes. It enforces no
+// audience. A token that carries an audience is refused. Use
+// ValidateWithAudience when the gateway has an audience.
 func Validate(key []byte, tok string) (*Claims, error) {
+	return ValidateWithAudience(key, tok, "")
+}
+
+// ValidateWithAudience checks a token against a key and one
+// expected audience. It checks the shape, the signature, the
+// agent id, the jti, the audience, the issue time, and the
+// expiry. It returns the claims when every check passes. A
+// token with no audience is a legacy token. It passes the
+// audience check on any gateway. A token with an audience
+// passes only when the audience matches the expected value.
+// An issue time more than MaxClockSkew in the future is
+// refused. The expiry must sit after the issue time.
+func ValidateWithAudience(key []byte, tok string, expectedAud string) (*Claims, error) {
 	parts := strings.Split(tok, ".")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return nil, errors.New("token is malformed")
@@ -121,8 +161,18 @@ func Validate(key []byte, tok string) (*Claims, error) {
 	if strings.TrimSpace(claims.ID) == "" {
 		return nil, errors.New("token has no id")
 	}
-	if time.Now().UTC().Unix() >= claims.Expires {
+	if claims.Audience != "" && claims.Audience != expectedAud {
+		return nil, errors.New("token audience does not match this gateway")
+	}
+	now := time.Now().UTC().Unix()
+	if claims.Issued > now+int64(MaxClockSkew/time.Second) {
+		return nil, errors.New("token issued in the future")
+	}
+	if now >= claims.Expires {
 		return nil, errors.New("token is expired")
+	}
+	if claims.Expires <= claims.Issued {
+		return nil, errors.New("token expiry is not after its issue time")
 	}
 	return &claims, nil
 }

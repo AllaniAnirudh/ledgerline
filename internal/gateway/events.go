@@ -343,13 +343,18 @@ type revokeRequest struct {
 	JTI string `json:"jti"`
 }
 
-// serveTokensRevoke answers POST /v1/tokens/revoke. It records
-// a token_revoked event in the ledger, then persists the jti.
-// The actor is the approver name when a per-approver token was
-// used. A revoked token is rejected from then on, across
-// restarts. Revoking an unknown jti still succeeds. It is
-// idempotent. A ledger failure refuses the revocation. The
-// caller retries.
+// serveTokensRevoke answers POST /v1/tokens/revoke. It revokes
+// the jti in memory first, then records a token_revoked event
+// in the ledger, then persists the revocation file. The actor
+// is the approver name when a per-approver token was used. A
+// revoked token is rejected from then on. Revoking an unknown
+// jti still succeeds. It is idempotent. A ledger failure
+// refuses the witness, not the revocation. The revocation
+// already stands in memory. The response says so. The caller
+// retries to get the witness. A file failure does not refuse
+// the revocation either. The response stays 200 with ok true
+// and persisted false, plus the persist error. The revocation
+// stands until a restart. The caller must know that.
 func (px *Proxy) serveTokensRevoke(w http.ResponseWriter, r *http.Request) {
 	var req revokeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -361,15 +366,17 @@ func (px *Proxy) serveTokensRevoke(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "revoke needs a jti", http.StatusBadRequest)
 		return
 	}
+	px.markRevoked(req.JTI)
 	actor, _ := px.approverActor(r)
 	args, _ := json.Marshal(map[string]string{"jti": req.JTI})
 	if _, err := px.ledger.AppendDetailed("gateway", "token_revoked", "(token)", args, "revoke", actor, ledger.EventDetail{}); err != nil {
-		http.Error(w, "ledger write failed", http.StatusInternalServerError)
+		http.Error(w, "ledger write failed; revocation stands in memory but is not witnessed", http.StatusInternalServerError)
 		return
 	}
-	if err := px.RevokeToken(req.JTI); err != nil {
-		http.Error(w, "revocation file write failed", http.StatusInternalServerError)
-		return
+	resp := map[string]any{"ok": true, "jti": req.JTI, "persisted": true}
+	if err := px.persistRevocations(); err != nil {
+		resp["persisted"] = false
+		resp["persist_error"] = err.Error()
 	}
-	writeJSON(w, map[string]any{"ok": true, "jti": req.JTI})
+	writeJSON(w, resp)
 }

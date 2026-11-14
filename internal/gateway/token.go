@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/AllaniAnirudh/ledgerline/internal/token"
 )
@@ -17,6 +18,22 @@ import (
 // agentTokenHeader carries the gateway-issued identity token on
 // proxy-path requests. It never reaches upstream.
 const agentTokenHeader = "X-Ledgerline-Agent-Token"
+
+// agentTokenOf reads the agent token from one proxy-path
+// request. The custom header wins. Authorization: Bearer is
+// the standard form. It is accepted too. Any other scheme is
+// ignored. The value never reaches upstream. The proxy strips
+// both headers before it forwards.
+func agentTokenOf(r *http.Request) string {
+	if tok := strings.TrimSpace(r.Header.Get(agentTokenHeader)); tok != "" {
+		return tok
+	}
+	auth := r.Header.Get("Authorization")
+	if len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return ""
+}
 
 // agentIDKey is the request context key for the validated agent
 // id. Only the proxy path sets it. The control plane never sets
@@ -60,19 +77,39 @@ func (px *Proxy) RequireAgentToken() bool { return px.requireAgentToken }
 // A missing, invalid, expired, or revoked token is an error.
 // The caller answers with 401 and writes no ledger event. There
 // is no agent id to attribute, so there is nothing to witness.
+// Signature validation and the revocation check run under one
+// hold of revokedMu. A revoke that lands between the two cannot
+// slip one request through. RevokeToken takes the same lock, so
+// it waits until this check finishes.
 func (px *Proxy) validateAgentToken(r *http.Request) (*token.Claims, error) {
-	tok := r.Header.Get(agentTokenHeader)
+	tok := agentTokenOf(r)
 	if tok == "" {
 		return nil, errors.New("no agent token")
 	}
-	claims, err := token.Validate(px.tokenKey, tok)
+	px.revokedMu.Lock()
+	defer px.revokedMu.Unlock()
+	claims, err := token.ValidateWithAudience(px.tokenKey, tok, px.tokenAudience())
 	if err != nil {
 		return nil, err
 	}
-	if px.isRevoked(claims.ID) {
+	if px.revoked != nil && px.revoked[claims.ID] {
 		return nil, errors.New("token is revoked")
 	}
 	return claims, nil
+}
+
+// tokenAudience is the audience this gateway expects on agent
+// tokens. It is the upstream URL. Each gateway fronts one
+// upstream, so the URL names the gateway. A token minted for
+// another upstream is refused. A token with no audience is a
+// legacy token. It passes on any gateway until it expires. Two
+// gateways that front the same upstream and share one key still
+// accept each other's tokens. Separate keys give full isolation.
+func (px *Proxy) tokenAudience() string {
+	if px.upstream == nil {
+		return ""
+	}
+	return px.upstream.String()
 }
 
 // isRevoked reports whether a token id is revoked.
@@ -87,14 +124,30 @@ func (px *Proxy) isRevoked(jti string) bool {
 // returns an error when the file cannot be written. The in-memory
 // mark still stands in that case.
 func (px *Proxy) RevokeToken(jti string) error {
+	px.markRevoked(jti)
+	return px.persistRevocations()
+}
+
+// markRevoked marks one token id revoked in memory only. The
+// mark stands at once. It does not touch the file. The caller
+// persists separately when the revocation must survive a restart.
+func (px *Proxy) markRevoked(jti string) {
 	px.revokedMu.Lock()
+	defer px.revokedMu.Unlock()
 	if px.revoked == nil {
 		px.revoked = map[string]bool{}
 	}
 	px.revoked[jti] = true
-	err := px.saveRevocationsLocked()
-	px.revokedMu.Unlock()
-	return err
+}
+
+// persistRevocations writes the revoked ids to the file. It
+// returns an error when the file cannot be written. The
+// in-memory marks still stand in that case. A restart loses
+// them, so the caller must report the failure honestly.
+func (px *Proxy) persistRevocations() error {
+	px.revokedMu.Lock()
+	defer px.revokedMu.Unlock()
+	return px.saveRevocationsLocked()
 }
 
 // loadRevocations reads the revocation file into memory. A file
