@@ -100,7 +100,7 @@ func TestContainDeniesPendingHolds(t *testing.T) {
 		t.Fatal("held call never appeared")
 	}
 
-	px.Contain("test-session", "tester", "suspicious hold")
+	px.Contain("test-session", "tester", "suspicious hold", "")
 	out := <-done
 	errObj, ok := out["error"].(map[string]any)
 	if !ok || !strings.Contains(errObj["message"].(string), "denied") {

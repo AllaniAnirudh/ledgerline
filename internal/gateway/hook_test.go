@@ -319,7 +319,7 @@ func TestHookContainedWitness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	px.Contain("s1", "", "test")
+	px.Contain("s1", "", "test", "")
 	_, out := postHook(t, px, "bash", `{}`, "s1", "")
 	if out["decision"] != "deny" {
 		t.Fatalf("contained session should deny, got %v", out)
@@ -348,7 +348,7 @@ func TestHookContainedSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	px.Contain("s1", "", "test")
+	px.Contain("s1", "", "test", "")
 	_, out := postHook(t, px, "bash", `{}`, "s1", "")
 	if out["decision"] != "deny" {
 		t.Fatalf("contained session should deny, got %v", out)

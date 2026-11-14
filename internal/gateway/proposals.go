@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/AllaniAnirudh/ledgerline/internal/ledger"
 )
 
 // Proposal is one tool call recorded for out-of-band application.
@@ -217,7 +219,7 @@ func (px *Proxy) decideProposal(w http.ResponseWriter, r *http.Request) {
 // witness rolls the queue entry back. The human decision afterwards
 // only records apply or deny. Application itself happens out of
 // band, by the human, outside the gateway.
-func (px *Proxy) propose(w http.ResponseWriter, session string, body []byte, tool string, args json.RawMessage) {
+func (px *Proxy) propose(w http.ResponseWriter, session string, body []byte, tool string, args json.RawMessage, agentID string) {
 	pr, isNew, err := px.proposals.AddDedup(session, tool, args)
 	if err != nil {
 		writeJSONRPCError(w, body, "ledgerline: proposal queue full, boundary closed")
@@ -229,7 +231,7 @@ func (px *Proxy) propose(w http.ResponseWriter, session string, body []byte, too
 		px.proposeResult(w, body, text)
 		return
 	}
-	if _, err := px.ledger.Append(session, "proposal", tool, args, "propose", ""); err != nil {
+	if _, err := px.ledger.AppendDetailed(session, "proposal", tool, args, "propose", "", ledger.EventDetail{AgentID: agentID}); err != nil {
 		px.proposals.Remove(pr.ID)
 		log.Printf("ledger write failed on proposal: %v", err)
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")

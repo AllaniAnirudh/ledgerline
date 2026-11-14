@@ -56,10 +56,11 @@ go build -o ledgerline ./cmd/ledgerline
 # upstream MCP session id seen on that session. Rotating the
 # session header alone does not evade it. The agent must also
 # abandon its upstream MCP session. This raises the cost of
-# evasion. It does not remove it. The proxy path has no
-# authentication by design. A fresh MCP session is a new
-# identity. Full binding needs proxy-path client auth. A human
-# can also freeze a session from the control plane at any time:
+# evasion. It does not remove it. Without proxy-path agent
+# tokens, a fresh MCP session is a new identity. With tokens on
+# (--require-agent-token), the agent id is bound to the token.
+# A human can also freeze a session from the control plane at
+# any time:
 #   ./ledgerline contain <session-id> --reason "suspicious holds"
 #   ./ledgerline contained
 # Note: clients that send no session header share the "default"
@@ -246,10 +247,69 @@ go build -o ledgerline ./cmd/ledgerline
 # Guard the control plane before you expose the gateway beyond
 # loopback. With no token, anyone who can reach the port can
 # read the ledger. This includes arguments. Such a person can
-# also decide approvals. The proxy path itself has no
-# authentication by design. Anyone who can reach the port can
-# also send tool calls to your upstream server.
+# also decide approvals. The proxy path has no authentication
+# unless you turn it on (see agent tokens below). Without it,
+# anyone who can reach the port can send tool calls to your
+# upstream server.
 ./ledgerline gateway ... --api-token "$LEDGERLINE_API_TOKEN"
+
+# Agent identity tokens (opt-in proxy-path auth). The gateway
+# mints short-lived HMAC-SHA256 tokens. Each token names one
+# agent id and one owner. The owner is the human or job that
+# started the session. The gateway checks the token on every
+# proxy-path request, not only at connect. A missing, invalid,
+# expired, or revoked token gets HTTP 401 with a JSON-RPC error
+# body. The rejection is not witnessed in the ledger. There is
+# no agent id to attribute. It is logged to stderr.
+# Make a key first. The key file holds one hex or base64 key:
+#   openssl rand -hex 32 > token.key
+# Mint a token. The default life is 8 hours. The max is 7 days.
+# Minting is offline. It writes no ledger event. It prints the
+# token on the first line and its expiry on the second line:
+#   ./ledgerline token issue --agent agent-1 --owner buppy --key-file token.key
+#   ./ledgerline token issue --agent agent-1 --owner buppy --ttl 24h --key-file token.key
+# The key can also come from env LEDGERLINE_TOKEN_KEY.
+# Send the token on every proxy-path request:
+#   curl ... -H 'X-Ledgerline-Agent-Token: <token>' ...
+# Turn checks on at the gateway. The flag without a key refuses
+# to start:
+#   ./ledgerline gateway ... --token-key-file token.key --require-agent-token
+# Revoke a token from the control plane. The jti is the token
+# id. Minting prints no jti. Decode the token payload to read
+# it: the payload is the first base64url part. Revocation
+# persists in ledgerline-revoked-tokens.json (next to --db, or
+# in the working directory). It survives a gateway restart.
+# A revoked token stays rejected:
+#   curl -X POST http://localhost:8080/v1/tokens/revoke \
+#     -H 'X-Ledgerline-Token: <api-token>' -d '{"jti":"<jti>"}'
+# The gateway never forwards the agent token upstream. It also
+# strips Authorization and X-Ledgerline-Token from upstream
+# requests. Agent identity stays at the gateway.
+# The agent id lands on every event the proxy path writes, as
+# agent_id. Without --require-agent-token, agent_id stays empty.
+# Rows are then labelled by session id, not by agent.
+# Known limit: the idempotency journal stays keyed by session
+# header. Two agents that share one session header share its
+# idempotency namespace. Give each agent its own session header
+# when that matters.
+
+# Dashboard read API. Both endpoints sit behind the same
+# control-plane token check as the rest of /v1. They add no
+# second auth system.
+# GET /v1/events lists ledger events. Filters are query params:
+# session, tool, kind, decision, mode, from, to (RFC 3339).
+# Paging is limit (default 100, max 500) and offset (default 0).
+# The answer is {events, total, limit, offset}. The whole chain
+# is loaded for the query. Filtering happens in memory.
+#   curl 'http://localhost:8080/v1/events?session=s1&decision=deny&limit=50'
+# GET /v1/sessions is a roster summary. One row per session id.
+# Each row shows total calls, allowed calls, denied calls,
+# detected would-be denials, holds, proposals, containment
+# count, first seen, last seen, status, and agent ids seen on
+# the session. Status is contained, active, or idle. Active
+# means an event in the last 5 minutes. A row is a session,
+# never an agent.
+#   curl http://localhost:8080/v1/sessions
 
 # Bind approver names to credentials with per-approver tokens.
 # A decision made with one goes into the ledger under the bound
@@ -271,8 +331,8 @@ go build -o ledgerline ./cmd/ledgerline
 
 ## Layout
 
-- `cmd/ledgerline` holds the CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `idempotency`, `resolve`, `tools`, `accept-tools`, `export`, `verify`, `run`, `hook`
-- `internal/gateway` is the boundary proxy. It intercepts `tools/call`. It consults policy. It holds calls for approval. It contains sessions. It records proposals. It brokers upstream credentials. It forwards the rest. It serves the `/v1/*` API, the `/approvals` page, and `/replay`
+- `cmd/ledgerline` holds the CLI: `gateway`, `approvals`, `approve`, `deny`, `contain`, `contained`, `proposals`, `apply`, `idempotency`, `resolve`, `tools`, `accept-tools`, `export`, `verify`, `run`, `hook`, `token`
+- `internal/gateway` is the boundary proxy. It intercepts `tools/call`. It consults policy. It holds calls for approval. It contains sessions. It records proposals. It brokers upstream credentials. It forwards the rest. It serves the `/v1/*` API, the `/approvals` page, and `/replay`. It checks agent tokens on the proxy path when `--require-agent-token` is set. It serves the dashboard read API (`/v1/events`, `/v1/sessions`) and token revocation (`POST /v1/tokens/revoke`)
 - `internal/ledger` holds the `Store` interface, the in-memory chain, the SQLite backend, and chain verification
 - `internal/policy` makes allow/deny/hold/contain/propose decisions from a YAML policy file or static lists. The YAML file uses ordered rules, glob tool names, and decoded-JSON argument matching that fails closed. It has a configurable default. Static list entries are tool globs. Each rule carries a mode: prevent enforces the action, detect only records what would have happened and lets the call run. A rule with no mode means prevent
 - `internal/pty` is PTY co-capture. It runs a command. It witnesses terminal output into the same ledger
@@ -290,12 +350,12 @@ Honest limits of the current build (also in `SECURITY.md`):
 - The gateway sets no timeout on upstream calls. Long-lived streaming sessions are never cut off. A hung upstream holds a request open.
 - Capture records the call and its policy outcome. It does not record the upstream result or the call duration. Keyed calls are the exception. Their redacted responses go into the journal up to 1 MiB for replay. Larger responses complete without a replay copy.
 - Containment is a session freeze inside a running gateway. It is not a kill switch that survives a gateway restart. A contained session unfreezes if the gateway restarts. Cancelling an in-flight request stops the gateway waiting. It cuts the response, so nothing from it reaches the agent. Whether the upstream itself stops depends on it observing cancellation. A started stream does stop. A plain request still awaiting its first byte may run to completion server-side, with its result discarded. Cancelling never undoes a side effect the upstream already executed.
-- Containment binds the ledger session header. It also binds the upstream MCP sessions observed on it. Rotating the ledger header alone does not evade it. Starting a fresh upstream MCP session does evade it. Without proxy-path client authentication, a new MCP session is a new identity.
+- Containment binds the ledger session header. It also binds the upstream MCP sessions observed on it. Rotating the ledger header alone does not evade it. Starting a fresh upstream MCP session does evade it. Without proxy-path agent tokens, a new MCP session is a new identity. With tokens on, the agent id is bound to the token.
 - Upstream pinning covers the configured upstream URL only. It does not verify what the upstream server is. It does not cover MCP servers reached any other way. The pin proves the configured upstream string matches the pin file, nothing more. The pin file itself has no protection against a same-user process. The first run trusts whatever upstream was passed.
 - Proposal "apply" records claim a human applied the action out of band. With no control-plane token, anyone who can reach the port can create that record. Treat no-token local use as single-user only.
 - Idempotency is per key, per session, for 24 hours, up to 1000 journal records. A replay bypasses current policy by design. The same key means the same call. A replay never bypasses containment. A resolved-executed key never re-forwards, even if the resolution was wrong. The human owns that call, not the gateway. Journal rows are durable, not hash-chained. Only the unknown and resolved transitions go into the chain.
 - Tools-drift enforcement denies unknown tool names only. It acts only once a baseline exists. The first sighting is trusted (TOFU). A server already compromised before the first gateway start baselines its malicious tools. A tools/list response the gateway cannot parse changes nothing. In-memory mode loses the baseline on restart. The stored baseline row is not covered by chain verification. A process that can write the ledger DB can rewrite it while verify stays green. This is the same conceded DB-write power as the chain itself. Session bundles exclude gateway-wide baseline and drift events. The full chain holds them.
-- Ledger events carry mode, decision id, policy hash, and agent id (schema v3). Old v1 and v2 chains still verify. A database from an older build migrates on open. Detection mode doubles the events per matched call: one policy_decision plus one tool_call.
+- Ledger events carry mode, decision id, policy hash, and agent id (schema v3). Old v1 and v2 chains still verify. A database from an older build migrates on open. Detection mode doubles the events per matched call: one policy_decision plus one tool_call. The agent id is set when `--require-agent-token` is on. It stays empty without it.
 
 ## Dogfood note
 

@@ -138,7 +138,7 @@ func (px *Proxy) serveHook(w http.ResponseWriter, r *http.Request) {
 		if reason != "" {
 			msg += ": " + reason
 		}
-		px.Contain(session, "", reason)
+		px.Contain(session, "", reason, "")
 		writeJSON(w, hookDecision{Decision: "deny", Reason: msg})
 	case policy.Propose:
 		if detect {

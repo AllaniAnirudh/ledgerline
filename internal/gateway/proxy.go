@@ -62,6 +62,16 @@ type Proxy struct {
 	pinConfigured bool
 	policyHash    string // SHA-256 hex of the policy file, captured at startup
 
+	// Agent token auth (opt-in). When requireAgentToken is set,
+	// every proxy-path request must carry a valid token. The
+	// key signs and checks tokens. Revoked token ids live in
+	// memory and in the revocation file. See token.go.
+	requireAgentToken bool
+	tokenKey          []byte
+	revokedMu         sync.Mutex
+	revoked           map[string]bool
+	revokeFile        string
+
 	inflightMu sync.Mutex
 	inflight   map[string]map[*inflightReq]struct{}
 
@@ -225,6 +235,21 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mcpID := r.Header.Get("Mcp-Session-Id")
 	px.observeMCP(session, mcpID)
 
+	// Agent token check. It runs before containment, policy,
+	// and forwarding. A rejected request is not witnessed. It
+	// has no agent id to attribute. The rejection goes to
+	// stderr only. The control plane above never needs it.
+	agentID := ""
+	if px.requireAgentToken {
+		claims, err := px.validateAgentToken(r)
+		if err != nil {
+			px.rejectAgentAuth(w, body, err)
+			return
+		}
+		agentID = claims.AgentID
+		r = withAgentID(r, agentID)
+	}
+
 	// A contained session is cut off entirely. No tool call,
 	// no list, and no other proxied traffic passes. The
 	// control plane above is unaffected. A human can still
@@ -236,13 +261,14 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// session id observed on it. Rotating the ledger header
 	// alone does not evade it. The agent must also abandon
 	// its upstream MCP session. That raises the cost of
-	// evasion. It does not eliminate it. The proxy path has
-	// no authentication by design. A fresh MCP session is a
-	// new identity. Full binding needs proxy-path client
-	// auth. This build does not add it (see SECURITY.md).
+	// evasion. It does not eliminate it. Without proxy-path
+	// agent tokens (--require-agent-token), a fresh MCP session
+	// is a new identity. With tokens on, the agent id is bound
+	// to the token, and rotation of the session header alone
+	// does not change it (see SECURITY.md).
 	if px.IsContained(session, mcpID) {
 		if r.Method == http.MethodPost {
-			if !px.witness(session, "containment", "(session)", nil, "deny", "", w, body) {
+			if !px.witness(session, "containment", "(session)", nil, "deny", "", agentID, w, body) {
 				return
 			}
 		}
@@ -260,7 +286,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodPost {
 				if isToolCall(body) {
 					tool, _ := toolCallDetails(body)
-					if _, ok := px.witnessPolicyDecision(session, tool, "deny", policy.ModePrevent.String(), w, body); !ok {
+					if _, ok := px.witnessPolicyDecision(session, tool, "deny", policy.ModePrevent.String(), agentID, w, body); !ok {
 						return
 					}
 				}
@@ -281,7 +307,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// secret must never reach the ledger, the hold queue,
 		// or the proposal queue.
 		if px.broker != nil && px.broker.ContainsSecret(args) {
-			if _, ok := px.witnessPolicyDecision(session, tool, "deny", policy.ModePrevent.String(), w, body); !ok {
+			if _, ok := px.witnessPolicyDecision(session, tool, "deny", policy.ModePrevent.String(), agentID, w, body); !ok {
 				return
 			}
 			writeJSONRPCError(w, body, "ledgerline: tool arguments contain a brokered credential")
@@ -293,7 +319,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// drifted tool would otherwise take the policy
 		// default.
 		if msg, denied := px.toolsGate(tool); denied {
-			if !px.witness(session, "tools_drift", tool, nil, "deny", "", w, body) {
+			if !px.witness(session, "tools_drift", tool, nil, "deny", "", agentID, w, body) {
 				return
 			}
 			writeJSONRPCError(w, body, msg)
@@ -321,7 +347,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					writeJSONRPCError(w, body, "ledgerline: idempotency key reused with different tool or arguments")
 					return
 				}
-				if px.idemShortCircuit(w, body, session, rec) {
+				if px.idemShortCircuit(w, body, session, rec, agentID) {
 					return
 				}
 			}
@@ -337,7 +363,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// records a proposal marked detected and never queues
 		// it. A human must never apply a call that already ran.
 		detect := mode == policy.ModeDetect && decision != policy.Allow
-		decisionID, ok := px.witnessPolicyDecision(session, tool, decision.String(), mode.String(), w, body)
+		decisionID, ok := px.witnessPolicyDecision(session, tool, decision.String(), mode.String(), agentID, w, body)
 		if !ok {
 			return
 		}
@@ -356,7 +382,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if detect {
 				break
 			}
-			px.hold(w, r, session, body, tool, args, claim)
+			px.hold(w, r, session, body, tool, args, claim, agentID)
 			return
 		case policy.Contain:
 			if detect {
@@ -366,21 +392,21 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if reason != "" {
 				msg += ": " + reason
 			}
-			px.Contain(session, "", reason)
+			px.Contain(session, "", reason, agentID)
 			writeJSONRPCError(w, body, msg)
 			return
 		case policy.Propose:
 			if detect {
 				// Record the proposal, marked detected. Do not
 				// queue it. The call forwards below.
-				if _, err := px.ledger.AppendDetailed(session, "proposal", tool, args, "propose", "", ledger.EventDetail{Mode: mode.String(), DecisionID: decisionID}); err != nil {
+				if _, err := px.ledger.AppendDetailed(session, "proposal", tool, args, "propose", "", ledger.EventDetail{Mode: mode.String(), DecisionID: decisionID, AgentID: agentID}); err != nil {
 					log.Printf("ledger write failed on proposal: %v", err)
 					writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
 					return
 				}
 				break
 			}
-			px.propose(w, session, body, tool, args)
+			px.propose(w, session, body, tool, args, agentID)
 			return
 		}
 		if claim != nil {
@@ -398,7 +424,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if existing.Tool != tool || existing.ArgsHash != claim.argsHash {
 					writeJSONRPCError(w, body, "ledgerline: idempotency key reused with different tool or arguments")
 				} else {
-					px.idemShortCircuit(w, body, session, existing)
+					px.idemShortCircuit(w, body, session, existing, agentID)
 				}
 				return
 			}
@@ -408,9 +434,9 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// decision to the call that ran anyway.
 		toolCallOK := false
 		if detect {
-			toolCallOK = px.witnessDetailed(session, "tool_call", tool, args, policy.Allow.String(), "", ledger.EventDetail{Mode: mode.String(), DecisionID: decisionID}, w, body)
+			toolCallOK = px.witnessDetailed(session, "tool_call", tool, args, policy.Allow.String(), "", ledger.EventDetail{Mode: mode.String(), DecisionID: decisionID, AgentID: agentID}, w, body)
 		} else {
-			toolCallOK = px.witness(session, "tool_call", tool, args, policy.Allow.String(), "", w, body)
+			toolCallOK = px.witness(session, "tool_call", tool, args, policy.Allow.String(), "", agentID, w, body)
 		}
 		if !toolCallOK {
 			if claim != nil {
@@ -426,7 +452,7 @@ func (px *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The gateway cannot classify the calls inside it. Batches
 	// are refused at the boundary. The refusal is witnessed.
 	if r.Method == http.MethodPost && isBatch(body) {
-		if _, ok := px.witnessPolicyDecision(session, "(batch)", policy.Deny.String(), policy.ModePrevent.String(), w, body); !ok {
+		if _, ok := px.witnessPolicyDecision(session, "(batch)", policy.Deny.String(), policy.ModePrevent.String(), agentID, w, body); !ok {
 			return
 		}
 		writeJSONRPCError(w, body, "ledgerline: batch requests are not accepted at this boundary")
@@ -486,9 +512,10 @@ func isBatch(body []byte) bool {
 }
 
 // witness appends one event, failing closed. If the ledger cannot
-// be written, the call does not pass the boundary.
-func (px *Proxy) witness(session, kind, tool string, args json.RawMessage, decision, actor string, w http.ResponseWriter, body []byte) bool {
-	if _, err := px.ledger.Append(session, kind, tool, args, decision, actor); err != nil {
+// be written, the call does not pass the boundary. The agent id
+// is empty when proxy-path auth is off.
+func (px *Proxy) witness(session, kind, tool string, args json.RawMessage, decision, actor, agentID string, w http.ResponseWriter, body []byte) bool {
+	if _, err := px.ledger.AppendDetailed(session, kind, tool, args, decision, actor, ledger.EventDetail{AgentID: agentID}); err != nil {
 		log.Printf("ledger write failed: %v", err)
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
 		return false
@@ -508,18 +535,18 @@ func (px *Proxy) witnessDetailed(session, kind, tool string, args json.RawMessag
 }
 
 // witnessPolicyDecision records one policy_decision event with
-// its mode, a fresh decision id, and the policy hash. It
-// returns the decision id. A follow-up tool_call in detect mode
-// reuses the id, so the dashboard can link the pair. It fails
-// closed like witness.
-func (px *Proxy) witnessPolicyDecision(session, tool, decision, mode string, w http.ResponseWriter, body []byte) (string, bool) {
+// its mode, a fresh decision id, and the policy hash. It also
+// records the agent id. It returns the decision id. A follow-up
+// tool_call in detect mode reuses the id, so the dashboard can
+// link the pair. It fails closed like witness.
+func (px *Proxy) witnessPolicyDecision(session, tool, decision, mode, agentID string, w http.ResponseWriter, body []byte) (string, bool) {
 	id, err := newID()
 	if err != nil {
 		log.Printf("ledger write failed: cannot allocate decision id: %v", err)
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
 		return "", false
 	}
-	detail := ledger.EventDetail{Mode: mode, DecisionID: id, PolicyHash: px.policyHash}
+	detail := ledger.EventDetail{Mode: mode, DecisionID: id, PolicyHash: px.policyHash, AgentID: agentID}
 	if _, err := px.ledger.AppendDetailed(session, "policy_decision", tool, nil, decision, "", detail); err != nil {
 		log.Printf("ledger write failed: %v", err)
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
@@ -569,7 +596,7 @@ func sessionOf(r *http.Request) string {
 func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, claim *idemClaim) {
 	session := sessionOf(r)
 	if px.IsContained(session, r.Header.Get("Mcp-Session-Id")) {
-		if _, err := px.ledger.Append(session, "containment", "(session)", nil, "deny", ""); err != nil {
+		if _, err := px.ledger.AppendDetailed(session, "containment", "(session)", nil, "deny", "", ledger.EventDetail{AgentID: agentIDOf(r)}); err != nil {
 			log.Printf("ledger write failed on contained forward: %v", err)
 		}
 		if claim != nil {
@@ -590,7 +617,7 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	if r.Method == http.MethodPost && isToolCall(body) {
 		if tool, _ := toolCallDetails(body); tool != "" {
 			if msg, denied := px.toolsGate(tool); denied {
-				if _, err := px.ledger.Append(session, "tools_drift", tool, nil, "deny", ""); err != nil {
+				if _, err := px.ledger.AppendDetailed(session, "tools_drift", tool, nil, "deny", "", ledger.EventDetail{AgentID: agentIDOf(r)}); err != nil {
 					log.Printf("ledger write failed on drift-denied forward: %v", err)
 				}
 				if claim != nil {
@@ -650,6 +677,15 @@ func (px *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, cl
 	}
 	upReq.Header = r.Header.Clone()
 	stripHopByHop(upReq.Header)
+	// The agent token and the control-plane token never reach
+	// upstream. The agent token proves identity to this
+	// gateway only. The control-plane token guards this
+	// gateway only. Neither belongs to the upstream server.
+	// Authorization is stripped too: a client credential
+	// must not leak to the upstream through the proxy.
+	upReq.Header.Del(agentTokenHeader)
+	upReq.Header.Del("Authorization")
+	upReq.Header.Del("X-Ledgerline-Token")
 	// Brokered headers are injected here. A foreign agent
 	// value under a brokered name was already denied
 	// before forwarding.
@@ -768,10 +804,18 @@ func toolCallDetails(body []byte) (string, json.RawMessage) {
 
 // writeJSONRPCError answers with a protocol-shaped error. MCP
 // clients see a proper JSON-RPC error instead of an HTTP failure.
+// It uses HTTP 200, the usual JSON-RPC transport status.
 func writeJSONRPCError(w http.ResponseWriter, body []byte, msg string) {
+	writeJSONRPCErrorStatus(w, body, msg, http.StatusOK)
+}
+
+// writeJSONRPCErrorStatus answers with a protocol-shaped error
+// and the given HTTP status. Auth rejections use 401.
+func writeJSONRPCErrorStatus(w http.ResponseWriter, body []byte, msg string, status int) {
 	var m jsonRPC
 	_ = json.Unmarshal(body, &m)
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      json.RawMessage(nullID(m.ID)),

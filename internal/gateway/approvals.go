@@ -23,6 +23,7 @@ type PendingApproval struct {
 	SessionID string          `json:"session_id"`
 	Tool      string          `json:"tool"`
 	Args      json.RawMessage `json:"args,omitempty"`
+	AgentID   string          `json:"agent_id,omitempty"`
 	CreatedAt time.Time       `json:"created_at"`
 	ExpiresAt time.Time       `json:"expires_at"`
 
@@ -59,7 +60,7 @@ func (a *Approvals) List() []*PendingApproval {
 	for _, p := range a.pending {
 		out = append(out, &PendingApproval{
 			ID: p.ID, SessionID: p.SessionID, Tool: p.Tool,
-			Args: p.Args, CreatedAt: p.CreatedAt, ExpiresAt: p.ExpiresAt,
+			Args: p.Args, AgentID: p.AgentID, CreatedAt: p.CreatedAt, ExpiresAt: p.ExpiresAt,
 		})
 	}
 	return out
@@ -115,7 +116,7 @@ func newID() (string, error) {
 // response goes back to the waiting agent. The release path fails
 // closed, like the rest of the boundary. If the approval cannot
 // be written to the ledger, the call does not pass.
-func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, body []byte, tool string, args json.RawMessage, claim *idemClaim) {
+func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, body []byte, tool string, args json.RawMessage, claim *idemClaim, agentID string) {
 	id, err := newID()
 	if err != nil {
 		writeJSONRPCError(w, body, "ledgerline: cannot allocate approval id, boundary closed")
@@ -126,6 +127,7 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 		SessionID: session,
 		Tool:      tool,
 		Args:      args,
+		AgentID:   agentID,
 		CreatedAt: time.Now().UTC(),
 		ExpiresAt: time.Now().UTC().Add(px.approvals.timeout),
 		resultCh:  make(chan decisionResult, 1),
@@ -175,13 +177,13 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 			if existing.Tool != tool || existing.ArgsHash != claim.argsHash {
 				writeJSONRPCError(w, body, "ledgerline: idempotency key reused with different tool or arguments")
 			} else {
-				px.idemShortCircuit(w, body, session, existing)
+				px.idemShortCircuit(w, body, session, existing, agentID)
 			}
 			return
 		}
 	}
 
-	if _, err := px.ledger.Append(session, "approval", tool, args, "hold", ""); err != nil {
+	if _, err := px.ledger.AppendDetailed(session, "approval", tool, args, "hold", "", ledger.EventDetail{AgentID: agentID}); err != nil {
 		removePending()
 		if claim != nil {
 			// The hold never stood. Its journal entry must
@@ -196,7 +198,7 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 	defer timer.Stop()
 	select {
 	case res := <-p.resultCh:
-		px.release(w, r, session, body, tool, args, res, claim)
+		px.release(w, r, session, body, tool, args, res, claim, agentID)
 	case <-timer.C:
 		// Claim the entry under the lock. A decision and a
 		// timeout can never both win the same hold.
@@ -205,13 +207,13 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 			// The decision won the race. Its result is already
 			// in the buffered channel.
 			px.approvals.mu.Unlock()
-			px.release(w, r, session, body, tool, args, <-p.resultCh, claim)
+			px.release(w, r, session, body, tool, args, <-p.resultCh, claim, agentID)
 			return
 		}
 		p.decided = true
 		delete(px.approvals.pending, p.ID)
 		px.approvals.mu.Unlock()
-		if _, err := px.ledger.Append(session, "approval", tool, args, "timeout", ""); err != nil {
+		if _, err := px.ledger.AppendDetailed(session, "approval", tool, args, "timeout", "", ledger.EventDetail{AgentID: agentID}); err != nil {
 			log.Printf("ledger write failed on approval timeout: %v", err)
 		}
 		if claim != nil {
@@ -225,9 +227,9 @@ func (px *Proxy) hold(w http.ResponseWriter, r *http.Request, session string, bo
 // release records the human's decision. When it is an approval,
 // it forwards the held call upstream. Any ledger failure closes
 // the boundary instead of letting the call through unrecorded.
-func (px *Proxy) release(w http.ResponseWriter, r *http.Request, session string, body []byte, tool string, args json.RawMessage, res decisionResult, claim *idemClaim) {
+func (px *Proxy) release(w http.ResponseWriter, r *http.Request, session string, body []byte, tool string, args json.RawMessage, res decisionResult, claim *idemClaim, agentID string) {
 	if !res.approved {
-		if _, err := px.ledger.Append(session, "approval", tool, args, "deny", res.actor); err != nil {
+		if _, err := px.ledger.AppendDetailed(session, "approval", tool, args, "deny", res.actor, ledger.EventDetail{AgentID: agentID}); err != nil {
 			log.Printf("ledger write failed on approval deny: %v", err)
 		}
 		if claim != nil {
@@ -238,11 +240,11 @@ func (px *Proxy) release(w http.ResponseWriter, r *http.Request, session string,
 		writeJSONRPCError(w, body, "ledgerline: tool call denied by approver")
 		return
 	}
-	if _, err := px.ledger.Append(session, "approval", tool, args, "approve", res.actor); err != nil {
+	if _, err := px.ledger.AppendDetailed(session, "approval", tool, args, "approve", res.actor, ledger.EventDetail{AgentID: agentID}); err != nil {
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
 		return
 	}
-	if _, err := px.ledger.Append(session, "tool_call", tool, args, "allow", res.actor); err != nil {
+	if _, err := px.ledger.AppendDetailed(session, "tool_call", tool, args, "allow", res.actor, ledger.EventDetail{AgentID: agentID}); err != nil {
 		writeJSONRPCError(w, body, "ledgerline: ledger unavailable, boundary closed")
 		return
 	}
@@ -267,6 +269,15 @@ func (px *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 
 	case r.URL.Path == "/v1/approvals" && r.Method == http.MethodGet:
 		writeJSON(w, px.approvals.List())
+
+	case r.URL.Path == "/v1/events" && r.Method == http.MethodGet:
+		px.serveEvents(w, r)
+
+	case r.URL.Path == "/v1/sessions" && r.Method == http.MethodGet:
+		px.serveSessions(w, r)
+
+	case r.URL.Path == "/v1/tokens/revoke" && r.Method == http.MethodPost:
+		px.serveTokensRevoke(w, r)
 
 	case strings.HasPrefix(r.URL.Path, "/v1/sessions/") && strings.HasSuffix(r.URL.Path, "/contain") && r.Method == http.MethodPost:
 		px.containSessionAPI(w, r)

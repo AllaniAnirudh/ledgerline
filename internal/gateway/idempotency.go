@@ -163,8 +163,8 @@ func (px *Proxy) recoverIdempotency() error {
 
 // witnessIdem records one idempotent short-circuit in the chain.
 // It fails closed like every other witness: no witness, no answer.
-func (px *Proxy) witnessIdem(session, tool, decision string, w http.ResponseWriter, body []byte) bool {
-	return px.witness(session, "idempotency", tool, nil, decision, "", w, body)
+func (px *Proxy) witnessIdem(session, tool, decision, agentID string, w http.ResponseWriter, body []byte) bool {
+	return px.witness(session, "idempotency", tool, nil, decision, "", agentID, w, body)
 }
 
 // idemShortCircuit answers a retry from its journal record, when
@@ -172,48 +172,48 @@ func (px *Proxy) witnessIdem(session, tool, decision string, w http.ResponseWrit
 // when it wrote a response. The caller passes the record it
 // already looked up. Tool and argument binding were checked
 // there.
-func (px *Proxy) idemShortCircuit(w http.ResponseWriter, body []byte, session string, rec ledger.IdempotencyRecord) bool {
+func (px *Proxy) idemShortCircuit(w http.ResponseWriter, body []byte, session string, rec ledger.IdempotencyRecord, agentID string) bool {
 	switch rec.State {
 	case ledger.IdemCompleted:
 		if rec.BodyTooLarge {
-			if !px.witnessIdem(session, rec.Tool, "refused", w, body) {
+			if !px.witnessIdem(session, rec.Tool, "refused", agentID, w, body) {
 				return true
 			}
 			writeJSONRPCError(w, body, "ledgerline: call previously completed but its response was too large to replay; check upstream, not re-forwarding")
 			return true
 		}
-		if !px.witnessIdem(session, rec.Tool, "replayed", w, body) {
+		if !px.witnessIdem(session, rec.Tool, "replayed", agentID, w, body) {
 			return true
 		}
 		replayIdem(w, rec)
 		return true
 	case ledger.IdemDenied:
-		if !px.witnessIdem(session, rec.Tool, "denied", w, body) {
+		if !px.witnessIdem(session, rec.Tool, "denied", agentID, w, body) {
 			return true
 		}
 		writeJSONRPCError(w, body, "ledgerline: call previously denied by approver; not re-forwarding")
 		return true
 	case ledger.IdemHeld:
-		if !px.witnessIdem(session, rec.Tool, "held", w, body) {
+		if !px.witnessIdem(session, rec.Tool, "held", agentID, w, body) {
 			return true
 		}
 		writeHeldAgain(w, body, rec.ApprovalID)
 		return true
 	case ledger.IdemStarted:
-		if !px.witnessIdem(session, rec.Tool, "in-flight", w, body) {
+		if !px.witnessIdem(session, rec.Tool, "in-flight", agentID, w, body) {
 			return true
 		}
 		writeJSONRPCError(w, body, "ledgerline: call already in flight; outcome not yet known")
 		return true
 	case ledger.IdemUnknown:
-		if !px.witnessIdem(session, rec.Tool, "unknown", w, body) {
+		if !px.witnessIdem(session, rec.Tool, "unknown", agentID, w, body) {
 			return true
 		}
 		writeJSONRPCError(w, body, "ledgerline: call outcome unknown; resolve it first (ledgerline resolve)")
 		return true
 	case ledger.IdemResolved:
 		if rec.Resolution == "executed" {
-			if !px.witnessIdem(session, rec.Tool, "refused", w, body) {
+			if !px.witnessIdem(session, rec.Tool, "refused", agentID, w, body) {
 				return true
 			}
 			writeJSONRPCError(w, body, "ledgerline: call previously executed (resolved); not re-forwarding")

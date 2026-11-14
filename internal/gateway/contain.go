@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/AllaniAnirudh/ledgerline/internal/ledger"
 )
 
 // containedSession is one frozen session. Every further call from
@@ -43,11 +45,12 @@ func (px *Proxy) observeMCP(sessionID, mcpID string) {
 // held calls are denied. Its in-flight upstream requests are
 // cancelled gateway-side (see forward for the exact guarantee).
 // The freeze is witnessed in the ledger, with the frozen MCP
-// sessions in the event arguments. The session stays contained
-// even if the ledger write fails. Containment denies passage,
-// so keeping it is the fail-closed direction. The failure is
-// logged loudly.
-func (px *Proxy) Contain(sessionID, actor, reason string) {
+// sessions in the event arguments. The agent id is empty when
+// the call comes from the control plane or the hook bridge.
+// The session stays contained even if the ledger write fails.
+// Containment denies passage, so keeping it is the fail-closed
+// direction. The failure is logged loudly.
+func (px *Proxy) Contain(sessionID, actor, reason, agentID string) {
 	px.containedMu.Lock()
 	if px.contained == nil {
 		px.contained = map[string]containedSession{}
@@ -74,7 +77,7 @@ func (px *Proxy) Contain(sessionID, actor, reason string) {
 	if len(mcpIDs) > 0 {
 		args, _ = json.Marshal(map[string][]string{"mcp_sessions": mcpIDs})
 	}
-	if _, err := px.ledger.Append(sessionID, "containment", "(session)", args, "contain", actor); err != nil {
+	if _, err := px.ledger.AppendDetailed(sessionID, "containment", "(session)", args, "contain", actor, ledger.EventDetail{AgentID: agentID}); err != nil {
 		log.Printf("ledgerline: ledger write failed on containment of session %s: %v", sessionID, err)
 	}
 	if sessionID == "default" {
@@ -116,7 +119,7 @@ func (px *Proxy) containSessionAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		actor = name
 	}
-	px.Contain(id, actor, req.Reason)
+	px.Contain(id, actor, req.Reason, "")
 	writeJSON(w, map[string]any{"ok": true, "session_id": id})
 }
 

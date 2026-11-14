@@ -38,7 +38,7 @@ func TestContainBindsMCPSession(t *testing.T) {
 	if code, _ := postToolSession(t, px, "read_file", "s1", "mcp-1"); code != 200 {
 		t.Fatalf("first call should pass, got %d", code)
 	}
-	px.Contain("s1", "tester", "rotation test")
+	px.Contain("s1", "tester", "rotation test", "")
 	if code, _ := postToolSession(t, px, "read_file", "s2", "mcp-1"); code != http.StatusForbidden {
 		t.Fatalf("rotated ledger session with same MCP session should get 403, got %d", code)
 	}
@@ -85,7 +85,7 @@ func TestContainAbortsInflight(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("upstream handler never entered")
 	}
-	px.Contain("s1", "tester", "in-flight test")
+	px.Contain("s1", "tester", "in-flight test", "")
 
 	select {
 	case <-done:
@@ -104,7 +104,7 @@ func TestContainAbortsInflight(t *testing.T) {
 // ServeHTTP gate. The hold release path does this.
 func TestForwardRefusesContainedSession(t *testing.T) {
 	px, hits := testProxyPolicy(t, policy.New(nil, nil))
-	px.Contain("s1", "tester", "backstop test")
+	px.Contain("s1", "tester", "backstop test", "")
 
 	body := `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_file","arguments":{}}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))

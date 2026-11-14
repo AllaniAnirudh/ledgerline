@@ -40,6 +40,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -48,6 +49,7 @@ import (
 	"github.com/AllaniAnirudh/ledgerline/internal/policy"
 	"github.com/AllaniAnirudh/ledgerline/internal/pty"
 	"github.com/AllaniAnirudh/ledgerline/internal/replay"
+	"github.com/AllaniAnirudh/ledgerline/internal/token"
 )
 
 func main() {
@@ -89,6 +91,8 @@ func main() {
 		err = runPTY(os.Args[2:])
 	case "hook":
 		err = runHook(os.Args[2:])
+	case "token":
+		err = runToken(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n", os.Args[1])
 		usage()
@@ -105,7 +109,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: ledgerline <gateway|approvals|approve|deny|contain|contained|proposals|apply|idempotency|resolve|tools|accept-tools|export|verify|run|hook> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: ledgerline <gateway|approvals|approve|deny|contain|contained|proposals|apply|idempotency|resolve|tools|accept-tools|export|verify|run|hook|token> [flags]")
 }
 
 // openStore returns the ledger backend. SQLite serves when --db
@@ -135,6 +139,9 @@ func runGateway(args []string) error {
 	holdTimeout := fs.Duration("hold-timeout", 5*time.Minute, "how long a held call waits for a human")
 	pinFile := fs.String("upstream-pin-file", "", "path to the upstream pin file (empty = no pinning; first run creates the pin)")
 	brokerFile := fs.String("broker", "", "broker config file (empty = no broker; credential values come from the environment, never the file)")
+	tokenKeyFile := fs.String("token-key-file", "", "path to the agent token key file (hex or base64 key; or env LEDGERLINE_TOKEN_KEY)")
+	tokenRevokeFile := fs.String("token-revoke-file", "", "path to the revoked token id file (default: ledgerline-revoked-tokens.json next to --db, else in the working directory)")
+	requireAgentToken := fs.Bool("require-agent-token", false, "require a valid agent token on every proxy-path request (needs a token key)")
 	reapprove := fs.Bool("reapprove-upstream", false, "accept a changed upstream and overwrite the pin (witnessed in the ledger)")
 	reapproveActor := fs.String("reapprove-actor", defaultActor(), "who is re-approving the upstream")
 	reapproveTools := fs.Bool("reapprove-tools", false, "accept the next observed tool surface as the new baseline (witnessed in the ledger)")
@@ -238,6 +245,34 @@ func runGateway(args []string) error {
 	}
 	if *apiToken != "" {
 		px.SetAPIToken(*apiToken)
+	}
+	// Agent token auth is opt-in. A key alone does not turn
+	// checks on. The flag does. The flag without a key
+	// refuses to start. The key comes from the key file or
+	// from env LEDGERLINE_TOKEN_KEY.
+	tokenKey, err := loadTokenKey(*tokenKeyFile)
+	if err != nil {
+		return err
+	}
+	if *requireAgentToken && tokenKey == nil {
+		return fmt.Errorf("--require-agent-token needs a token key: pass --token-key-file or set LEDGERLINE_TOKEN_KEY")
+	}
+	if tokenKey != nil {
+		revokeFile := *tokenRevokeFile
+		if revokeFile == "" {
+			if *dbPath != "" {
+				revokeFile = filepath.Join(filepath.Dir(*dbPath), "ledgerline-revoked-tokens.json")
+			} else {
+				revokeFile = "ledgerline-revoked-tokens.json"
+			}
+		}
+		if err := px.SetTokenKey(tokenKey, revokeFile); err != nil {
+			return err
+		}
+		px.SetRequireAgentToken(*requireAgentToken)
+		if *requireAgentToken {
+			log.Printf("ledgerline: proxy path requires agent tokens (revocations: %s)", revokeFile)
+		}
 	}
 	for _, pair := range approverTokens {
 		name, token, ok := strings.Cut(pair, "=")
@@ -901,6 +936,59 @@ func runAcceptTools(args []string) error {
 		return fmt.Errorf("gateway: %s", strings.TrimSpace(string(respBody)))
 	}
 	fmt.Println("re-approval pending: the next observed tool surface becomes the new baseline")
+	return nil
+}
+
+// loadTokenKey returns the agent token key from a key file or
+// from env LEDGERLINE_TOKEN_KEY. It returns nil, nil when
+// neither is set. The caller decides whether a missing key is
+// an error.
+func loadTokenKey(keyFile string) ([]byte, error) {
+	if keyFile != "" {
+		return token.LoadKeyFile(keyFile)
+	}
+	if v := os.Getenv("LEDGERLINE_TOKEN_KEY"); v != "" {
+		return token.ParseKey(v)
+	}
+	return nil, nil
+}
+
+// runToken mints agent identity tokens. Only "issue" exists.
+// Minting is offline. It writes no ledger event. It prints the
+// token on the first line and its expiry on the second line, as
+// "expires: <RFC 3339 UTC>". The default life is 8 hours. The
+// max is 7 days. A longer ttl is refused.
+func runToken(args []string) error {
+	if len(args) < 1 || args[0] != "issue" {
+		return fmt.Errorf("usage: ledgerline token issue --agent <id> --owner <name> [--ttl 8h] [--key-file path]")
+	}
+	fs := flag.NewFlagSet("token issue", flag.ExitOnError)
+	agentID := fs.String("agent", "", "agent id the token names (required)")
+	owner := fs.String("owner", "", "human or job that started the session (required)")
+	ttl := fs.Duration("ttl", token.DefaultTTL, "token life (default 8h, max 7d)")
+	keyFile := fs.String("key-file", "", "path to the token key file (or env LEDGERLINE_TOKEN_KEY)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *agentID == "" {
+		return fmt.Errorf("--agent is required")
+	}
+	if *owner == "" {
+		return fmt.Errorf("--owner is required")
+	}
+	key, err := loadTokenKey(*keyFile)
+	if err != nil {
+		return err
+	}
+	if key == nil {
+		return fmt.Errorf("no token key: pass --key-file or set LEDGERLINE_TOKEN_KEY")
+	}
+	tok, claims, err := token.Issue(key, *agentID, *owner, *ttl)
+	if err != nil {
+		return err
+	}
+	fmt.Println(tok)
+	fmt.Printf("expires: %s\n", claims.ExpiresAt().Format(time.RFC3339))
 	return nil
 }
 
